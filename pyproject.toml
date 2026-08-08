@@ -32,7 +32,7 @@ dependencies = [
   "pydantic>=2.13.4",
   "pyyaml>=6.0.3",
   "typer>=0.27.0",
-  "uvicorn[standard]>=0.52.0",
+  "uvicorn[standard]>=0.52.1",
 ]
 
 [project.urls]
@@ -46,7 +46,7 @@ dev = [
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
   "respx>=0.23.1",
-  "ruff>=0.16.0",
+  "ruff>=0.16.1",
 ]
 
 [dependency-groups]

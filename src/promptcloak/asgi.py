@@ -1,3 +1,3 @@
-from promptcloak.proxy import create_app
+from promptlatch.asgi import app
 
-app = create_app()
+__all__ = ["app"]

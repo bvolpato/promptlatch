@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from promptcloak.config import (
+from promptlatch.config import (
     RedactionConfig,
     RuleConfig,
     ServerConfig,
@@ -12,13 +12,13 @@ from promptcloak.config import (
 
 
 def test_server_api_key_env(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("PROMPTCLOAK_SERVER_API_KEY", "local-token")
-    monkeypatch.setenv("PROMPTCLOAK_DEBUG_REQUESTS", "true")
-    monkeypatch.setenv("PROMPTCLOAK_DEBUG_MAX_BODY_CHARS", "1234")
-    monkeypatch.setenv("PROMPTCLOAK_TARGET_API_KEY", "upstream-token")
-    monkeypatch.setenv("PROMPTCLOAK_TARGET_API_KEY_HEADER", "x-api-key")
-    monkeypatch.setenv("PROMPTCLOAK_TARGET_BASE_URL", "https://upstream.example/v1")
-    monkeypatch.setenv("PROMPTCLOAK_RESPONSES_TO_CHAT", "true")
+    monkeypatch.setenv("PROMPTLATCH_SERVER_API_KEY", "local-token")
+    monkeypatch.setenv("PROMPTLATCH_DEBUG_REQUESTS", "true")
+    monkeypatch.setenv("PROMPTLATCH_DEBUG_MAX_BODY_CHARS", "1234")
+    monkeypatch.setenv("PROMPTLATCH_TARGET_API_KEY", "upstream-token")
+    monkeypatch.setenv("PROMPTLATCH_TARGET_API_KEY_HEADER", "x-api-key")
+    monkeypatch.setenv("PROMPTLATCH_TARGET_BASE_URL", "https://upstream.example/v1")
+    monkeypatch.setenv("PROMPTLATCH_RESPONSES_TO_CHAT", "true")
 
     settings = load_settings(tmp_path / "missing.yaml")
 
@@ -29,6 +29,44 @@ def test_server_api_key_env(monkeypatch, tmp_path) -> None:
     assert settings.target.api_key_header == "x-api-key"
     assert settings.target.default_base_url == "https://upstream.example/v1"
     assert settings.compat.responses_to_chat is True
+
+
+def test_legacy_server_api_key_env_remains_authenticated(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("PROMPTCLOAK_SERVER_API_KEY", "legacy-fixture-token")
+    monkeypatch.setenv("PROMPTLATCH_REQUIRE_SERVER_API_KEY", "true")
+
+    with pytest.warns(FutureWarning, match="PROMPTLATCH_SERVER_API_KEY"):
+        settings = load_settings(tmp_path / "missing.yaml")
+
+    assert settings.server.api_key == "legacy-fixture-token"
+
+
+def test_legacy_default_config_path_is_loaded(monkeypatch, tmp_path) -> None:
+    import promptlatch.config as config_module
+
+    current_dir = tmp_path / "promptlatch"
+    legacy_dir = tmp_path / "promptcloak"
+    legacy_dir.mkdir()
+    (legacy_dir / "config.yaml").write_text(
+        "server:\n  api_key: legacy-fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG_PATH", current_dir / "config.yaml")
+    monkeypatch.setattr(config_module, "DEFAULT_KEY_PATH", current_dir / "key")
+    monkeypatch.setattr(config_module, "LEGACY_CONFIG_PATH", legacy_dir / "config.yaml")
+    monkeypatch.setattr(config_module, "LEGACY_KEY_PATH", legacy_dir / "key")
+    monkeypatch.delenv("PROMPTLATCH_CONFIG", raising=False)
+    monkeypatch.delenv("PROMPTCLOAK_CONFIG", raising=False)
+
+    with pytest.warns(FutureWarning, match="using legacy path"):
+        settings = load_settings()
+
+    assert settings.server.api_key == "legacy-fixture-token"
+
+
+def test_required_server_api_key_fails_closed() -> None:
+    with pytest.raises(ValidationError, match="server API key is required but missing"):
+        ServerConfig(require_api_key=True)
 
 
 @pytest.mark.parametrize(

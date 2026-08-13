@@ -1,6 +1,6 @@
 # Security policy
 
-PromptCloak redacts secrets from LLM request content before forwarding it.
+PromptLatch redacts secrets from LLM request content before forwarding it.
 
 ## Reporting
 
@@ -21,7 +21,7 @@ Report vulnerabilities privately through GitHub Security Advisories for this rep
 ## Limits
 
 - Upstream credentials remain in provider-bound auth headers because the provider
-  needs them. PromptCloak masks these headers in debug output.
+  needs them. PromptLatch masks these headers in debug output.
 - Encoded request bodies must be decompressed before redaction.
 - Private-target checks validate DNS before connection but do not pin that resolution. Allow only trusted upstream hostnames.
 - Emergency request tracing can print raw request bodies locally.

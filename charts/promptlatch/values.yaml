@@ -1,8 +1,8 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/bvolpato/promptcloak
-  tag: "0.1.10"
+  repository: ghcr.io/bvolpato/promptlatch
+  tag: "0.2.0"
   pullPolicy: IfNotPresent
 
 service:
@@ -13,14 +13,19 @@ serverAuth:
   enabled: true
   apiKey: ""
 
+migration:
+  # Set only while upgrading a release installed from the old chart.
+  preserveLegacyNames: false
+
 # Existing Secret keys are loaded as environment variables. Include
-# PROMPTCLOAK_SERVER_API_KEY when serverAuth.enabled is true.
+# PROMPTLATCH_SERVER_API_KEY when serverAuth.enabled is true. The 0.2 chart also
+# accepts the previous variable name during upgrades.
 existingSecret: ""
 
 env:
-  PROMPTCLOAK_HOST: 0.0.0.0
-  PROMPTCLOAK_PORT: "8000"
-  PROMPTCLOAK_TARGET_DEFAULT_BASE_URL: https://api.openai.com/v1
+  PROMPTLATCH_HOST: 0.0.0.0
+  PROMPTLATCH_PORT: "8000"
+  PROMPTLATCH_TARGET_DEFAULT_BASE_URL: https://api.openai.com/v1
 
 secretEnv: {}
 

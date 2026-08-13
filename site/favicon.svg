@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="PromptCloak icon">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="PromptLatch latch icon">
   <rect width="64" height="64" rx="14" fill="#54d6a0"/>
-  <path d="M18 18h17c8 0 13 5 13 12s-5 12-13 12h-9v8h-8V18Zm8 8v8h9c3 0 5-1 5-4s-2-4-5-4h-9Z" fill="#06120d"/>
+  <path d="M12 23a4 4 0 0 1 4-4h25v-4h11v34H41v-4H16a4 4 0 0 1-4-4V23Zm8 5v8h25v-8H20Z" fill="#06120d"/>
+  <circle cx="20" cy="32" r="2.5" fill="#54d6a0"/>
 </svg>

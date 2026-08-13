@@ -13,6 +13,7 @@ on:
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  IMAGE_NAME: ghcr.io/bvolpato/promptlatch
 
 permissions:
   contents: read
@@ -23,11 +24,12 @@ concurrency:
 
 jobs:
   build:
+    name: build
     runs-on: ubuntu-latest
     permissions:
-      attestations: write
+      attestations: write # Publish provenance for release artifacts.
       contents: read
-      id-token: write
+      id-token: write # Sign provenance through GitHub OIDC.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,6 +41,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_REPOSITORY" != "bvolpato/promptlatch" ]; then
+            echo "release must run from bvolpato/promptlatch" >&2
+            exit 1
+          fi
           ref_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")
           if [ "$(jq -r '.object.type' <<<"$ref_json")" != "tag" ]; then
             echo "release tag must be annotated and signed" >&2
@@ -63,14 +69,14 @@ jobs:
       - run: uv run scripts/audit_secrets.py
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pyright src tests
+      - run: uv run pyright src tests scripts
       - run: uv run pip-audit
       - run: uv run pytest
       - run: uv build
-      - run: helm lint ./charts/promptcloak
-      - run: helm template promptcloak ./charts/promptcloak >/dev/null
+      - run: helm lint ./charts/promptlatch
+      - run: helm template promptlatch ./charts/promptlatch >/dev/null
       - run: uv run scripts/check_helm.py
-      - run: helm package charts/promptcloak --destination dist
+      - run: helm package charts/promptlatch --destination dist
       - run: cd dist && sha256sum -- ./*.whl ./*.tar.gz ./*.tgz > SHA256SUMS
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
@@ -82,11 +88,12 @@ jobs:
           if-no-files-found: error
 
   publish:
+    name: publish
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      packages: write
+      contents: write # Create or repair GitHub release assets.
+      packages: write # Push versioned GHCR image.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -97,19 +104,6 @@ jobs:
         with:
           name: release-dist
           path: dist
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $RELEASE_TAG already exists; publish a new version" >&2
-            exit 1
-          fi
-          gh release create "$RELEASE_TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "PromptCloak ${RELEASE_TAG#v}" \
-            --generate-notes \
-            --verify-tag
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -119,7 +113,7 @@ jobs:
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: docker-meta
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ env.RELEASE_TAG }}
             type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
@@ -131,3 +125,21 @@ jobs:
           sbom: true
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "PromptLatch ${RELEASE_TAG#v}"
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "PromptLatch ${RELEASE_TAG#v}" \
+              --generate-notes \
+              --verify-tag
+          fi

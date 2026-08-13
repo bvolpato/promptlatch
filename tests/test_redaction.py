@@ -3,8 +3,8 @@ import tempfile
 import pytest
 import requests
 
-from promptcloak.config import RedactionConfig, RuleConfig
-from promptcloak.redaction import RedactionKeyCollisionError, SecretRedactor
+from promptlatch.config import RedactionConfig, RuleConfig
+from promptlatch.redaction import RedactionKeyCollisionError, SecretRedactor
 from tests.fixtures import EXPANDED_PROVIDER_FIXTURES, OPENAI_FAKE, PROVIDER_FIXTURES
 
 
@@ -281,7 +281,7 @@ def test_tail_rule_redacts_full_token() -> None:
         )
     )
 
-    result = redactor.redact_text("token=pc_live_9999999999999999abcd1234")
+    result = redactor.redact_text("token=pl_live_9999999999999999abcd1234")
 
     assert "9999999999999999abcd1234" not in result.value
     assert result.stats.rule_hits["tail"] == 1

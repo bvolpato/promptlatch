@@ -50,7 +50,7 @@ EXPANDED_PROVIDER_FIXTURES = {
 
 OPENAI_FAKE = fake_secret("sk-")
 GEMINI_FAKE = PROVIDER_FIXTURES["gemini_api_key"]
-CUSTOM_TAIL_SECRET = "pc_live_000000000000abcd1234"
+CUSTOM_TAIL_SECRET = "pl_live_000000000000abcd1234"
 
 
 def complex_payload() -> dict[str, Any]:

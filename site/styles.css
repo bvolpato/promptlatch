@@ -90,14 +90,9 @@ button:focus-visible {
 }
 
 .brand-mark {
-  display: grid;
-  place-items: center;
   width: 34px;
   height: 34px;
-  border-radius: 8px;
-  background: var(--green);
-  color: #07110d;
-  font-size: 0.78rem;
+  flex: none;
 }
 
 nav {

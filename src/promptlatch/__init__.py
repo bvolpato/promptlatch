@@ -1,18 +1,7 @@
-"""Compatibility imports for PromptLatch 0.2."""
+"""PromptLatch package."""
 
-from __future__ import annotations
-
-import warnings
-
-warnings.warn(
-    "promptcloak imports are deprecated; use promptlatch",
-    FutureWarning,
-    stacklevel=1,
-)
-
-from promptlatch import (  # noqa: E402
+from promptlatch.library import (
     PromptLatch,
-    __version__,
     redact_messages,
     redact_params,
     redact_payload,
@@ -22,11 +11,9 @@ from promptlatch import (  # noqa: E402
     scan_payload,
     scan_text,
 )
-
-PromptCloak = PromptLatch
+from promptlatch.version import __version__
 
 __all__ = [
-    "PromptCloak",
     "PromptLatch",
     "__version__",
     "redact_messages",

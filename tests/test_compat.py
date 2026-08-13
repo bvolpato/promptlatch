@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from promptcloak.compat import (
+from promptlatch.compat import (
     ResponsesInputError,
     chat_stream_to_responses,
     responses_to_chat_payload,

@@ -1,6 +1,0 @@
-apiVersion: v2
-name: promptcloak
-description: Local secret-redacting LLM proxy
-type: application
-version: 0.1.10
-appVersion: "0.1.10"

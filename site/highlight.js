@@ -14,7 +14,7 @@
     if (text.includes("from ") || text.includes("client.") || text.includes("redact_")) {
       return "python";
     }
-    if (/^(brew|curl|docker|helm|kubectl|uv|promptcloak|export|mkdir|cp|codex|opencode|claude)\b/m.test(text)) {
+    if (/^(brew|curl|docker|helm|kubectl|uv|promptlatch|export|mkdir|cp|codex|opencode|claude)\b/m.test(text)) {
       return "bash";
     }
     return "text";
@@ -28,7 +28,7 @@
       ["flag", /--?[A-Za-z0-9][A-Za-z0-9-]*/g],
       [
         "keyword",
-        /\b(?:brew|promptcloak|export|curl|docker|helm|kubectl|uv|mkdir|cp|codex|opencode|claude|jq|kind)\b/g,
+        /\b(?:brew|promptlatch|export|curl|docker|helm|kubectl|uv|mkdir|cp|codex|opencode|claude|jq|kind)\b/g,
       ],
     ],
     json: [

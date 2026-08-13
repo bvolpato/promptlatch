@@ -1,3 +1,3 @@
 from promptlatch.proxy import create_app
 
-__all__ = ["create_app"]
+app = create_app()

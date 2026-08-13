@@ -17,11 +17,11 @@ def test_release_docs_reference_current_artifacts() -> None:
     prompt = (ROOT / "PROMPT.md").read_text(encoding="utf-8")
     combined = readme + site
 
-    assert f"releases/download/v{version}/promptcloak-{version}-py3-none-any.whl" in combined
-    assert f"releases/download/v{version}/promptcloak-{version}.tgz" in combined
-    assert f"ghcr.io/bvolpato/promptcloak:{version}" in combined
-    assert f"releases/download/v{version}/promptcloak-{version}-py3-none-any.whl" in prompt
-    assert f"ghcr.io/bvolpato/promptcloak:{version}" in prompt
+    assert f"releases/download/v{version}/promptlatch-{version}-py3-none-any.whl" in combined
+    assert f"releases/download/v{version}/promptlatch-{version}.tgz" in combined
+    assert f"ghcr.io/bvolpato/promptlatch:{version}" in combined
+    assert f"releases/download/v{version}/promptlatch-{version}-py3-none-any.whl" in prompt
+    assert f"ghcr.io/bvolpato/promptlatch:{version}" in prompt
     assert "0.1.3" not in combined
 
 
@@ -29,8 +29,8 @@ def test_docs_do_not_claim_pypi_install() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     site = (ROOT / "site" / "index.html").read_text(encoding="utf-8")
 
-    assert "uv add promptcloak" not in readme
-    assert "uv add promptcloak" not in site
+    assert "uv add promptlatch" not in readme
+    assert "uv add promptlatch" not in site
 
 
 def test_site_uses_local_syntax_highlighting() -> None:

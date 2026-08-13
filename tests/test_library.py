@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, replace
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, Field
 
-from promptcloak import PromptCloak, redact_messages, redact_params, scan_params
-from promptcloak.config import RedactionConfig, RuleConfig
+from promptlatch import PromptLatch, redact_messages, redact_params, scan_params
+from promptlatch.config import RedactionConfig, RuleConfig, Settings
 from tests.fixtures import GEMINI_FAKE, OPENAI_FAKE
 
 
@@ -86,16 +88,32 @@ def test_scan_params_returns_redaction_stats() -> None:
     assert OPENAI_FAKE not in result.value["messages"][0]["content"]
 
 
-def test_promptcloak_instance_uses_custom_rules() -> None:
-    cloak = PromptCloak(
+def test_promptlatch_instance_uses_custom_rules() -> None:
+    latch = PromptLatch(
         RedactionConfig(
             engine="basic",
             rules=[RuleConfig(type="exact", value="abcd1234", name="tail")],
         )
     )
 
-    result = cloak.scan_text("token=pc_live_000000000000abcd1234")
+    result = latch.scan_text("token=pl_live_000000000000abcd1234")
 
-    assert "pc_live_000000000000abcd1234" not in result.value
+    assert "pl_live_000000000000abcd1234" not in result.value
     assert "[REDACTED_SECRET]" in result.value
     assert result.stats.rule_hits["tail"] == 1
+
+
+def test_legacy_import_redacts_with_deprecation_warning() -> None:
+    with pytest.warns(FutureWarning, match="use promptlatch"):
+        from promptcloak import PromptCloak
+        from promptcloak.config import Settings as LegacySettings
+
+    assert LegacySettings is Settings
+    assert PromptCloak().text(f"OPENAI_API_KEY={OPENAI_FAKE}") == (
+        "OPENAI_API_KEY=[REDACTED_SECRET]"
+    )
+
+
+@pytest.mark.parametrize("module", ["audit", "compat", "patterns"])
+def test_legacy_submodules_remain_importable(module: str) -> None:
+    assert importlib.import_module(f"promptcloak.{module}")

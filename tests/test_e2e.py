@@ -8,7 +8,7 @@ import httpx
 import pytest
 import respx
 
-from promptcloak.config import (
+from promptlatch.config import (
     AuditConfig,
     CompatConfig,
     RedactionConfig,
@@ -16,7 +16,7 @@ from promptcloak.config import (
     Settings,
     TargetConfig,
 )
-from promptcloak.proxy import create_app
+from promptlatch.proxy import create_app
 from tests.fixtures import (
     CUSTOM_TAIL_SECRET,
     GEMINI_FAKE,
@@ -305,7 +305,7 @@ async def test_e2e_debug_headers_mask_redaction_rule_header(
         return_value=httpx.Response(200, json={"ok": True})
     )
 
-    with caplog.at_level(logging.WARNING, logger="promptcloak"):
+    with caplog.at_level(logging.WARNING, logger="promptlatch"):
         async with httpx.AsyncClient(
             transport=_transport(settings), base_url="http://proxy"
         ) as client:

@@ -1,24 +1,24 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "promptcloak.fullname" . }}
+  name: {{ include "promptlatch.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "promptcloak.name" . }}
+    app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "promptcloak.name" . }}
+      app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "promptcloak.name" . }}
+        app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
     spec:
       automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: promptcloak
+        - name: promptlatch
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
@@ -32,11 +32,15 @@ spec:
           {{- end }}
           env:
             {{- if .Values.serverAuth.enabled }}
-            - name: PROMPTCLOAK_SERVER_API_KEY
+            - name: PROMPTLATCH_REQUIRE_SERVER_API_KEY
+              value: "true"
+            {{- if not .Values.existingSecret }}
+            - name: PROMPTLATCH_SERVER_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "promptcloak.secretName" . | quote }}
-                  key: PROMPTCLOAK_SERVER_API_KEY
+                  name: {{ include "promptlatch.secretName" . | quote }}
+                  key: PROMPTLATCH_SERVER_API_KEY
+            {{- end }}
             {{- end }}
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
@@ -44,11 +48,11 @@ spec:
             {{- end }}
             {{- if not .Values.existingSecret }}
             {{- range $key, $value := .Values.secretEnv }}
-            {{- if or (ne $key "PROMPTCLOAK_SERVER_API_KEY") (not $.Values.serverAuth.enabled) }}
+            {{- if or (and (ne $key "PROMPTLATCH_SERVER_API_KEY") (ne $key "PROMPTCLOAK_SERVER_API_KEY")) (not $.Values.serverAuth.enabled) }}
             - name: {{ $key }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "promptcloak.fullname" $ }}-secret
+                  name: {{ include "promptlatch.secretName" $ | quote }}
                   key: {{ $key }}
             {{- end }}
             {{- end }}

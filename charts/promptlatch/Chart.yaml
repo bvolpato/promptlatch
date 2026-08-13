@@ -1,0 +1,7 @@
+apiVersion: v2
+name: promptlatch
+description: Local secret-redacting LLM proxy
+icon: https://raw.githubusercontent.com/bvolpato/promptlatch/main/site/favicon.svg
+type: application
+version: 0.2.0
+appVersion: "0.2.0"

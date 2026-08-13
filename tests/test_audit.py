@@ -1,4 +1,4 @@
-from promptcloak.patterns import AUDIT_EXCLUDED_PATTERN_NAMES, BUILTIN_PATTERNS
+from promptlatch.patterns import AUDIT_EXCLUDED_PATTERN_NAMES, BUILTIN_PATTERNS
 from scripts.audit_secrets import PATTERNS
 
 

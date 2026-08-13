@@ -1,13 +1,13 @@
-# Integrate PromptCloak
+# Integrate PromptLatch
 
-Add PromptCloak to redact secrets from LLM request content before it leaves this
+Add PromptLatch to redact secrets from LLM request content before it leaves this
 machine or application process.
 
 ## Inspect integration
 
 1. Inspect current LLM clients, agent configs, package manager, runtime, and deployment model.
-2. Read current PromptCloak README and use release commands shown there. This release
-   is distributed through GitHub releases; do not install the unrelated PyPI project.
+2. Read current PromptLatch README and use release commands shown there. PromptLatch is
+   not published to PyPI; install release wheel or use Homebrew, Docker, or source.
 3. Choose proxy mode or Python library mode based on where requests are created.
 
 Use proxy mode for coding agents, non-Python applications, or clients that accept
@@ -22,40 +22,40 @@ Homebrew:
 
 ```bash
 brew tap bvolpato/tap
-brew install promptcloak
-promptcloak version
+brew install promptlatch
+promptlatch version
 ```
 
 uv tool:
 
 ```bash
 uv tool install \
-  https://github.com/bvolpato/promptcloak/releases/download/v0.1.10/promptcloak-0.1.10-py3-none-any.whl
-promptcloak version
+  https://github.com/bvolpato/promptlatch/releases/download/v0.2.0/promptlatch-0.2.0-py3-none-any.whl
+promptlatch version
 ```
 
 Docker:
 
 ```bash
-docker pull ghcr.io/bvolpato/promptcloak:0.1.10
-docker run --rm --entrypoint promptcloak \
-  ghcr.io/bvolpato/promptcloak:0.1.10 version
+docker pull ghcr.io/bvolpato/promptlatch:0.2.0
+docker run --rm --entrypoint promptlatch \
+  ghcr.io/bvolpato/promptlatch:0.2.0 version
 ```
 
 Source checkout:
 
 ```bash
-git clone https://github.com/bvolpato/promptcloak.git
-cd promptcloak
+git clone https://github.com/bvolpato/promptlatch.git
+cd promptlatch
 uv sync --extra dev --locked
-uv run promptcloak version
+uv run promptlatch version
 ```
 
 For Python library mode, add release wheel to existing uv project:
 
 ```bash
 uv add \
-  https://github.com/bvolpato/promptcloak/releases/download/v0.1.10/promptcloak-0.1.10-py3-none-any.whl
+  https://github.com/bvolpato/promptlatch/releases/download/v0.2.0/promptlatch-0.2.0-py3-none-any.whl
 ```
 
 ## Security rules
@@ -68,7 +68,7 @@ uv add \
 - Leave `debug_requests: false` and do not add telemetry.
 - Use full redaction. Add custom tail-only rules for unknown internal formats.
 - Detection must remain deterministic; do not add entropy-only matching.
-- Provider authentication belongs outside request content. PromptCloak forwards
+- Provider authentication belongs outside request content. PromptLatch forwards
   configured upstream credentials and masks sensitive headers in debug output.
 - Use `X-Target-API-Key` or `X-Target-Authorization` for client-selected targets.
   Do not enable generic client authorization forwarding when proxy auth is enabled.
@@ -105,22 +105,22 @@ target key to a different host.
 
 Point OpenAI-compatible clients at `http://127.0.0.1:8000/v1`. Set Claude Code
 `ANTHROPIC_BASE_URL` to `http://127.0.0.1:8000`. Some SDKs require a local API-key
-value even when PromptCloak has no `server.api_key`; use a non-secret placeholder.
-Do not invent a PromptCloak key unless local proxy auth is enabled.
+value even when PromptLatch has no `server.api_key`; use a non-secret placeholder.
+Do not invent a PromptLatch key unless local proxy auth is enabled.
 
 For Codex and OpenCode with OpenRouter, start from checked-in files under
 `examples/`. They use dedicated target headers, keep key in environment, and leave
 Responses-to-Chat bridge off because OpenRouter supports native Responses. Claude
-Code uses Anthropic Messages; set provider key on PromptCloak and send separate
+Code uses Anthropic Messages; set provider key on PromptLatch and send separate
 local bearer token through `ANTHROPIC_AUTH_TOKEN` when proxy auth is enabled.
 
 ## Python library mode
 
-Install current PromptCloak release from README, then redact immediately before
+Install current PromptLatch release from README, then redact immediately before
 each SDK call:
 
 ```python
-from promptcloak import redact_messages, redact_params, redact_payload
+from promptlatch import redact_messages, redact_params, redact_payload
 
 safe_messages = redact_messages(messages)
 safe_params = redact_params(model=model, messages=messages, tools=tools)

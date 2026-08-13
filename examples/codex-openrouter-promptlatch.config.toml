@@ -1,9 +1,9 @@
 model = "openai/gpt-oss-120b"
-model_provider = "promptcloak-openrouter"
+model_provider = "promptlatch-openrouter"
 model_reasoning_effort = "high"
 
-[model_providers.promptcloak-openrouter]
-name = "PromptCloak OpenRouter"
+[model_providers.promptlatch-openrouter]
+name = "PromptLatch OpenRouter"
 base_url = "http://127.0.0.1:8000/v1"
 wire_api = "responses"
 env_http_headers = { "X-Target-API-Key" = "OPENROUTER_API_KEY" }

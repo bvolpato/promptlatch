@@ -8,13 +8,13 @@ RUN uv sync --no-dev --no-editable --locked
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    PROMPTCLOAK_HOST=0.0.0.0 \
-    PROMPTCLOAK_PORT=8000
+    PROMPTLATCH_HOST=0.0.0.0 \
+    PROMPTLATCH_PORT=8000
 
 WORKDIR /app
-RUN groupadd --gid 10001 promptcloak \
-    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin promptcloak
-COPY --from=builder --chown=promptcloak:promptcloak /app /app
+RUN groupadd --gid 10001 promptlatch \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin promptlatch
+COPY --from=builder --chown=promptlatch:promptlatch /app /app
 USER 10001:10001
 EXPOSE 8000
-CMD ["promptcloak", "serve", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["promptlatch", "serve", "--host", "0.0.0.0", "--port", "8000"]

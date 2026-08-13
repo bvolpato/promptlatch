@@ -3,13 +3,13 @@ requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "promptcloak"
-version = "0.1.10"
+name = "promptlatch"
+version = "0.2.0"
 description = "Local OpenAI-compatible proxy and Python library for redacting secrets before prompts leave your machine."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-authors = [{ name = "PromptCloak contributors" }]
+authors = [{ name = "PromptLatch contributors" }]
 keywords = ["openai", "proxy", "redaction", "secrets", "privacy", "llm"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -36,9 +36,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://bvolpato.github.io/promptcloak/"
-Repository = "https://github.com/bvolpato/promptcloak"
-Issues = "https://github.com/bvolpato/promptcloak/issues"
+Homepage = "https://bvolpato.github.io/promptlatch/"
+Repository = "https://github.com/bvolpato/promptlatch"
+Issues = "https://github.com/bvolpato/promptlatch/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -55,10 +55,10 @@ audit = [
 ]
 
 [project.scripts]
-promptcloak = "promptcloak.cli:app"
+promptlatch = "promptlatch.cli:app"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/promptcloak"]
+packages = ["src/promptlatch", "src/promptcloak"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

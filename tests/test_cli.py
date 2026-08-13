@@ -5,8 +5,8 @@ import subprocess
 import yaml
 from typer.testing import CliRunner
 
-from promptcloak.cli import app
-from promptcloak.version import __version__
+from promptlatch.cli import app
+from promptlatch.version import __version__
 
 
 def test_version_command() -> None:
@@ -39,10 +39,10 @@ def test_init_defaults_to_openai(tmp_path) -> None:
 def test_version_does_not_load_default_config(tmp_path) -> None:
     invalid_config = tmp_path / "invalid.yaml"
     invalid_config.write_text("[invalid", encoding="utf-8")
-    env = os.environ | {"PROMPTCLOAK_CONFIG": str(invalid_config)}
+    env = os.environ | {"PROMPTLATCH_CONFIG": str(invalid_config)}
 
     result = subprocess.run(
-        ["promptcloak", "version"],
+        ["promptlatch", "version"],
         capture_output=True,
         check=False,
         env=env,

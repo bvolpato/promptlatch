@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-_PATTERN_MODULE = runpy.run_path(ROOT / "src" / "promptcloak" / "patterns.py")
+_PATTERN_MODULE = runpy.run_path(str(ROOT / "src" / "promptlatch" / "patterns.py"))
 PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (name, pattern)
     for name, pattern in _PATTERN_MODULE["BUILTIN_PATTERNS"]

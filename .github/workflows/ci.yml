@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (${{ matrix.python-version }})
@@ -22,11 +26,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-      - run: uv python install "${{ matrix.python-version }}"
-      - run: uv sync --python "${{ matrix.python-version }}" --extra dev --locked
+      - name: Install Python
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: uv python install "$PYTHON_VERSION"
+      - name: Sync environment
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: uv sync --python "$PYTHON_VERSION" --extra dev --locked
       - run: uv run pytest
 
   package:
+    name: package
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -41,11 +52,11 @@ jobs:
       - run: uv run scripts/audit_secrets.py
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pyright src tests
+      - run: uv run pyright src tests scripts
       - run: uv run pip-audit
       - run: uv build
-      - run: helm lint ./charts/promptcloak
-      - run: helm template promptcloak ./charts/promptcloak >/dev/null
+      - run: helm lint ./charts/promptlatch
+      - run: helm template promptlatch ./charts/promptlatch >/dev/null
       - run: uv run scripts/check_helm.py
-      - run: docker build -t promptcloak:ci .
-      - run: docker run --rm --entrypoint promptcloak promptcloak:ci version
+      - run: docker build -t promptlatch:ci .
+      - run: docker run --rm --entrypoint promptlatch promptlatch:ci version

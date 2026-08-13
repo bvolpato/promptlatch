@@ -15,7 +15,7 @@ copyButton.addEventListener("click", async () => {
     await navigator.clipboard.writeText(await response.text());
     label.textContent = "Copied";
     icon.src = "./icons/check.svg";
-    status.textContent = "PromptCloak integration prompt copied.";
+    status.textContent = "PromptLatch integration prompt copied.";
   } catch {
     label.textContent = "Copy failed";
     status.textContent = "Prompt could not be copied. Open PROMPT.md from the repository.";

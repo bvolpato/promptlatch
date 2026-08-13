@@ -3,19 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PromptCloak</title>
+    <title>PromptLatch</title>
     <meta
       name="description"
       content="Open-source local proxy and Python library for redacting secrets before LLM requests leave your machine."
     />
-    <meta property="og:title" content="PromptCloak" />
+    <meta property="og:title" content="PromptLatch" />
     <meta
       property="og:description"
       content="Redact keys, tokens, private keys, signed URLs, and custom rules before requests reach LLM providers."
     />
-    <meta property="og:image" content="https://bvolpato.github.io/promptcloak/hero.png" />
+    <meta property="og:image" content="https://bvolpato.github.io/promptlatch/hero.png" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:image" content="https://bvolpato.github.io/promptcloak/hero.png" />
+    <meta name="twitter:image" content="https://bvolpato.github.io/promptlatch/hero.png" />
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./styles.css" />
     <script src="./highlight.js" defer></script>
@@ -23,9 +23,9 @@
   </head>
   <body>
     <header class="site-header">
-      <a class="brand" href="#top" aria-label="PromptCloak home">
-        <span class="brand-mark">PC</span>
-        <span>PromptCloak</span>
+      <a class="brand" href="#top" aria-label="PromptLatch home">
+        <img class="brand-mark" src="./favicon.svg" alt="" />
+        <span>PromptLatch</span>
       </a>
       <nav aria-label="Primary">
         <a href="#install">Install</a>
@@ -34,7 +34,7 @@
         <a href="#agents">Agents</a>
         <a href="#limits">Limits</a>
         <a href="#security">Security</a>
-        <a href="https://github.com/bvolpato/promptcloak">GitHub</a>
+        <a href="https://github.com/bvolpato/promptlatch">GitHub</a>
       </nav>
     </header>
 
@@ -42,9 +42,9 @@
       <section class="hero">
         <div class="hero-copy">
           <p class="eyebrow">Local secret redaction</p>
-          <h1>PromptCloak</h1>
+          <h1>PromptLatch</h1>
           <p class="lede">
-            PromptCloak runs locally and redacts credentials from LLM request content
+            PromptLatch runs locally and redacts credentials from LLM request content
             before sending it to a provider.
           </p>
           <div class="actions">
@@ -60,7 +60,7 @@
               <img class="button-icon" src="./icons/copy.svg" alt="" />
               <span id="copy-prompt-label">Copy prompt</span>
             </button>
-            <a class="button secondary" href="https://github.com/bvolpato/promptcloak">GitHub</a>
+            <a class="button secondary" href="https://github.com/bvolpato/promptlatch">GitHub</a>
             <span id="copy-prompt-status" class="sr-only" aria-live="polite"></span>
           </div>
         </div>
@@ -99,9 +99,9 @@
           </p>
         </div>
         <pre><code>brew tap bvolpato/tap
-brew install promptcloak
-promptcloak init
-promptcloak serve</code></pre>
+brew install promptlatch
+promptlatch init
+promptlatch serve</code></pre>
         <pre><code>FAKE_KEY="AI""zaSyFixtureToken000000000000000000000"
 curl --compressed -fsS http://127.0.0.1:8000/post \
   -H "X-Target-Base-URL: https://postman-echo.com" \
@@ -117,21 +117,21 @@ curl --compressed -fsS http://127.0.0.1:8000/post \
           <p class="eyebrow">Install</p>
           <h2>Install and run locally.</h2>
           <p>
-            Use PromptCloak as a local proxy for agents, or import it before direct SDK
+            Use PromptLatch as a local proxy for agents, or import it before direct SDK
             calls.
           </p>
         </div>
         <div class="code-grid">
           <pre><code>brew tap bvolpato/tap
-brew install promptcloak
-promptcloak init --target-base-url https://api.openai.com/v1
+brew install promptlatch
+promptlatch init --target-base-url https://api.openai.com/v1
 export OPENAI_API_KEY="&lt;openai-upstream-key&gt;"
-promptcloak serve</code></pre>
+promptlatch serve</code></pre>
           <pre><code>uv tool install \
-  https://github.com/bvolpato/promptcloak/releases/download/v0.1.10/promptcloak-0.1.10-py3-none-any.whl
-promptcloak doctor</code></pre>
+  https://github.com/bvolpato/promptlatch/releases/download/v0.2.0/promptlatch-0.2.0-py3-none-any.whl
+promptlatch doctor</code></pre>
           <pre><code>uv add \
-  https://github.com/bvolpato/promptcloak/releases/download/v0.1.10/promptcloak-0.1.10-py3-none-any.whl</code></pre>
+  https://github.com/bvolpato/promptlatch/releases/download/v0.2.0/promptlatch-0.2.0-py3-none-any.whl</code></pre>
         </div>
       </section>
 
@@ -140,7 +140,7 @@ promptcloak doctor</code></pre>
           <p class="eyebrow">Proxy mode</p>
           <h2>Choose upstream in config or per request.</h2>
           <p>
-            PromptCloak redacts JSON and text bodies, forwards the original route, and
+            PromptLatch redacts JSON and text bodies, forwards the original route, and
             leaves provider-specific fields intact. Set one default target, or send
             per-request target headers.
           </p>
@@ -212,7 +212,7 @@ curl http://127.0.0.1:8000/v1/responses \
           <p class="eyebrow">Library</p>
           <h2>Redact before SDK calls.</h2>
           <p>
-            Import PromptCloak helpers before OpenAI, LiteLLM, LangChain, Anthropic, or
+            Import PromptLatch helpers before OpenAI, LiteLLM, LangChain, Anthropic, or
             custom HTTP client calls.
           </p>
         </div>
@@ -220,7 +220,7 @@ curl http://127.0.0.1:8000/v1/responses \
           <article>
             <h3>OpenAI</h3>
             <pre><code>from openai import OpenAI
-from promptcloak import redact_messages
+from promptlatch import redact_messages
 
 client = OpenAI()
 client.chat.completions.create(
@@ -231,7 +231,7 @@ client.chat.completions.create(
           <article>
             <h3>LiteLLM</h3>
             <pre><code>from litellm import completion
-from promptcloak import redact_params
+from promptlatch import redact_params
 
 messages = [{"role": "user", "content": "API_KEY=&lt;secret&gt;"}]
 
@@ -242,7 +242,7 @@ completion(**redact_params(
           </article>
           <article>
             <h3>Responses API</h3>
-            <pre><code>from promptcloak import redact_params
+            <pre><code>from promptlatch import redact_params
 
 client.responses.create(**redact_params(
   model="gpt-5.5",
@@ -252,7 +252,7 @@ client.responses.create(**redact_params(
           <article>
             <h3>LangChain</h3>
             <pre><code>from langchain_openai import ChatOpenAI
-from promptcloak import redact_messages
+from promptlatch import redact_messages
 
 llm = ChatOpenAI(model="gpt-5.5")
 llm.invoke(redact_messages([
@@ -262,7 +262,7 @@ llm.invoke(redact_messages([
           <article>
             <h3>Anthropic</h3>
             <pre><code>from anthropic import Anthropic
-from promptcloak import redact_messages
+from promptlatch import redact_messages
 
 Anthropic().messages.create(
   model="claude-opus-4-8",
@@ -273,7 +273,7 @@ Anthropic().messages.create(
           <article>
             <h3>LlamaIndex</h3>
             <pre><code>from llama_index.llms.openai import OpenAI
-from promptcloak import redact_messages
+from promptlatch import redact_messages
 
 llm = OpenAI(model="gpt-5.5")
 llm.chat(redact_messages(messages))</code></pre>
@@ -290,24 +290,24 @@ llm.chat(redact_messages(messages))</code></pre>
           <article>
             <h3>Codex</h3>
             <pre><code>model = "openai/gpt-oss-120b"
-model_provider = "promptcloak-openrouter"
+model_provider = "promptlatch-openrouter"
 
-[model_providers.promptcloak-openrouter]
-name = "PromptCloak OpenRouter"
+[model_providers.promptlatch-openrouter]
+name = "PromptLatch OpenRouter"
 base_url = "http://127.0.0.1:8000/v1"
 wire_api = "responses"
 env_http_headers = { "X-Target-API-Key" = "OPENROUTER_API_KEY" }
 http_headers = { "X-Target-Base-URL" = "https://openrouter.ai/api/v1" }
 
-# ~/.codex/openrouter-promptcloak.config.toml
-# codex -p openrouter-promptcloak</code></pre>
-            <pre><code>cp examples/promptcloak-openrouter.config.yaml \
-  ~/.config/promptcloak/config.yaml
-cp examples/codex-openrouter-promptcloak.config.toml \
-  ~/.codex/openrouter-promptcloak.config.toml
+# ~/.codex/openrouter-promptlatch.config.toml
+# codex -p openrouter-promptlatch</code></pre>
+            <pre><code>cp examples/promptlatch-openrouter.config.yaml \
+  ~/.config/promptlatch/config.yaml
+cp examples/codex-openrouter-promptlatch.config.toml \
+  ~/.codex/openrouter-promptlatch.config.toml
 export OPENROUTER_API_KEY="&lt;openrouter-upstream-key&gt;"
-promptcloak serve
-codex -p openrouter-promptcloak</code></pre>
+promptlatch serve
+codex -p openrouter-promptlatch</code></pre>
             <p>Use a Responses-capable backend. Current Codex custom tools do not fit the Chat Completions bridge.</p>
           </article>
           <article>
@@ -315,9 +315,9 @@ codex -p openrouter-promptcloak</code></pre>
             <pre><code>{
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "promptcloak-openrouter": {
+    "promptlatch-openrouter": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "PromptCloak OpenRouter",
+      "name": "PromptLatch OpenRouter",
       "options": {
         "baseURL": "http://127.0.0.1:8000/v1",
         "headers": {
@@ -327,28 +327,28 @@ codex -p openrouter-promptcloak</code></pre>
       },
       "models": {
         "openai/gpt-oss-120b": {
-          "name": "gpt-oss via PromptCloak"
+          "name": "gpt-oss via PromptLatch"
         }
       }
     }
   },
-  "model": "promptcloak-openrouter/openai/gpt-oss-120b"
+  "model": "promptlatch-openrouter/openai/gpt-oss-120b"
 }</code></pre>
             <pre><code>export OPENROUTER_API_KEY="&lt;openrouter-upstream-key&gt;"
 opencode run \
-  -m promptcloak-openrouter/openai/gpt-oss-120b \
-  "Reply with exactly: promptcloak-opencode-ok"</code></pre>
+  -m promptlatch-openrouter/openai/gpt-oss-120b \
+  "Reply with exactly: promptlatch-opencode-ok"</code></pre>
           </article>
           <article>
             <h3>Claude Code</h3>
-            <pre><code>export PROMPTCLOAK_TARGET_BASE_URL="https://api.anthropic.com"
-export PROMPTCLOAK_TARGET_API_KEY="$ANTHROPIC_UPSTREAM_API_KEY"
-export PROMPTCLOAK_TARGET_API_KEY_HEADER="x-api-key"
-export PROMPTCLOAK_SERVER_API_KEY="&lt;local-proxy-key&gt;"
-promptcloak serve
+            <pre><code>export PROMPTLATCH_TARGET_BASE_URL="https://api.anthropic.com"
+export PROMPTLATCH_TARGET_API_KEY="$ANTHROPIC_UPSTREAM_API_KEY"
+export PROMPTLATCH_TARGET_API_KEY_HEADER="x-api-key"
+export PROMPTLATCH_SERVER_API_KEY="&lt;local-proxy-key&gt;"
+promptlatch serve
 
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
-export ANTHROPIC_AUTH_TOKEN="$PROMPTCLOAK_SERVER_API_KEY"
+export ANTHROPIC_AUTH_TOKEN="$PROMPTLATCH_SERVER_API_KEY"
 export DISABLE_TELEMETRY=1
 claude</code></pre>
           </article>
@@ -360,7 +360,7 @@ claude</code></pre>
           <p class="eyebrow">Limits</p>
           <h2>Request redaction has a clear boundary.</h2>
           <p>
-            PromptCloak scans request bodies and query parameters before forwarding.
+            PromptLatch scans request bodies and query parameters before forwarding.
             Some credential flows are outside that boundary.
           </p>
         </div>
@@ -383,28 +383,28 @@ claude</code></pre>
         <div class="agent-grid">
           <article>
             <h3>Docker</h3>
-            <pre><code>docker run -d --name promptcloak --rm \
+            <pre><code>docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
-  --env-file "$HOME/.config/promptcloak/provider.env" \
-  ghcr.io/bvolpato/promptcloak:0.1.10
+  --env-file "$HOME/.config/promptlatch/provider.env" \
+  ghcr.io/bvolpato/promptlatch:0.2.0
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz</code></pre>
           </article>
           <article>
             <h3>Helm</h3>
-            <pre><code>kubectl create secret generic promptcloak-env \
-  --from-env-file="$HOME/.config/promptcloak/kubernetes.env"
+            <pre><code>kubectl create secret generic promptlatch-env \
+  --from-env-file="$HOME/.config/promptlatch/kubernetes.env"
 
-helm install promptcloak \
-  https://github.com/bvolpato/promptcloak/releases/download/v0.1.10/promptcloak-0.1.10.tgz \
-  --set env.PROMPTCLOAK_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
-  --set existingSecret=promptcloak-env
+helm install promptlatch \
+  https://github.com/bvolpato/promptlatch/releases/download/v0.2.0/promptlatch-0.2.0.tgz \
+  --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
+  --set existingSecret=promptlatch-env
 
-kubectl wait deployment/promptcloak --for=condition=Available --timeout=90s
-export PROMPTCLOAK_SERVER_API_KEY="$(kubectl get secret promptcloak-env \
-  -o jsonpath='{.data.PROMPTCLOAK_SERVER_API_KEY}' | base64 --decode)"
-kubectl port-forward svc/promptcloak 8000:8000
+kubectl wait deployment/promptlatch --for=condition=Available --timeout=90s
+export PROMPTLATCH_SERVER_API_KEY="$(kubectl get secret promptlatch-env \
+  -o jsonpath='{.data.PROMPTLATCH_SERVER_API_KEY}' | base64 --decode)"
+kubectl port-forward svc/promptlatch 8000:8000
 curl -fsS http://127.0.0.1:8000/healthz</code></pre>
           </article>
         </div>
@@ -461,8 +461,8 @@ curl -fsS http://127.0.0.1:8000/healthz</code></pre>
 
     <footer>
       <span>MIT licensed.</span>
-      <a href="https://github.com/bvolpato/promptcloak">GitHub</a>
-      <a href="https://github.com/bvolpato/promptcloak/blob/main/SECURITY.md">Security</a>
+      <a href="https://github.com/bvolpato/promptlatch">GitHub</a>
+      <a href="https://github.com/bvolpato/promptlatch/blob/main/SECURITY.md">Security</a>
     </footer>
   </body>
 </html>

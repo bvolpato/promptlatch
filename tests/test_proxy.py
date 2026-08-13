@@ -6,8 +6,8 @@ import httpx
 import pytest
 import respx
 
-from promptcloak.config import CompatConfig, RedactionConfig, ServerConfig, Settings, TargetConfig
-from promptcloak.proxy import create_app
+from promptlatch.config import CompatConfig, RedactionConfig, ServerConfig, Settings, TargetConfig
+from promptlatch.proxy import create_app
 from tests.fixtures import OPENAI_FAKE, PROVIDER_FIXTURES
 
 
@@ -290,11 +290,11 @@ async def test_per_request_redaction_rules() -> None:
         response = await client.post(
             "/v1/chat/completions",
             headers={"X-Redact-Extra-Rules": '[{"type":"exact","value":"abcd1234","name":"tail"}]'},
-            json={"messages": [{"role": "user", "content": "token pc_live_000000abcd1234"}]},
+            json={"messages": [{"role": "user", "content": "token pl_live_000000abcd1234"}]},
         )
 
     assert response.status_code == 200
-    assert "pc_live_000000abcd1234" not in route.calls.last.request.content.decode()
+    assert "pl_live_000000abcd1234" not in route.calls.last.request.content.decode()
 
 
 @pytest.mark.asyncio
@@ -810,7 +810,7 @@ async def test_debug_requests_log_raw_and_redacted_bodies(caplog: pytest.LogCapt
     )
     transport = httpx.ASGITransport(app=create_app(settings))
 
-    with caplog.at_level(logging.WARNING, logger="promptcloak"):
+    with caplog.at_level(logging.WARNING, logger="promptlatch"):
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             response = await client.post(
                 "/v1/chat/completions",
@@ -941,7 +941,7 @@ async def test_debug_requests_trace_rejected_responses_bridge_payload(
     )
     transport = httpx.ASGITransport(app=create_app(settings))
 
-    with caplog.at_level(logging.WARNING, logger="promptcloak"):
+    with caplog.at_level(logging.WARNING, logger="promptlatch"):
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             response = await client.post(
                 "/v1/responses",

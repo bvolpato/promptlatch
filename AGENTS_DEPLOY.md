@@ -13,12 +13,13 @@ PromptLatch ships through signed Git tag, GitHub Actions, Homebrew tap, GitHub P
 6. Create and push signed tag:
 
 ```bash
-VERSION=0.2.0
+VERSION=0.2.1
 git tag -s "v${VERSION}" -m "PromptLatch ${VERSION}"
 git push origin "v${VERSION}"
 ```
 
-Tag triggers `.github/workflows/release.yml`. Workflow publishes GitHub assets and GHCR image.
+Tag triggers `.github/workflows/release.yml`. Workflow publishes Python distributions to PyPI,
+GitHub assets, and GHCR image.
 
 ## Homebrew
 

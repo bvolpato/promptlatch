@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "promptlatch"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local OpenAI-compatible proxy and Python library for redacting secrets before prompts leave your machine."
 readme = "README.md"
 requires-python = ">=3.12"

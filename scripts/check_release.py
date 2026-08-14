@@ -54,16 +54,18 @@ def read_lock_version() -> str:
 
 
 def required_release_references(version: str) -> dict[str, tuple[Path, str]]:
-    wheel = f"releases/download/v{version}/promptlatch-{version}-py3-none-any.whl"
     chart = f"releases/download/v{version}/promptlatch-{version}.tgz"
     image = f"ghcr.io/bvolpato/promptlatch:{version}"
     return {
-        "README wheel": (ROOT / "README.md", wheel),
+        "README PyPI tool": (ROOT / "README.md", "uv tool install promptlatch"),
+        "README PyPI library": (ROOT / "README.md", "uv add promptlatch"),
         "README Helm chart": (ROOT / "README.md", chart),
         "README container": (ROOT / "README.md", image),
-        "PROMPT wheel": (ROOT / "PROMPT.md", wheel),
+        "PROMPT PyPI tool": (ROOT / "PROMPT.md", "uv tool install promptlatch"),
+        "PROMPT PyPI library": (ROOT / "PROMPT.md", "uv add promptlatch"),
         "PROMPT container": (ROOT / "PROMPT.md", image),
-        "site wheel": (ROOT / "site" / "index.html", wheel),
+        "site PyPI tool": (ROOT / "site" / "index.html", "uv tool install promptlatch"),
+        "site PyPI library": (ROOT / "site" / "index.html", "uv add promptlatch"),
         "site Helm chart": (ROOT / "site" / "index.html", chart),
         "site container": (ROOT / "site" / "index.html", image),
     }

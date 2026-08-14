@@ -6,8 +6,7 @@ machine or application process.
 ## Inspect integration
 
 1. Inspect current LLM clients, agent configs, package manager, runtime, and deployment model.
-2. Read current PromptLatch README and use release commands shown there. PromptLatch is
-   not published to PyPI; install release wheel or use Homebrew, Docker, or source.
+2. Read current PromptLatch README and use release commands shown there.
 3. Choose proxy mode or Python library mode based on where requests are created.
 
 Use proxy mode for coding agents, non-Python applications, or clients that accept
@@ -29,17 +28,16 @@ promptlatch version
 uv tool:
 
 ```bash
-uv tool install \
-  https://github.com/bvolpato/promptlatch/releases/download/v0.2.0/promptlatch-0.2.0-py3-none-any.whl
+uv tool install promptlatch
 promptlatch version
 ```
 
 Docker:
 
 ```bash
-docker pull ghcr.io/bvolpato/promptlatch:0.2.0
+docker pull ghcr.io/bvolpato/promptlatch:0.2.1
 docker run --rm --entrypoint promptlatch \
-  ghcr.io/bvolpato/promptlatch:0.2.0 version
+  ghcr.io/bvolpato/promptlatch:0.2.1 version
 ```
 
 Source checkout:
@@ -51,11 +49,10 @@ uv sync --extra dev --locked
 uv run promptlatch version
 ```
 
-For Python library mode, add release wheel to existing uv project:
+For Python library mode, add PromptLatch to existing uv project:
 
 ```bash
-uv add \
-  https://github.com/bvolpato/promptlatch/releases/download/v0.2.0/promptlatch-0.2.0-py3-none-any.whl
+uv add promptlatch
 ```
 
 ## Security rules

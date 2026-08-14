@@ -23,7 +23,7 @@ uv build
 Release tags create GitHub releases through `.github/workflows/release.yml`.
 
 ```bash
-VERSION=0.2.0
+VERSION=0.2.1
 uv run scripts/check_release.py --tag "v${VERSION}"
 uv run scripts/audit_secrets.py
 uv run ruff check .

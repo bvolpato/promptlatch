@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling==1.31.0"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -25,7 +25,7 @@ classifiers = [
 ]
 
 dependencies = [
-  "bc-detect-secrets==1.5.47",
+  "bc-detect-secrets==1.5.49",
   "cryptography>=50.0.0",
   "fastapi>=0.141.1",
   "httpx>=0.28.1",

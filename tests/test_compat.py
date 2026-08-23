@@ -6,6 +6,7 @@ import pytest
 
 from promptlatch.compat import (
     ResponsesInputError,
+    chat_response_to_responses,
     chat_stream_to_responses,
     responses_to_chat_payload,
 )
@@ -35,7 +36,8 @@ async def test_chat_stream_preserves_utf8_split_across_chunks() -> None:
             {"choices": [{"delta": {"content": "😀"}}]},
             ensure_ascii=False,
         )
-        + "\n\ndata: [DONE]\n\n"
+        + '\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        + "data: [DONE]\n\n"
     ).encode()
     split = raw.index("😀".encode()) + 2
 
@@ -47,7 +49,11 @@ async def test_chat_stream_preserves_utf8_split_across_chunks() -> None:
 
 @pytest.mark.asyncio
 async def test_chat_stream_accepts_crlf_events_split_between_chunks() -> None:
-    raw = b'data: {"choices":[{"delta":{"content":"hello"}}]}\r\n\r\ndata: [DONE]\r\n\r\n'
+    raw = (
+        b'data: {"choices":[{"delta":{"content":"hello"}}]}\r\n\r\n'
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\r\n\r\n'
+        b"data: [DONE]\r\n\r\n"
+    )
     split = raw.index(b"\r\n") + 1
 
     output = await _collect([raw[:split], raw[split:]])
@@ -55,6 +61,95 @@ async def test_chat_stream_accepts_crlf_events_split_between_chunks() -> None:
     deltas = [event["delta"] for event in _events(output) if event["type"].endswith(".delta")]
     assert deltas == ["hello"]
     assert any(event["type"] == "response.completed" for event in _events(output))
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_marks_token_limit_as_incomplete() -> None:
+    output = await _collect(
+        [
+            b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+            b"data: [DONE]\n\n"
+        ]
+    )
+
+    events = _events(output)
+    terminal = events[-1]
+    assert terminal["type"] == "response.incomplete"
+    assert terminal["response"]["status"] == "incomplete"
+    assert terminal["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert not any(event["type"] == "response.completed" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_event",
+    [
+        b'data: {"error":{"code":"rate_limit_exceeded","message":"try later"}}\n\n',
+        b'event: error\ndata: {"code":"rate_limit_exceeded","message":"try later"}\n\n',
+    ],
+)
+async def test_chat_stream_marks_upstream_error_as_failed(raw_event: bytes) -> None:
+    output = await _collect([raw_event])
+
+    events = _events(output)
+    assert any(
+        event["type"] == "error"
+        and event["code"] == "rate_limit_exceeded"
+        and event["message"] == "try later"
+        for event in events
+    )
+    assert events[-1]["type"] == "response.failed"
+    assert not any(event["type"] == "response.completed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_marks_missing_done_event_as_failed() -> None:
+    output = await _collect(
+        [
+            b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        ]
+    )
+
+    events = _events(output)
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["error"]["code"] == "upstream_stream_truncated"
+    assert not any(event["type"] == "response.completed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_marks_interrupted_iterator_as_failed() -> None:
+    async def interrupted_chunks():
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        raise ConnectionError("fixture disconnect")
+
+    output = b"".join(
+        [chunk async for chunk in chat_stream_to_responses(interrupted_chunks())]
+    ).decode()
+
+    events = _events(output)
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["error"]["code"] == "upstream_stream_interrupted"
+    assert not any(event["type"] == "response.completed" for event in events)
+
+
+def test_chat_response_marks_token_limit_as_incomplete() -> None:
+    response = chat_response_to_responses(
+        {
+            "id": "chatcmpl_fixture",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "partial"},
+                    "finish_reason": "length",
+                }
+            ],
+        }
+    )
+
+    assert response["status"] == "incomplete"
+    assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert response["end_turn"] is False
 
 
 def test_responses_vision_input_uses_chat_image_url_shape() -> None:

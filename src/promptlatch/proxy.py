@@ -168,10 +168,10 @@ async def forward_request(request: Request, path: str) -> Response:
         raise HTTPException(status_code=502, detail=f"upstream request failed: {exc}") from exc
 
     if _is_streaming(upstream.headers):
-        transform_stream = compat_responses_to_chat
+        transform_stream = compat_responses_to_chat and upstream.is_success
         response_headers = _response_headers(upstream.headers, transformed=transform_stream)
         stream = _stream_upstream(upstream, close_client, client, decoded=transform_stream)
-        if compat_responses_to_chat:
+        if transform_stream:
             stream = chat_stream_to_responses(stream)
             response_headers["content-type"] = "text/event-stream; charset=utf-8"
         return StreamingResponse(
@@ -181,7 +181,7 @@ async def forward_request(request: Request, path: str) -> Response:
             media_type=response_headers.get("content-type"),
         )
 
-    transform_response = compat_responses_to_chat
+    transform_response = compat_responses_to_chat and upstream.is_success
     response_headers = _response_headers(upstream.headers, transformed=transform_response)
     upstream_content = (
         await upstream.aread() if transform_response else await _read_raw_upstream(upstream)
@@ -191,13 +191,13 @@ async def forward_request(request: Request, path: str) -> Response:
         await client.aclose()
 
     upstream_payload: Any | None = None
-    if compat_responses_to_chat and _is_json_content(upstream.headers):
+    if transform_response and _is_json_content(upstream.headers):
         try:
             upstream_payload = json.loads(upstream_content)
         except ValueError:
             upstream_payload = None
 
-    if compat_responses_to_chat and isinstance(upstream_payload, dict):
+    if transform_response and isinstance(upstream_payload, dict):
         response_payload = chat_response_to_responses(upstream_payload)
         return JSONResponse(
             response_payload,

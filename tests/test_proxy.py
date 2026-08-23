@@ -859,7 +859,12 @@ async def test_responses_to_chat_bridge_rewrites_request_and_response() -> None:
             200,
             json={
                 "id": "chatcmpl_fixture",
-                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
             },
         )
@@ -885,6 +890,66 @@ async def test_responses_to_chat_bridge_rewrites_request_and_response() -> None:
     ]
     assert response.json()["output"][0]["content"][0]["text"] == "ok"
     assert response.json()["usage"]["total_tokens"] == 5
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_responses_to_chat_bridge_preserves_upstream_http_error() -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1",
+            block_private_targets=False,
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        compat=CompatConfig(responses_to_chat=True),
+    )
+    upstream_error = {
+        "error": {"type": "rate_limit_error", "code": "rate_limit_exceeded", "message": "later"}
+    }
+    respx.post("https://upstream.example/v1/chat/completions").mock(
+        return_value=httpx.Response(429, json=upstream_error)
+    )
+    transport = httpx.ASGITransport(app=create_app(settings))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses", json={"model": "fixture-model", "input": "hello"}
+        )
+
+    assert response.status_code == 429
+    assert response.json() == upstream_error
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_responses_to_chat_bridge_does_not_transform_streaming_http_error() -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1",
+            block_private_targets=False,
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        compat=CompatConfig(responses_to_chat=True),
+    )
+    upstream_body = b'data: {"error":{"code":"overloaded","message":"later"}}\n\n'
+    respx.post("https://upstream.example/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            503,
+            content=upstream_body,
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+    transport = httpx.ASGITransport(app=create_app(settings))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "fixture-model", "stream": True, "input": "hello"},
+        )
+
+    assert response.status_code == 503
+    assert response.content == upstream_body
+    assert "response.completed" not in response.text
 
 
 @pytest.mark.asyncio
@@ -1086,6 +1151,8 @@ async def test_responses_to_chat_bridge_streams_responses_events() -> None:
                 b'data: {"id":"chatcmpl_fixture","choices":[{"delta":{"content":"he"}}]}\n\n'
                 b'data: {"id":"chatcmpl_fixture","choices":[{"delta":{"content":"llo"}}],'
                 b'"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+                b'data: {"id":"chatcmpl_fixture","choices":[{"delta":{},'
+                b'"finish_reason":"stop"}]}\n\n'
                 b"data: [DONE]\n\n"
             ),
             headers={"content-type": "text/event-stream"},
@@ -1142,7 +1209,8 @@ async def test_responses_to_chat_bridge_maps_chat_tool_calls() -> None:
                                     },
                                 }
                             ],
-                        }
+                        },
+                        "finish_reason": "tool_calls",
                     }
                 ],
             },

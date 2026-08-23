@@ -45,14 +45,32 @@ def responses_to_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def chat_response_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
     response_id = _response_id(payload)
     output = _chat_message_to_response_items(_chat_message(payload), response_id)
-    return {
+    finish_reason = _chat_finish_reason(payload)
+    response: dict[str, Any] = {
         "id": response_id,
         "object": "response",
-        "status": "completed",
         "output": output,
         "usage": _responses_usage(payload.get("usage")),
-        "end_turn": True,
     }
+    if finish_reason in {"stop", "tool_calls", "function_call"}:
+        response.update(status="completed", end_turn=True)
+    elif finish_reason in {"length", "content_filter"}:
+        reason = "max_output_tokens" if finish_reason == "length" else "content_filter"
+        response.update(
+            status="incomplete",
+            incomplete_details={"reason": reason},
+            end_turn=False,
+        )
+    else:
+        response.update(
+            status="failed",
+            error={
+                "code": "upstream_response_invalid",
+                "message": "Upstream Chat Completions response has no valid finish reason.",
+            },
+            end_turn=False,
+        )
+    return response
 
 
 async def chat_stream_to_responses(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
@@ -66,7 +84,18 @@ async def chat_stream_to_responses(chunks: AsyncIterator[bytes]) -> AsyncIterato
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     buffer = ""
     event_lines: list[str] = []
-    async for chunk in chunks:
+    iterator = aiter(chunks)
+    while True:
+        try:
+            chunk = await anext(iterator)
+        except StopAsyncIteration:
+            break
+        except Exception:
+            for event in state.failure_events(
+                "upstream_stream_interrupted", "Upstream stream failed before completion."
+            ):
+                yield event
+            return
         buffer += decoder.decode(chunk)
         while (line := _pop_sse_line(buffer)) is not None:
             value, buffer = line
@@ -90,7 +119,9 @@ async def chat_stream_to_responses(chunks: AsyncIterator[bytes]) -> AsyncIterato
     if event_lines:
         async for event in _chat_sse_event_to_responses("\n".join(event_lines), state):
             yield event
-    for event in state.finish_events():
+    for event in state.failure_events(
+        "upstream_stream_truncated", "Upstream stream ended before the [DONE] event."
+    ):
         yield event
 
 
@@ -115,6 +146,7 @@ class _ChatStreamState:
         self.message_started = False
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.usage: dict[str, Any] | None = None
+        self.finish_reason: str | None = None
         self.finished = False
 
     def text_delta_events(self, delta: str) -> list[bytes]:
@@ -166,9 +198,61 @@ class _ChatStreamState:
     def finish_events(self) -> list[bytes]:
         if self.finished:
             return []
+        if self.finish_reason not in {
+            "stop",
+            "tool_calls",
+            "function_call",
+            "length",
+            "content_filter",
+        }:
+            return self.failure_events(
+                "upstream_stream_invalid",
+                "Upstream stream ended without a valid finish reason.",
+            )
         self.finished = True
-        events = []
-        output = []
+        events, output = self._output_events()
+        incomplete = self.finish_reason in {"length", "content_filter"}
+        status = "incomplete" if incomplete else "completed"
+        response: dict[str, Any] = {
+            "id": self.response_id,
+            "status": status,
+            "output": output,
+            "usage": _responses_usage(self.usage),
+            "end_turn": not incomplete,
+        }
+        if incomplete:
+            reason = "max_output_tokens" if self.finish_reason == "length" else "content_filter"
+            response["incomplete_details"] = {"reason": reason}
+        events.append(_sse({"type": f"response.{status}", "response": response}))
+        return events
+
+    def failure_events(self, code: str, message: str) -> list[bytes]:
+        if self.finished:
+            return []
+        self.finished = True
+        events, output = self._output_events()
+        error = {"code": code, "message": message}
+        events.append(_sse({"type": "error", **error, "param": None}))
+        events.append(
+            _sse(
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "id": self.response_id,
+                        "status": "failed",
+                        "output": output,
+                        "usage": _responses_usage(self.usage),
+                        "error": error,
+                        "end_turn": False,
+                    },
+                }
+            )
+        )
+        return events
+
+    def _output_events(self) -> tuple[list[bytes], list[dict[str, Any]]]:
+        events: list[bytes] = []
+        output: list[dict[str, Any]] = []
         if self.message_started:
             item = self.message_item(self.text)
             output.append(item)
@@ -177,24 +261,18 @@ class _ChatStreamState:
             item = self.tool_item(tool_call)
             output.append(item)
             events.append(_sse({"type": "response.output_item.done", "item": item}))
-        events.append(
-            _sse(
-                {
-                    "type": "response.completed",
-                    "response": {
-                        "id": self.response_id,
-                        "status": "completed",
-                        "output": output,
-                        "usage": _responses_usage(self.usage),
-                        "end_turn": True,
-                    },
-                }
-            )
-        )
-        return events
+        return events, output
 
 
 async def _chat_sse_event_to_responses(raw: str, state: _ChatStreamState) -> AsyncIterator[bytes]:
+    event_name = next(
+        (
+            line.removeprefix("event:").lstrip()
+            for line in raw.splitlines()
+            if line.startswith("event:")
+        ),
+        None,
+    )
     data = "\n".join(
         line.removeprefix("data:").lstrip() for line in raw.splitlines() if line.startswith("data:")
     )
@@ -207,10 +285,33 @@ async def _chat_sse_event_to_responses(raw: str, state: _ChatStreamState) -> Asy
     try:
         payload = json.loads(data)
     except json.JSONDecodeError:
+        for event in state.failure_events(
+            "upstream_stream_invalid", "Upstream stream contained invalid JSON."
+        ):
+            yield event
+        return
+    if not isinstance(payload, dict):
+        for event in state.failure_events(
+            "upstream_stream_invalid", "Upstream stream event must contain a JSON object."
+        ):
+            yield event
+        return
+    upstream_error = payload.get("error")
+    if event_name == "error" or isinstance(upstream_error, dict):
+        error = upstream_error if isinstance(upstream_error, dict) else payload
+        raw_code = error.get("code")
+        raw_message = error.get("message")
+        code = raw_code if isinstance(raw_code, str) else "upstream_error"
+        message = raw_message if isinstance(raw_message, str) else "Upstream error."
+        for event in state.failure_events(code, message):
+            yield event
         return
     if payload.get("usage"):
         state.usage = payload["usage"]
     for choice in payload.get("choices") or []:
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None:
+            state.finish_reason = finish_reason if isinstance(finish_reason, str) else ""
         delta = choice.get("delta") or {}
         if delta.get("content"):
             for event in state.text_delta_events(delta["content"]):
@@ -421,6 +522,15 @@ def _chat_message(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(message, dict):
             return message
     return {}
+
+
+def _chat_finish_reason(payload: dict[str, Any]) -> str | None:
+    choices = payload.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        finish_reason = choices[0].get("finish_reason")
+        if isinstance(finish_reason, str):
+            return finish_reason
+    return None
 
 
 def _chat_message_to_response_items(

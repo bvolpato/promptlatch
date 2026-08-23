@@ -13,7 +13,7 @@ PromptLatch ships through signed Git tag, GitHub Actions, Homebrew tap, GitHub P
 6. Create and push signed tag:
 
 ```bash
-VERSION=0.2.1
+VERSION=0.2.2
 git tag -s "v${VERSION}" -m "PromptLatch ${VERSION}"
 git push origin "v${VERSION}"
 ```

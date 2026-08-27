@@ -25,7 +25,7 @@ classifiers = [
 ]
 
 dependencies = [
-  "bc-detect-secrets==1.5.49",
+  "bc-detect-secrets==1.5.50",
   "cryptography>=50.0.0",
   "fastapi>=0.141.1",
   "httpx>=0.28.1",

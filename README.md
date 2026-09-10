@@ -714,6 +714,12 @@ Without `existingSecret`, chart generates proxy key and stores `secretEnv` value
 chart-managed Secret. Send `Authorization: Bearer $PROMPTLATCH_SERVER_API_KEY` on
 proxied requests. Health probes remain unauthenticated.
 
+Services route only to pods from their own release. Connected Helm upgrades preserve
+the existing Deployment selector. For offline upgrades of charts through 0.2.2, set
+`migration.preserveSelector=true` and retain it on later offline upgrades. Omit it on
+fresh installs. Old Deployments keep their broad immutable selectors; replacing them
+is required for controller isolation, even though Service routing is isolated.
+
 ## Emergency request tracing
 
 `promptlatch serve --debug-requests` logs raw request bodies before redaction. Restrict it to local fixture data and cases where an echo target is insufficient. Auth, target-key, and redaction-rule headers are masked; body text is visible.

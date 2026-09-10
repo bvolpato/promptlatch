@@ -3,7 +3,7 @@ kind: Service
 metadata:
   name: {{ include "promptlatch.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
+    {{- include "promptlatch.selectorLabels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   ports:
@@ -12,4 +12,4 @@ spec:
       protocol: TCP
       name: http
   selector:
-    app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
+    {{- include "promptlatch.selectorLabels" . | nindent 4 }}

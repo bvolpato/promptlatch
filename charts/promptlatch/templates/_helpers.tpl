@@ -24,6 +24,24 @@ promptcloak
 {{- end -}}
 {{- end -}}
 
+{{- define "promptlatch.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "promptlatch.deploymentSelector" -}}
+{{- $root := .root -}}
+{{- if .existingSelector -}}
+{{- toYaml .existingSelector -}}
+{{- else if or $root.Values.migration.preserveLegacyNames (get $root.Values.migration "preserveSelector") -}}
+matchLabels:
+  app.kubernetes.io/name: {{ include "promptlatch.selectorName" $root }}
+{{- else -}}
+matchLabels:
+  {{- include "promptlatch.selectorLabels" $root | nindent 2 }}
+{{- end -}}
+{{- end -}}
+
 {{- define "promptlatch.secretName" -}}
 {{- if .Values.existingSecret -}}
 {{ .Values.existingSecret }}

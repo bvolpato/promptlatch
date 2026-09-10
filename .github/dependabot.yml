@@ -4,6 +4,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Keep direct constraints ranged so uv updates only need lockfile changes.
     versioning-strategy: lockfile-only
     cooldown:
       default-days: 7

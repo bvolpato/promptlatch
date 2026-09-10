@@ -97,14 +97,7 @@ class PromptLatch:
         field_names = getattr(type(message), "model_fields", None)
         model_copy = getattr(message, "model_copy", None)
         if isinstance(field_names, Mapping) and callable(model_copy):
-            stats = RedactionStats()
-            updates: dict[str, Any] = {}
-            for name in field_names:
-                result = self.scan_payload(getattr(message, name))
-                _merge_stats(stats, result.stats)
-                if result.stats.redactions:
-                    updates[name] = result.value
-            return RedactionResult(model_copy(update=updates), stats)
+            return self.scan_payload(message)
 
         content_result = self.scan_payload(message.content)
         return RedactionResult(_with_content(message, content_result.value), content_result.stats)

@@ -190,6 +190,10 @@ result = scan_messages(messages)
 assert result.stats.redactions >= 1
 ```
 
+Nested Pydantic messages and tool calls retain their types and leave the originals
+unchanged. A detected secret in a model's extra field name raises `ValueError` rather
+than returning an unsafe payload. Do not send the original input after a scanning error.
+
 For custom tail-only rules:
 
 ```python
@@ -609,9 +613,11 @@ Coverage includes fixture-shaped examples for:
   `authorization`, `credentials`, `signed_url`, and `sas_token`.
 - User-defined exact-tail and regex rules for private formats.
 
-JSON is scanned structurally. Query parameters and unencoded non-JSON bodies, including
-multipart requests, are scanned without changing unrelated bytes. Encoded request bodies are
-rejected while redaction is enabled; decompress them before sending.
+JSON, query parameters, and URL-encoded form fields are scanned structurally.
+Other unencoded text bodies are scanned without changing unrelated bytes.
+Multipart uploads are rejected with `415` while redaction is enabled: raw byte
+scanning cannot reliably protect attachment contents or form fields. Compressed
+request bodies are also rejected; decompress them before sending.
 
 Every scan runs locally without an LLM. Entropy-only matching is disabled; use
 custom rules for opaque internal formats.
@@ -711,6 +717,8 @@ proxied requests. Health probes remain unauthenticated.
 ## Emergency request tracing
 
 `promptlatch serve --debug-requests` logs raw request bodies before redaction. Restrict it to local fixture data and cases where an echo target is insufficient. Auth, target-key, and redaction-rule headers are masked; body text is visible.
+
+Uvicorn access logs are disabled in both normal and debug mode to avoid logging query-string secrets.
 
 ## Development
 

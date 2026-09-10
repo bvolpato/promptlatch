@@ -365,6 +365,7 @@ claude</code></pre>
         <ul>
           <li>Provider auth is added from config or dedicated target headers after client header filtering.</li>
           <li>Unknown private token formats need a custom exact-tail or regex rule.</li>
+          <li>Multipart uploads and compressed request bodies are rejected while redaction is enabled.</li>
           <li>Provider responses pass through without scanning or redaction.</li>
           <li><code>--debug-requests</code> can print raw local request bodies. Use fixture data only.</li>
         </ul>

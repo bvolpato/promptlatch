@@ -52,6 +52,7 @@ def serve(
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("promptlatch").setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = load_settings(config)
     if host:
         settings.server.host = host
@@ -59,7 +60,12 @@ def serve(
         settings.server.port = port
     if debug_requests:
         settings.server.debug_requests = True
-    uvicorn.run(create_app(settings), host=settings.server.host, port=settings.server.port)
+    uvicorn.run(
+        create_app(settings),
+        host=settings.server.host,
+        port=settings.server.port,
+        access_log=False,
+    )
 
 
 @app.command()

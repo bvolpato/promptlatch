@@ -23,6 +23,7 @@ Report vulnerabilities privately through GitHub Security Advisories for this rep
 - Upstream credentials remain in provider-bound auth headers because the provider
   needs them. PromptLatch masks these headers in debug output.
 - Encoded request bodies must be decompressed before redaction.
+- Multipart uploads are rejected while redaction is enabled. Attachments are not scanned.
 - Private-target checks validate DNS before connection but do not pin that resolution. Allow only trusted upstream hostnames.
 - Emergency request tracing can print raw request bodies locally.
 - Provider responses pass through without scanning or redaction.

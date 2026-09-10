@@ -1,6 +1,7 @@
 import gzip
 import json
 import logging
+from urllib.parse import parse_qsl
 
 import httpx
 import pytest
@@ -120,12 +121,15 @@ async def test_proxy_redacts_secret_shaped_query_parameter_names() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize("empty_body", [False, True])
 @respx.mock
-async def test_proxy_redacts_multipart_body_without_corrupting_binary_bytes() -> None:
+async def test_proxy_rejects_multipart_before_forwarding(engine: str, empty_body: bool) -> None:
     settings = Settings(
         target=TargetConfig(
             default_base_url="https://upstream.example/v1", block_private_targets=False
-        )
+        ),
+        redaction=RedactionConfig.model_validate({"engine": engine}),
     )
     route = respx.post("https://upstream.example/v1/files").mock(
         return_value=httpx.Response(200, json={"ok": True})
@@ -134,8 +138,10 @@ async def test_proxy_redacts_multipart_body_without_corrupting_binary_bytes() ->
     binary_marker = b"\xff\x00\xfe"
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        response = await client.post(
+        request = client.build_request(
+            "POST",
             "/v1/files",
+            data={"password": "FixtureTokenForm"},
             files={
                 "file": (
                     "fixture.bin",
@@ -144,12 +150,71 @@ async def test_proxy_redacts_multipart_body_without_corrupting_binary_bytes() ->
                 )
             },
         )
+        if empty_body:
+            request = client.build_request(
+                "POST", "/v1/files", headers={"Content-Type": request.headers["content-type"]}
+            )
+        response = await client.send(request)
+
+    assert response.status_code == 415
+    assert response.json()["detail"] == "multipart request bodies are not supported with redaction"
+    assert not route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@respx.mock
+async def test_proxy_redacts_decoded_form_fields(engine: str) -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+        redaction=RedactionConfig.model_validate({"engine": engine}),
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    transport = httpx.ASGITransport(app=create_app(settings))
+    body = b"p%61ssword=FixtureTokenForm&note=hello+world&tag=one&tag=two&blank="
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "Application/X-WWW-Form-Urlencoded; charset=utf-8"},
+            content=body,
+        )
 
     assert response.status_code == 200
-    forwarded = route.calls.last.request.content
-    assert OPENAI_FAKE.encode() not in forwarded
-    assert b"[REDACTED_SECRET]" in forwarded
-    assert binary_marker in forwarded
+    assert parse_qsl(route.calls.last.request.content.decode(), keep_blank_values=True) == [
+        ("password", "[REDACTED_SECRET]"),
+        ("note", "hello world"),
+        ("tag", "one"),
+        ("tag", "two"),
+        ("blank", ""),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"password=%FF", b"password=\xff"])
+@respx.mock
+async def test_proxy_rejects_invalid_form_encoding(body: bytes) -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    transport = httpx.ASGITransport(app=create_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            content=body,
+        )
+
+    assert response.status_code == 400
+    assert not route.called
 
 
 @pytest.mark.asyncio
@@ -222,6 +287,46 @@ async def test_proxy_preserves_encoded_body_when_redaction_is_disabled() -> None
     assert response.status_code == 200
     assert route.calls.last.request.content == body
     assert route.calls.last.request.headers["content-encoding"] == "gzip"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge", [False, True])
+async def test_upstream_body_failure_closes_response_and_returns_bad_gateway(bridge: bool) -> None:
+    class BrokenBody(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b'{"output":'
+            raise httpx.ReadError("fixture disconnect")
+
+        async def aclose(self):
+            self.closed = True
+
+    body = BrokenBody()
+    app = create_app(
+        Settings(
+            target=TargetConfig(
+                default_base_url="https://upstream.example/v1", block_private_targets=False
+            ),
+            redaction=RedactionConfig(engine="basic"),
+            compat=CompatConfig(responses_to_chat=bridge),
+        )
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/json"}, stream=body)
+        )
+    ) as upstream:
+        app.state.client = upstream
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/v1/responses", json={"model": "fixture-model", "input": "hello"}
+            )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "upstream response failed"
+    assert body.closed
 
 
 @pytest.mark.asyncio
@@ -1190,7 +1295,7 @@ async def test_responses_to_chat_bridge_maps_chat_tool_calls() -> None:
         redaction=RedactionConfig(engine="basic"),
         compat=CompatConfig(responses_to_chat=True),
     )
-    respx.post("https://upstream.example/v1/chat/completions").mock(
+    route = respx.post("https://upstream.example/v1/chat/completions").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -1232,16 +1337,21 @@ async def test_responses_to_chat_bridge_maps_chat_tool_calls() -> None:
                         "parameters": {"type": "object", "properties": {}},
                     }
                 ],
+                "tool_choice": {"type": "function", "name": "exec_command"},
             },
         )
 
-    item = response.json()["output"][0]
-    assert item == {
-        "type": "function_call",
-        "call_id": "call_fixture",
-        "name": "exec_command",
-        "arguments": '{"cmd":"pwd"}',
+    forwarded = json.loads(route.calls.last.request.content)
+    assert forwarded["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "exec_command"},
     }
+    item = response.json()["output"][0]
+    assert item["type"] == "function_call"
+    assert item["call_id"] == "call_fixture"
+    assert item["name"] == "exec_command"
+    assert item["arguments"] == '{"cmd":"pwd"}'
+    assert item["status"] == "completed"
 
 
 @pytest.mark.asyncio

@@ -1,18 +1,24 @@
+{{- $existingSelector := dict -}}
+{{- if .Release.IsUpgrade -}}
+{{- $existingDeployment := lookup "apps/v1" "Deployment" .Release.Namespace (include "promptlatch.fullname" .) -}}
+{{- if $existingDeployment -}}
+{{- $existingSelector = $existingDeployment.spec.selector -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "promptlatch.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
+    {{- include "promptlatch.selectorLabels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
-    matchLabels:
-      app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
+    {{- include "promptlatch.deploymentSelector" (dict "root" . "existingSelector" $existingSelector) | nindent 4 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "promptlatch.selectorName" . }}
+        {{- include "promptlatch.selectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
       securityContext:

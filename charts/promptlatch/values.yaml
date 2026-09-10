@@ -16,6 +16,8 @@ serverAuth:
 migration:
   # Set only while upgrading a release installed from the old chart.
   preserveLegacyNames: false
+  # For offline upgrades of releases whose Deployment selector lacks an instance label.
+  preserveSelector: false
 
 # Existing Secret keys are loaded as environment variables. Include
 # PROMPTLATCH_SERVER_API_KEY when serverAuth.enabled is true. The 0.2 chart also

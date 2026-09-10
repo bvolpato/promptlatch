@@ -7,11 +7,11 @@ import logging
 import posixpath
 import secrets
 import socket
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any
-from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -172,7 +172,7 @@ async def forward_request(request: Request, path: str) -> Response:
         response_headers = _response_headers(upstream.headers, transformed=transform_stream)
         stream = _stream_upstream(upstream, close_client, client, decoded=transform_stream)
         if transform_stream:
-            stream = chat_stream_to_responses(stream)
+            stream = chat_stream_to_responses(stream, json_payload)
             response_headers["content-type"] = "text/event-stream; charset=utf-8"
         return StreamingResponse(
             stream,
@@ -183,12 +183,16 @@ async def forward_request(request: Request, path: str) -> Response:
 
     transform_response = compat_responses_to_chat and upstream.is_success
     response_headers = _response_headers(upstream.headers, transformed=transform_response)
-    upstream_content = (
-        await upstream.aread() if transform_response else await _read_raw_upstream(upstream)
-    )
-    await upstream.aclose()
-    if close_client:
-        await client.aclose()
+    try:
+        upstream_content = (
+            await upstream.aread() if transform_response else await _read_raw_upstream(upstream)
+        )
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="upstream response failed") from None
+    finally:
+        await upstream.aclose()
+        if close_client:
+            await client.aclose()
 
     upstream_payload: Any | None = None
     if transform_response and _is_json_content(upstream.headers):
@@ -198,7 +202,7 @@ async def forward_request(request: Request, path: str) -> Response:
             upstream_payload = None
 
     if transform_response and isinstance(upstream_payload, dict):
-        response_payload = chat_response_to_responses(upstream_payload)
+        response_payload = chat_response_to_responses(upstream_payload, json_payload)
         return JSONResponse(
             response_payload,
             status_code=upstream.status_code,
@@ -266,6 +270,11 @@ def _redact_request_body(
     parse_json: bool = False,
 ) -> tuple[bytes, RedactionStats, Any | None]:
     stats = RedactionStats()
+    media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if redactor.config.enabled and media_type.startswith("multipart/"):
+        raise HTTPException(
+            status_code=415, detail="multipart request bodies are not supported with redaction"
+        )
     if not body:
         return body, stats, None
 
@@ -282,6 +291,14 @@ def _redact_request_body(
             except json.JSONDecodeError:
                 raise HTTPException(status_code=400, detail="invalid JSON request body") from None
         return body, stats, None
+
+    if media_type == "application/x-www-form-urlencoded":
+        try:
+            fields = parse_qsl(body.decode("utf-8"), keep_blank_values=True, errors="strict")
+        except UnicodeError:
+            raise HTTPException(status_code=400, detail="invalid form request encoding") from None
+        cleaned, stats = _redact_parameter_pairs(fields, redactor)
+        return urlencode(cleaned).encode("utf-8"), stats, None
 
     if _is_json_request(request):
         try:
@@ -308,9 +325,15 @@ def _redact_request_body(
 def _redact_query_params(
     request: Request, redactor: SecretRedactor
 ) -> tuple[list[tuple[str, str]], RedactionStats]:
+    return _redact_parameter_pairs(request.query_params.multi_items(), redactor)
+
+
+def _redact_parameter_pairs(
+    pairs: Iterable[tuple[str, str]], redactor: SecretRedactor
+) -> tuple[list[tuple[str, str]], RedactionStats]:
     redacted: list[tuple[str, str]] = []
     stats = RedactionStats()
-    for key, value in request.query_params.multi_items():
+    for key, value in pairs:
         result = redactor.redact_payload({key: value})
         stats.merge(result.stats)
         redacted.append(next(iter(result.value.items())))

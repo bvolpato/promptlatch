@@ -87,19 +87,24 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "assigned_secret",
         re.compile(
-            r"(?i)\b([A-Za-z0-9_.-]*(?:api[_-]?keys?|client[_-]?secrets?|"
+            r"(?i)(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
+            r"(?P<field>[A-Za-z0-9_.-]*(?:api[_-]?keys?|client[_-]?secrets?|"
             r"secrets?|passwords?|passwd|pwd|tokens?|access[_-]?tokens?|"
             r"refresh[_-]?tokens?|id[_-]?tokens?|auth[_-]?tokens?|session[_-]?tokens?|"
             r"private[_-]?keys?|credentials?|webhook[_-]?urls?)[A-Za-z0-9_.-]*)"
-            r"(\s*[:=]\s*)([\"']?)([^\"'\s;\[\]]{8,})([\"']?)"
+            r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']?))"
+            r"(?P<secret>[^\"'\s;\[\]]{8,})(?P=value_quote)"
         ),
     ),
     (
         "auth_header",
         re.compile(
-            r"(?i)\b((?:authorization|proxy-authorization|x-api-key|api-key|x-auth-token|"
+            r"(?i)(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
+            r"(?:authorization|proxy-authorization|x-api-key|api-key|x-auth-token|"
             r"x-auth-key|cf-access-token)"
-            r"\s*[:=]\s*(?:(?:bearer|token|basic|key)\s+)?)([A-Za-z0-9._~+/=-]{8,})"
+            r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']?)"
+            r"(?:(?:bearer|token|basic|key)\s+)?)"
+            r"(?P<secret>[A-Za-z0-9._~+/=-]{8,})(?P=value_quote)"
         ),
     ),
     (

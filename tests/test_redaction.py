@@ -1,4 +1,6 @@
+import json
 import tempfile
+from typing import Literal
 
 import pytest
 import requests
@@ -170,6 +172,64 @@ def test_authorization_header_value_is_redacted() -> None:
 
     assert bearer not in result.value
     assert result.value == "Authorization: Bearer [REDACTED_SECRET]"
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+def test_json_authorization_header_value_is_redacted(
+    engine: Literal["basic", "detect-secrets"],
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine=engine))
+    bearer = "FixtureToken000000000000000000000"
+    text = json.dumps({"Authorization": f"Bearer {bearer}"})
+
+    result = redactor.redact_text(text)
+
+    assert bearer not in result.value
+    assert result.value == '{"Authorization": "Bearer [REDACTED_SECRET]"}'
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "Authorization=Bearer FixtureToken000000000000000000000",
+            "Authorization=Bearer [REDACTED_SECRET]",
+        ),
+        (
+            'client_secret="FixtureToken000000000000000000000"',
+            'client_secret="[REDACTED_SECRET]"',
+        ),
+        (
+            '{"client_secret": "FixtureToken000000000000000000000"}',
+            '{"client_secret": "[REDACTED_SECRET]"}',
+        ),
+    ],
+)
+def test_auth_and_assignment_redaction_preserves_surrounding_syntax(
+    text: str, expected: str
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine="basic"))
+
+    result = redactor.redact_text(text)
+
+    assert result.value == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"AuthorizationMode": "Bearer FixtureToken000000000000000000000"}',
+        'Document the "Authorization" header with a Bearer token.',
+        '{"client_secret_note": "use a secret from the environment"}',
+    ],
+)
+def test_auth_and_assignment_patterns_avoid_similar_prose_and_fields(text: str) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine="basic"))
+
+    result = redactor.redact_text(text)
+
+    assert result.value == text
+    assert result.stats.redactions == 0
 
 
 def test_connection_string_password_is_redacted() -> None:

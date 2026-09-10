@@ -1,7 +1,12 @@
 import os
+import socket
 import stat
 import subprocess
+import time
+import urllib.error
+import urllib.request
 
+import pytest
 import yaml
 from typer.testing import CliRunner
 
@@ -51,6 +56,77 @@ def test_version_does_not_load_default_config(tmp_path) -> None:
 
     assert result.returncode == 0
     assert result.stdout.strip() == __version__
+
+
+@pytest.mark.parametrize("debug_requests", [False, True])
+def test_serve_does_not_log_request_url_secrets(tmp_path, debug_requests: bool) -> None:
+    query_token = "FixtureTokenOpaqueQuery0000000000000000"
+    server_token = "FixtureTokenServerAuth0000000000000000"
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "server": {
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "api_key": server_token,
+                    "require_api_key": True,
+                },
+                "target": {"default_base_url": "https://example.invalid/v1"},
+                "redaction": {"engine": "basic"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PROMPTLATCH_", "PROMPTCLOAK_"))
+    }
+    command = ["promptlatch", "serve", "--config", str(config)]
+    if debug_requests:
+        command.append("--debug-requests")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+
+    try:
+        health_url = f"http://127.0.0.1:{port}/healthz"
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                with urllib.request.urlopen(health_url, timeout=0.25) as response:
+                    assert response.status == 200
+                break
+            except (OSError, urllib.error.URLError):
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise AssertionError("PromptLatch server did not start") from None
+                time.sleep(0.05)
+
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/models?api_key={query_token}",
+            headers={"Authorization": "Bearer FixtureTokenWrongAuth000000000000000"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(request, timeout=2)
+        assert exc_info.value.code == 401
+    finally:
+        process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=5)
+
+    assert query_token not in stdout + stderr
 
 
 def test_encrypt_rules_is_idempotent(tmp_path) -> None:

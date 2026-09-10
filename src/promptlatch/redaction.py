@@ -86,6 +86,9 @@ class SecretRedactor:
     def _walk(self, value: Any, stats: RedactionStats) -> Any:
         if isinstance(value, str):
             return self._redact_string(value, stats)
+        model_fields = self._model_fields(value)
+        if model_fields is not None:
+            return self._redact_model(value, model_fields, stats)
         if isinstance(value, list):
             return [self._walk(item, stats) for item in value]
         if isinstance(value, tuple):
@@ -96,13 +99,62 @@ class SecretRedactor:
                 redacted_key = self._redact_string(key, stats) if isinstance(key, str) else key
                 if redacted_key in redacted:
                     raise RedactionKeyCollisionError("mapping keys collide after redaction")
-                redacted[redacted_key] = (
-                    self._redact_sensitive_field(item, stats, strict=self._is_strict_field(key))
-                    if self._is_sensitive_field(key)
-                    else self._walk(item, stats)
-                )
+                redacted[redacted_key] = self._redact_field_value(key, item, stats)
             return redacted
         return value
+
+    def _model_fields(self, value: Any) -> Mapping[str, Any] | None:
+        model_fields = getattr(type(value), "model_fields", None)
+        model_copy = getattr(value, "model_copy", None)
+        if isinstance(model_fields, Mapping) and callable(model_copy):
+            return model_fields
+        return None
+
+    def _redact_model(
+        self,
+        value: Any,
+        model_fields: Mapping[str, Any],
+        stats: RedactionStats,
+        *,
+        sensitive: bool = False,
+        strict: bool = False,
+    ) -> Any:
+        updates: dict[str, Any] = {}
+        for name in model_fields:
+            try:
+                item = getattr(value, name)
+            except AttributeError:
+                continue
+            before = stats.redactions
+            redacted = (
+                self._redact_sensitive_field(item, stats, strict=strict)
+                if sensitive
+                else self._redact_field_value(name, item, stats)
+            )
+            if stats.redactions > before:
+                updates[name] = redacted
+
+        model_extra = getattr(value, "model_extra", None)
+        if isinstance(model_extra, Mapping):
+            for name in model_extra:
+                if isinstance(name, str) and self._redact_string(name, RedactionStats()) != name:
+                    raise ValueError("model extra key cannot be safely redacted")
+            for name, item in model_extra.items():
+                before = stats.redactions
+                redacted = (
+                    self._redact_sensitive_field(item, stats, strict=strict)
+                    if sensitive
+                    else self._redact_field_value(name, item, stats)
+                )
+                if stats.redactions > before:
+                    updates[name] = redacted
+
+        return value.model_copy(update=updates)
+
+    def _redact_field_value(self, key: Any, value: Any, stats: RedactionStats) -> Any:
+        if self._is_sensitive_field(key):
+            return self._redact_sensitive_field(value, stats, strict=self._is_strict_field(key))
+        return self._walk(value, stats)
 
     def _is_sensitive_field(self, key: Any) -> bool:
         if not isinstance(key, str):
@@ -127,6 +179,15 @@ class SecretRedactor:
                 return value
             stats.add("sensitive_field", 1)
             return self.placeholder
+        model_fields = self._model_fields(value)
+        if model_fields is not None:
+            return self._redact_model(
+                value,
+                model_fields,
+                stats,
+                sensitive=True,
+                strict=strict,
+            )
         if isinstance(value, list):
             return [self._redact_sensitive_field(item, stats, strict=strict) for item in value]
         if isinstance(value, tuple):
@@ -210,13 +271,17 @@ class SecretRedactor:
         if name == "assigned_secret":
             return pattern.subn(
                 lambda match: (
-                    f"{match.group(1)}{match.group(2)}{match.group(3)}"
-                    f"{self.placeholder}{match.group(5)}"
+                    f"{match.group('prefix')}{self.placeholder}{match.group('value_quote')}"
                 ),
                 value,
             )
         if name == "auth_header":
-            return pattern.subn(lambda match: f"{match.group(1)}{self.placeholder}", value)
+            return pattern.subn(
+                lambda match: (
+                    f"{match.group('prefix')}{self.placeholder}{match.group('value_quote')}"
+                ),
+                value,
+            )
         if name == "signed_url_query_param":
             return pattern.subn(lambda match: f"{match.group(1)}{self.placeholder}", value)
         if name == "url_credentials":

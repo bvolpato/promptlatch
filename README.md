@@ -302,10 +302,12 @@ LiteLLM:
 from litellm import completion
 from promptlatch import redact_params
 
-response = completion(**redact_params(
-    model="openai/gpt-6-sol",
-    messages=[{"role": "user", "content": "GEMINI_API_KEY=example-key-value-123456"}],
-))
+response = completion(
+    **redact_params(
+        model="openai/gpt-6-sol",
+        messages=[{"role": "user", "content": "GEMINI_API_KEY=example-key-value-123456"}],
+    )
+)
 ```
 
 Anthropic:
@@ -318,9 +320,7 @@ client = Anthropic()
 response = client.messages.create(
     model="claude-opus-4-8",
     max_tokens=1024,
-    messages=redact_messages([
-        {"role": "user", "content": "token=example-token-value-123456"}
-    ]),
+    messages=redact_messages([{"role": "user", "content": "token=example-token-value-123456"}]),
 )
 ```
 
@@ -331,9 +331,13 @@ from langchain_openai import ChatOpenAI
 from promptlatch import redact_messages
 
 llm = ChatOpenAI(model="gpt-6-sol")
-response = llm.invoke(redact_messages([
-    ("human", "Here is my token: example-token-value-123456"),
-]))
+response = llm.invoke(
+    redact_messages(
+        [
+            ("human", "Here is my token: example-token-value-123456"),
+        ]
+    )
+)
 ```
 
 ### Inspect redaction results
@@ -361,9 +365,13 @@ secret tail inside a longer value. Prefer storing only that tail in config.
 from promptlatch import PromptLatch
 from promptlatch.config import RedactionConfig, RuleConfig
 
-latch = PromptLatch(RedactionConfig(rules=[
-    RuleConfig(type="exact", value="abcd1234", name="internal-token"),
-]))
+latch = PromptLatch(
+    RedactionConfig(
+        rules=[
+            RuleConfig(type="exact", value="abcd1234", name="internal-token"),
+        ]
+    )
+)
 safe_prompt = latch.text("internal token: private-abcd1234")
 ```
 

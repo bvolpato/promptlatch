@@ -146,10 +146,12 @@ from openai import OpenAI
 from promptlatch import redact_params
 
 client = OpenAI()
-response = client.responses.create(**redact_params(
-    model="gpt-6-sol",
-    input="Inspect this config: OPENAI_API_KEY=example-secret-value-123456",
-))
+response = client.responses.create(
+    **redact_params(
+        model="gpt-6-sol",
+        input="Inspect this config: OPENAI_API_KEY=example-secret-value-123456",
+    )
+)
 ```
 
 Use the same pattern for every request path, including retries, streaming calls,

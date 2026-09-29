@@ -115,10 +115,10 @@ curl --compressed -fsS http://127.0.0.1:8000/post \
       <section id="install" class="section">
         <div class="section-copy">
           <p class="eyebrow">Install</p>
-          <h2>Install and run locally.</h2>
+          <h2>Install proxy or library.</h2>
           <p>
-            Use PromptLatch as a local proxy for agents, or import it before direct SDK
-            calls.
+            Run the proxy for existing clients, or add the Python library to redact
+            prompts and request data inside your application.
           </p>
         </div>
         <div class="code-grid">
@@ -129,7 +129,9 @@ export OPENAI_API_KEY="&lt;openai-upstream-key&gt;"
 promptlatch serve</code></pre>
           <pre><code>uv tool install promptlatch
 promptlatch doctor</code></pre>
-          <pre><code>uv add promptlatch</code></pre>
+          <pre><code>uv add promptlatch
+# or
+python -m pip install promptlatch</code></pre>
         </div>
       </section>
 
@@ -150,7 +152,7 @@ promptlatch doctor</code></pre>
   -H "X-Target-Base-URL: https://api.openai.com/v1" \
   -H "X-Target-API-Key: $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5.5","input":"Reply exactly: ok"}' \
+  -d '{"model":"gpt-6-sol","input":"Reply exactly: ok"}' \
   | jq -r '.output[0].content[0].text'</code></pre>
           </article>
           <article>
@@ -208,22 +210,69 @@ curl http://127.0.0.1:8000/v1/responses \
       <section id="library" class="section">
         <div class="section-copy">
           <p class="eyebrow">Library</p>
-          <h2>Redact before SDK calls.</h2>
+          <h2>Redact values before SDK calls.</h2>
           <p>
-            Import PromptLatch helpers before OpenAI, LiteLLM, LangChain, Anthropic, or
-            custom HTTP client calls.
+            No proxy required. PromptLatch returns a redacted value; pass that returned
+            value to the SDK or HTTP client. It does not intercept or modify SDK calls.
+            If redaction raises an error, do not send the original input.
           </p>
         </div>
         <div class="agent-grid">
           <article>
-            <h3>OpenAI</h3>
+            <h3>Prompt text</h3>
+            <pre><code>from openai import OpenAI
+from promptlatch import redact_text
+
+client = OpenAI()
+prompt = "Inspect config: OPENAI_API_KEY=example-secret-value-123456"
+client.responses.create(
+  model="gpt-6-sol",
+  input=redact_text(prompt),
+)</code></pre>
+          </article>
+          <article>
+            <h3>Message arrays</h3>
             <pre><code>from openai import OpenAI
 from promptlatch import redact_messages
 
 client = OpenAI()
+messages = [{"role": "user", "content": "GITHUB_TOKEN=example-token-value-123456"}]
+safe_messages = redact_messages(messages)
+
 client.chat.completions.create(
-  model="gpt-5.5",
-  messages=redact_messages(messages),
+  model="gpt-6-sol",
+  messages=safe_messages,
+)</code></pre>
+          </article>
+          <article>
+            <h3>SDK parameters</h3>
+            <pre><code>from openai import OpenAI
+from promptlatch import redact_params
+
+client = OpenAI()
+
+safe_params = redact_params(
+  model="gpt-6-sol",
+  input="Authorization: Bearer FixtureToken000000000000000000000",
+)
+client.responses.create(**safe_params)</code></pre>
+          </article>
+          <article>
+            <h3>Structured payloads</h3>
+            <pre><code>import os
+import httpx
+from promptlatch import redact_payload
+
+payload = {
+  "model": "gpt-6-sol",
+  "input": [{"role": "user", "content": [
+    {"type": "input_text", "text": "OPENAI_API_KEY=example-secret-value-123456"}
+  ]}],
+}
+httpx.post(
+  "https://api.openai.com/v1/responses",
+  headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+  json=redact_payload(payload),
 )</code></pre>
           </article>
           <article>
@@ -231,20 +280,9 @@ client.chat.completions.create(
             <pre><code>from litellm import completion
 from promptlatch import redact_params
 
-messages = [{"role": "user", "content": "API_KEY=&lt;secret&gt;"}]
-
 completion(**redact_params(
-  model="openai/gpt-5.5",
-  messages=messages,
-))</code></pre>
-          </article>
-          <article>
-            <h3>Responses API</h3>
-            <pre><code>from promptlatch import redact_params
-
-client.responses.create(**redact_params(
-  model="gpt-5.5",
-  input="OPENAI_API_KEY=&lt;secret&gt;",
+  model="openai/gpt-6-sol",
+  messages=[{"role": "user", "content": "GEMINI_API_KEY=example-key-value-123456"}],
 ))</code></pre>
           </article>
           <article>
@@ -252,31 +290,19 @@ client.responses.create(**redact_params(
             <pre><code>from langchain_openai import ChatOpenAI
 from promptlatch import redact_messages
 
-llm = ChatOpenAI(model="gpt-5.5")
+llm = ChatOpenAI(model="gpt-6-sol")
 llm.invoke(redact_messages([
-  ("human", "token=&lt;secret&gt;"),
+  ("human", "token=example-token-value-123456"),
 ]))</code></pre>
           </article>
-          <article>
-            <h3>Anthropic</h3>
-            <pre><code>from anthropic import Anthropic
-from promptlatch import redact_messages
-
-Anthropic().messages.create(
-  model="claude-opus-4-8",
-  max_tokens=1024,
-  messages=redact_messages(messages),
-)</code></pre>
-          </article>
-          <article>
-            <h3>LlamaIndex</h3>
-            <pre><code>from llama_index.llms.openai import OpenAI
-from promptlatch import redact_messages
-
-llm = OpenAI(model="gpt-5.5")
-llm.chat(redact_messages(messages))</code></pre>
-          </article>
         </div>
+        <p class="section-copy">
+          Helpers return new redacted values and leave input data unchanged. Use
+          <code>scan_text</code>, <code>scan_messages</code>, <code>scan_params</code>,
+          or <code>scan_payload</code> to inspect redaction counts. Keep provider
+          authentication in SDK configuration; these helpers redact application
+          request content.
+        </p>
       </section>
 
       <section id="agents" class="section">
@@ -365,6 +391,7 @@ claude</code></pre>
         <ul>
           <li>Provider auth is added from config or dedicated target headers after client header filtering.</li>
           <li>Unknown private token formats need a custom exact-tail or regex rule.</li>
+          <li>Multipart uploads and compressed request bodies are rejected while redaction is enabled.</li>
           <li>Provider responses pass through without scanning or redaction.</li>
           <li><code>--debug-requests</code> can print raw local request bodies. Use fixture data only.</li>
         </ul>
@@ -384,7 +411,7 @@ claude</code></pre>
             <pre><code>docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.2
+  ghcr.io/bvolpato/promptlatch:0.2.3
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz</code></pre>
@@ -395,7 +422,7 @@ curl --retry 10 --retry-connrefused --retry-delay 1 \
   --from-env-file="$HOME/.config/promptlatch/kubernetes.env"
 
 helm install promptlatch \
-  https://github.com/bvolpato/promptlatch/releases/download/v0.2.2/promptlatch-0.2.2.tgz \
+  https://github.com/bvolpato/promptlatch/releases/download/v0.2.3/promptlatch-0.2.3.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 

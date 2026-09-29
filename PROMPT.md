@@ -35,9 +35,9 @@ promptlatch version
 Docker:
 
 ```bash
-docker pull ghcr.io/bvolpato/promptlatch:0.2.2
+docker pull ghcr.io/bvolpato/promptlatch:0.2.3
 docker run --rm --entrypoint promptlatch \
-  ghcr.io/bvolpato/promptlatch:0.2.2 version
+  ghcr.io/bvolpato/promptlatch:0.2.3 version
 ```
 
 Source checkout:
@@ -113,26 +113,51 @@ local bearer token through `ANTHROPIC_AUTH_TOKEN` when proxy auth is enabled.
 
 ## Python library mode
 
-Install current PromptLatch release from README, then redact immediately before
-each SDK call:
+Use library mode when Python code builds the prompt or request. Install the current
+PyPI release with `uv add promptlatch` or `python -m pip install promptlatch`. Add
+the relevant SDK separately. Redact immediately before each SDK or HTTP call:
 
 ```python
-from promptlatch import redact_messages, redact_params, redact_payload
+from promptlatch import redact_messages, redact_params, redact_payload, redact_text
 
+safe_prompt = redact_text(prompt)
 safe_messages = redact_messages(messages)
 safe_params = redact_params(model=model, messages=messages, tools=tools)
 safe_payload = redact_payload(payload)
 ```
 
-Pick the helper that matches the call shape:
+Choose the helper that matches the value you will send:
 
-- `redact_messages` for message arrays, including LangChain message objects.
-- `redact_params` for OpenAI, LiteLLM, and similar keyword arguments.
-- `redact_payload` for raw JSON-compatible request bodies.
+- `redact_text` for one prompt string or text field.
+- `redact_messages` for message arrays, tuple-style messages, OpenAI/Pydantic
+  messages, and LangChain message objects.
+- `redact_params` for SDK keyword arguments, including OpenAI and LiteLLM calls.
+  It scans a `messages` argument as messages and recursively scans other values.
+- `redact_payload` for raw mapping/list request bodies, including nested tool
+  arguments and structured content.
 
-Do not mutate caller-owned data or redact provider authentication passed outside
-request content. Cover every LLM call path, including retries, streaming calls,
-tool payloads, and background jobs.
+**Pass the returned value to the SDK call.** Helpers only return redacted values;
+they do not patch the SDK, send requests, or change values held by the SDK client.
+Keep provider authentication in the SDK's environment or secret manager. If a helper
+raises an error, fail closed and do not send the original input.
+
+```python
+from openai import OpenAI
+from promptlatch import redact_params
+
+client = OpenAI()
+response = client.responses.create(
+    **redact_params(
+        model="gpt-6-sol",
+        input="Inspect this config: OPENAI_API_KEY=example-secret-value-123456",
+    )
+)
+```
+
+Use the same pattern for every request path, including retries, streaming calls,
+tool payloads, and background jobs. `scan_text`, `scan_messages`, `scan_params`, and
+`scan_payload` return a `RedactionResult` with `.value` and redaction counts for
+inspection; pass `.value` to the SDK.
 
 ## Verification
 

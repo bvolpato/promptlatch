@@ -9,9 +9,10 @@
 
 **Redact secrets before prompts reach an LLM provider.**
 
-PromptLatch is a local proxy and Python library for coding agents, SDKs, and
-OpenAI-compatible backends. It scans request bodies and query parameters, replaces
-detected credentials and custom matches, then forwards the request.
+PromptLatch is a local proxy and a Python redaction library. Use the proxy for
+coding agents and clients that support a custom base URL. Use the library to redact
+prompt text, message arrays, SDK parameters, and structured request payloads before
+your application calls an LLM SDK.
 
 Scanning stays local. PromptLatch has no telemetry or phone-home behavior.
 
@@ -26,7 +27,7 @@ Agent integration prompt: [`PROMPT.md`](https://github.com/bvolpato/promptlatch/
 | Need | Use |
 | --- | --- |
 | Protect coding agents and IDEs | Run `promptlatch serve` and point OpenAI-compatible clients at `http://127.0.0.1:8000/v1`. |
-| Protect SDK calls in your app | Import `redact_messages`, `redact_params`, or `redact_payload`. |
+| Protect SDK calls in Python | Import `redact_text`, `redact_messages`, `redact_params`, or `redact_payload` and pass each returned value to the SDK. |
 
 ## Coverage
 
@@ -50,6 +51,8 @@ See [SECURITY.md](SECURITY.md) for deployment defaults and remaining limits.
 
 ## Install
 
+Python package: [promptlatch on PyPI](https://pypi.org/project/promptlatch/).
+
 Homebrew:
 
 ```bash
@@ -63,6 +66,14 @@ uv:
 ```bash
 uv tool install promptlatch
 promptlatch doctor
+```
+
+Python library:
+
+```bash
+uv add promptlatch
+# or
+python -m pip install promptlatch
 ```
 
 Source:
@@ -124,7 +135,7 @@ Point clients at `http://127.0.0.1:8000/v1`. For example:
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.5",
+    "model": "gpt-6-sol",
     "messages": [{
       "role": "user",
       "content": "Here is my .env: OPENAI_API_KEY=<api-key-like-value>"
@@ -163,179 +174,203 @@ can run PromptLatch as a background service after configuring its environment:
 brew services start bvolpato/tap/promptlatch
 ```
 
-## Use as a library
+## Use as a Python library
 
-PromptLatch can run without running the proxy service. Import redaction helpers and filter
-request values before passing them to any SDK. PromptLatch does not install OpenAI,
-LiteLLM, LangChain, or Anthropic SDKs; examples assume those are already in your
-app.
+Use PromptLatch without starting the proxy. Redact each prompt or request value in
+the same process, immediately before passing it to your SDK or HTTP client. Install
+the SDK you use separately; PromptLatch has no OpenAI, LiteLLM, LangChain, Anthropic,
+or LlamaIndex SDK dependency.
 
-```bash
-uv add promptlatch
-```
+Choose a helper for the shape of the value you send:
 
-```python
-from promptlatch import redact_messages, scan_messages
+| Input | Helper | Result |
+| --- | --- | --- |
+| One prompt or text field | `redact_text(text)` | Redacted string |
+| Chat messages, including nested tool data | `redact_messages(messages)` | Redacted message list |
+| SDK keyword arguments | `redact_params(**params)` | Redacted dictionary ready to unpack into an SDK call |
+| Raw mapping/list request body | `redact_payload(payload)` | Redacted structure with its shape preserved |
 
-messages = [
-    {
-        "role": "user",
-        "content": "Debug this .env: OPENAI_API_KEY=<api-key-like-value>",
-    }
-]
+All four helpers are exported from `promptlatch`. They return the safe value. They do
+not send the request or change an SDK client for you. **Pass the returned value to the
+SDK call; never pass the original value after redaction.** If redaction raises an
+error, do not retry by sending the original input.
 
-safe_messages = redact_messages(messages)
-result = scan_messages(messages)
+### Redact a standalone prompt
 
-assert result.stats.redactions >= 1
-```
-
-Nested Pydantic messages and tool calls retain their types and leave the originals
-unchanged. A detected secret in a model's extra field name raises `ValueError` rather
-than returning an unsafe payload. Do not send the original input after a scanning error.
-
-For custom tail-only rules:
-
-```python
-from promptlatch import PromptLatch
-from promptlatch.config import RedactionConfig, RuleConfig
-
-latch = PromptLatch(
-    RedactionConfig(rules=[RuleConfig(type="exact", value="abcd1234", name="tail-only")])
-)
-
-safe_messages = latch.messages(messages)
-```
-
-### OpenAI Python
+Use `redact_text` when the prompt is assembled as a string, before passing it as
+`input`, `prompt`, or another SDK field:
 
 ```python
 from openai import OpenAI
-from promptlatch import redact_messages, redact_params
+from promptlatch import redact_text
 
 client = OpenAI()
+prompt = "Inspect this config: OPENAI_API_KEY=example-secret-value-123456"
 
-messages = [{"role": "user", "content": "API key: <api-key-like-value>"}]
-
-response = client.chat.completions.create(
-    model="gpt-5.5",
-    messages=redact_messages(messages),
-)
-
-response_api = client.responses.create(
-    **redact_params(
-        model="gpt-5.5",
-        input="Summarize this config: OPENAI_API_KEY=<api-key-like-value>",
-    )
+response = client.responses.create(
+    model="gpt-6-sol",
+    input=redact_text(prompt),
 )
 ```
 
-### LiteLLM
+### Redact a message array
+
+Use `redact_messages` for chat-style `messages` arrays. It supports mapping-based
+messages, `(role, content)` tuples, Pydantic/OpenAI message models, and LangChain
+message objects:
+
+```python
+from openai import OpenAI
+from promptlatch import redact_messages
+
+client = OpenAI()
+messages = [
+    {"role": "system", "content": "Summarize the user's log."},
+    {"role": "user", "content": "Authorization: Bearer FixtureToken000000000000000000000"},
+]
+
+safe_messages = redact_messages(messages)
+response = client.chat.completions.create(
+    model="gpt-6-sol",
+    messages=safe_messages,
+)
+```
+
+For non-Pydantic message objects, PromptLatch copies the object and redacts its
+`content` field. For Pydantic messages, it recursively redacts fields, including
+tool calls, and preserves the model type. Inputs are left unchanged.
+
+### Redact SDK parameters or structured payloads
+
+Use `redact_params` when assembling SDK keyword arguments. It returns a dictionary
+you can unpack directly into the SDK call. A `messages` argument is treated as a
+message array; other values, including `input`, `tools`, and nested parameter
+objects, are scanned recursively.
+
+```python
+from openai import OpenAI
+from promptlatch import redact_params
+
+client = OpenAI()
+safe_params = redact_params(
+    model="gpt-6-sol",
+    input="Summarize this: GITHUB_TOKEN=example-token-value-123456",
+)
+response = client.responses.create(**safe_params)
+```
+
+For raw JSON-compatible bodies, use `redact_payload` and pass its result to the
+transport. It recursively scans strings in mappings and lists without reshaping the
+request schema:
+
+```python
+import os
+import httpx
+from promptlatch import redact_payload
+
+payload = {
+    "model": "gpt-6-sol",
+    "input": [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "OPENAI_API_KEY=example-secret-value-123456",
+                }
+            ],
+        }
+    ],
+    "metadata": {"job": "support-triage"},
+}
+response = httpx.post(
+    "https://api.openai.com/v1/responses",
+    headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+    json=redact_payload(payload),
+)
+```
+
+### Use with other SDKs
+
+Call the same helpers at each SDK boundary. Keep provider authentication in the
+SDK's normal environment/configuration; PromptLatch redacts prompt and payload
+content, not credentials held in the SDK's transport configuration.
+
+LiteLLM:
 
 ```python
 from litellm import completion
 from promptlatch import redact_params
 
-messages = [{"role": "user", "content": "GEMINI_API_KEY=<api-key-like-value>"}]
-
-response = completion(
-    **redact_params(
-        model="openai/gpt-5.5",
-        messages=messages,
-    )
-)
+response = completion(**redact_params(
+    model="openai/gpt-6-sol",
+    messages=[{"role": "user", "content": "GEMINI_API_KEY=example-key-value-123456"}],
+))
 ```
 
-### LangChain
-
-Tuple-style messages:
-
-```python
-from langchain_openai import ChatOpenAI
-from promptlatch import redact_messages
-
-llm = ChatOpenAI(model="gpt-5.5")
-
-response = llm.invoke(
-    redact_messages(
-        [
-            ("system", "You are concise."),
-            ("human", "Here is my token: <api-key-like-value>"),
-        ]
-    )
-)
-```
-
-LangChain message objects:
-
-```python
-from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
-from promptlatch import redact_messages
-
-llm = ChatOpenAI(model="gpt-5.5")
-
-response = llm.invoke(
-    redact_messages(
-        [
-            HumanMessage(content="Here is my token: <api-key-like-value>"),
-        ]
-    )
-)
-```
-
-### Anthropic Python
+Anthropic:
 
 ```python
 from anthropic import Anthropic
 from promptlatch import redact_messages
 
 client = Anthropic()
-
 response = client.messages.create(
     model="claude-opus-4-8",
     max_tokens=1024,
-    messages=redact_messages(
-        [{"role": "user", "content": "ANTHROPIC_API_KEY=<api-key-like-value>"}]
-    ),
+    messages=redact_messages([
+        {"role": "user", "content": "token=example-token-value-123456"}
+    ]),
 )
 ```
 
-### LlamaIndex
+LangChain:
 
 ```python
-from llama_index.core.llms import ChatMessage
-from llama_index.llms.openai import OpenAI
+from langchain_openai import ChatOpenAI
 from promptlatch import redact_messages
 
-llm = OpenAI(model="gpt-5.5")
-
-response = llm.chat(
-    redact_messages(
-        [
-            ChatMessage(role="user", content="Here is my token: <api-key-like-value>"),
-        ]
-    )
-)
+llm = ChatOpenAI(model="gpt-6-sol")
+response = llm.invoke(redact_messages([
+    ("human", "Here is my token: example-token-value-123456"),
+]))
 ```
 
-### Raw HTTP or custom clients
+### Inspect redaction results
+
+`scan_text`, `scan_messages`, `scan_params`, and `scan_payload` return a
+`RedactionResult` with `.value` and `.stats`. Use `.value` for the SDK call, and use
+`.stats.redactions` or `.stats.rule_hits` for counts by rule. Stats do not contain
+matched secret values.
 
 ```python
-import httpx
-from promptlatch import redact_payload
+from promptlatch import scan_text
 
-payload = {
-    "model": "gpt-5.5",
-    "messages": [{"role": "user", "content": "secret=<api-key-like-value>"}],
-}
-
-response = httpx.post(
-    "https://api.openai.com/v1/chat/completions",
-    headers={"Authorization": "Bearer <provider-api-key>"},
-    json=redact_payload(payload),
-)
+result = scan_text("OPENAI_API_KEY=example-secret-value-123456")
+print(result.stats.redactions)
+safe_text = result.value
 ```
+
+### Configure custom rules
+
+The default helpers use the default `RedactionConfig`. For per-application rules,
+create a `PromptLatch` instance. Exact rules of 16 characters or fewer match a
+secret tail inside a longer value. Prefer storing only that tail in config.
+
+```python
+from promptlatch import PromptLatch
+from promptlatch.config import RedactionConfig, RuleConfig
+
+latch = PromptLatch(RedactionConfig(rules=[
+    RuleConfig(type="exact", value="abcd1234", name="internal-token"),
+]))
+safe_prompt = latch.text("internal token: private-abcd1234")
+```
+
+Redaction copies mappings, lists, tuples, and Pydantic models rather than mutating
+caller-owned values. A detected secret in a Pydantic model's extra field name or
+mapping-key collision raises `ValueError`; fail closed and do not send the original
+input. Unknown private token formats need a custom exact-tail or regex rule.
 
 ## Configuration
 
@@ -399,7 +434,7 @@ curl http://127.0.0.1:8000/v1/responses \
   -H "X-Target-Base-URL: https://api.openai.com/v1" \
   -H "X-Target-API-Key: $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5.5","input":"scan this <api-key-like-value>"}'
+  -d '{"model":"gpt-6-sol","input":"scan this <api-key-like-value>"}'
 ```
 
 Set `X-Target-API-Key-Header: x-api-key` for Anthropic-style upstream authentication.
@@ -652,7 +687,7 @@ PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
 docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.2
+  ghcr.io/bvolpato/promptlatch:0.2.3
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz
@@ -702,8 +737,8 @@ helm uninstall promptlatch
 Release asset:
 
 ```bash
-helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.2/promptlatch-0.2.2.tgz
-helm install promptlatch ./promptlatch-0.2.2.tgz \
+helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.3/promptlatch-0.2.3.tgz
+helm install promptlatch ./promptlatch-0.2.3.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 ```

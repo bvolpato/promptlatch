@@ -12,8 +12,8 @@ Verify each published surface after deployment.
 ## Container and Helm
 
 ```bash
-docker pull ghcr.io/bvolpato/promptlatch:0.2.2
-docker run --rm --entrypoint promptlatch ghcr.io/bvolpato/promptlatch:0.2.2 version
+docker pull ghcr.io/bvolpato/promptlatch:0.2.3
+docker run --rm --entrypoint promptlatch ghcr.io/bvolpato/promptlatch:0.2.3 version
 helm lint ./charts/promptlatch
 ```
 

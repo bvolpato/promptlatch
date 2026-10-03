@@ -665,6 +665,11 @@ request bodies are also rejected; decompress them before sending.
 Every scan runs locally without an LLM. Entropy-only matching is disabled; use
 custom rules for opaque internal formats.
 
+Scan results are cached per string in a bounded, in-memory record. Repeated text,
+such as conversation history, is scanned once per process. The record is keyed by
+digest and holds redacted output only, never the original input. One redactor is
+safe to share between threads.
+
 ## Encrypt rules at rest
 
 ```bash

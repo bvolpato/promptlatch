@@ -236,7 +236,10 @@ def test_scan_cache_never_keeps_unredacted_input() -> None:
     for key, (redacted, _hits) in redactor._cache._entries.items():
         assert isinstance(key, bytes) and len(key) == 16
         assert OPENAI_FAKE not in (redacted or "")
-    assert _ScanCache.key(text) == _ScanCache.key(str(text)) != _ScanCache.key(text + "x")
+    cache = redactor._cache
+    assert cache.key(text) == cache.key("".join(text)) != cache.key(text + "x")
+    # Another process, or another redactor, derives different keys.
+    assert cache.key(text) != SecretRedactor(RedactionConfig())._cache.key(text)
 
 
 @pytest.mark.parametrize(

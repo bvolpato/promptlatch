@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
+import os
 import re
 import threading
 from bisect import bisect_right
@@ -87,7 +89,9 @@ _RuleHits = tuple[tuple[str, int], ...]
 class _ScanCache:
     """Bounded, thread-safe record of scan results by string.
 
-    Keys are digests, so the cache never keeps unredacted input in memory.
+    Keys are digests, so the cache never keeps unredacted input in memory. The
+    digest is an HMAC under a random key that exists only in this process, so a
+    key cannot be matched against guessed input outside of it.
     """
 
     def __init__(self, max_entries: int, max_chars: int) -> None:
@@ -96,11 +100,11 @@ class _ScanCache:
         self._chars = 0
         self._entries: OrderedDict[bytes, tuple[str | None, _RuleHits]] = OrderedDict()
         self._lock = threading.Lock()
+        self._secret = os.urandom(32)
 
-    @staticmethod
-    def key(value: str) -> bytes:
+    def key(self, value: str) -> bytes:
         data = value.encode("utf-8", "surrogatepass")
-        return hashlib.blake2b(data, digest_size=16).digest()
+        return hmac.digest(self._secret, data, "sha256")[:16]
 
     def get(self, key: bytes) -> tuple[str | None, _RuleHits] | None:
         with self._lock:

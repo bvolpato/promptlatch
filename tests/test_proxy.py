@@ -1,14 +1,24 @@
+import asyncio
 import gzip
 import json
 import logging
+import threading
 from urllib.parse import parse_qsl
 
 import httpx
 import pytest
 import respx
 
-from promptlatch.config import CompatConfig, RedactionConfig, ServerConfig, Settings, TargetConfig
+from promptlatch.config import (
+    AuditConfig,
+    CompatConfig,
+    RedactionConfig,
+    ServerConfig,
+    Settings,
+    TargetConfig,
+)
 from promptlatch.proxy import create_app
+from promptlatch.redaction import SecretRedactor
 from tests.fixtures import OPENAI_FAKE, PROVIDER_FIXTURES
 
 
@@ -400,6 +410,199 @@ async def test_per_request_redaction_rules() -> None:
 
     assert response.status_code == 200
     assert "pl_live_000000abcd1234" not in route.calls.last.request.content.decode()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_identical_per_request_rules_reuse_scan_cache_and_audit_stats(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        audit=AuditConfig(enabled=True),
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    app = create_app(settings)
+    scans: list[str] = []
+    original = SecretRedactor._scan_string
+
+    def counting(redactor: SecretRedactor, value: str, stats) -> str:
+        scans.append(value)
+        return original(redactor, value, stats)
+
+    monkeypatch.setattr(SecretRedactor, "_scan_string", counting)
+    secret = "pl_fixture_rule_secret_1234567890"
+    header = json.dumps(
+        [{"type": "exact", "value": secret, "name": "request_rule"}],
+        separators=(",", ":"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    scans_after_first = 0
+
+    with caplog.at_level(logging.INFO, logger="promptlatch"):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            for _ in range(2):
+                response = await client.post(
+                    "/v1/responses",
+                    headers={"X-Redact-Extra-Rules": header},
+                    json={"input": secret},
+                )
+                assert response.status_code == 200
+                assert route.calls.last.request.content == b'{"input":"[REDACTED_SECRET]"}'
+                if len(route.calls) == 1:
+                    scans_after_first = len(scans)
+
+    assert scans_after_first > 0
+    assert len(scans) == scans_after_first
+    events = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "promptlatch" and record.message.startswith("{")
+    ]
+    body_events = [
+        event
+        for event in events
+        if event.get("event") == "redaction" and event.get("path") == "/v1/responses"
+    ]
+    assert [event["redactions"] for event in body_events] == [1, 1]
+    assert [event["rules"] for event in body_events] == [{"request_rule": 1}] * 2
+    cached = repr(app.state.redactor._cache._entries)
+    assert header not in cached
+    assert secret not in cached
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_per_request_rule_cache_isolated_between_different_headers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        audit=AuditConfig(enabled=True),
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    app = create_app(settings)
+    transport = httpx.ASGITransport(app=app)
+    secret_a = "pl_fixture_rule_alpha_1234567890"
+    secret_b = "pl_fixture_rule_bravo_1234567890"
+    body = {"input": f"{secret_a} {secret_b}"}
+    headers = [
+        json.dumps([{"type": "exact", "value": secret_b, "name": "rule_b"}]),
+        json.dumps([{"type": "exact", "value": secret_a, "name": "rule_a"}]),
+    ]
+
+    with caplog.at_level(logging.INFO, logger="promptlatch"):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            for header in headers:
+                response = await client.post(
+                    "/v1/responses",
+                    headers={"X-Redact-Extra-Rules": header},
+                    json=body,
+                )
+                assert response.status_code == 200
+
+    assert json.loads(route.calls[0].request.content) == {"input": f"{secret_a} [REDACTED_SECRET]"}
+    assert json.loads(route.calls[1].request.content) == {"input": f"[REDACTED_SECRET] {secret_b}"}
+    events = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "promptlatch" and record.message.startswith("{")
+    ]
+    body_events = [
+        event
+        for event in events
+        if event.get("event") == "redaction" and event.get("path") == "/v1/responses"
+    ]
+    assert [event["rules"] for event in body_events] == [{"rule_b": 1}, {"rule_a": 1}]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_proxy_offloads_redaction_so_healthz_stays_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic"),
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    app = create_app(settings)
+    entered = threading.Event()
+    release = threading.Event()
+    health_completed = threading.Event()
+    result: dict[str, object] = {}
+    errors: list[BaseException] = []
+    redactor = app.state.redactor
+    original = redactor.redact_payload
+
+    def blocking(payload):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("redaction release timed out")
+        return original(payload)
+
+    monkeypatch.setattr(redactor, "redact_payload", blocking)
+
+    async def exercise() -> None:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+
+            async def check_health_after_redaction_starts() -> None:
+                if not await asyncio.to_thread(entered.wait, 2):
+                    raise TimeoutError("redaction did not start")
+                response = await client.get("/healthz")
+                result["health_status"] = response.status_code
+                health_completed.set()
+
+            health_task = asyncio.create_task(check_health_after_redaction_starts())
+            await asyncio.sleep(0)
+            post_task = asyncio.create_task(
+                client.post(
+                    "/v1/responses",
+                    json={"input": f"key {OPENAI_FAKE}"},
+                )
+            )
+            result["post_response"] = await post_task
+            await health_task
+
+    def run_requests() -> None:
+        try:
+            asyncio.run(exercise())
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_requests, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(timeout=2), "redaction did not start"
+        responsive_before_release = health_completed.wait(timeout=1)
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive(), "proxy requests did not finish after releasing redaction"
+    assert not errors
+    assert responsive_before_release
+    assert result["health_status"] == 200
+    post_response = result["post_response"]
+    assert isinstance(post_response, httpx.Response)
+    assert post_response.status_code == 200
+    assert route.calls.last.request.content == b'{"input":"key [REDACTED_SECRET]"}'
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import codecs
 import json
-from collections.abc import AsyncIterator
+import re
+import sys
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import suppress
+from json.encoder import encode_basestring_ascii
 from time import time
 from typing import Any
 from uuid import uuid4
+
+from pydantic_core import from_json
+
+_SSE_NON_CRLF_LINE_BREAK = re.compile(r"[\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 class ResponsesInputError(ValueError):
@@ -99,7 +105,7 @@ def chat_response_to_responses(
 
 async def chat_stream_to_responses(
     chunks: AsyncIterator[bytes], request_payload: dict[str, Any] | None = None
-) -> AsyncIterator[bytes]:
+) -> AsyncGenerator[bytes, None]:
     state = _ChatStreamState(request_payload)
     yield state.event(
         {
@@ -107,8 +113,7 @@ async def chat_stream_to_responses(
             "response": state.response([], "in_progress"),
         }
     )
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    buffer = ""
+    line_reader = _SSELineReader()
     event_lines: list[str] = []
     iterator = aiter(chunks)
     try:
@@ -123,32 +128,26 @@ async def chat_stream_to_responses(
                 ):
                     yield event
                 return
-            buffer += decoder.decode(chunk)
-            while (line := _pop_sse_line(buffer)) is not None:
-                value, buffer = line
-                if value:
-                    event_lines.append(value)
+            for line in line_reader.feed(chunk):
+                if line:
+                    event_lines.append(line)
                     continue
-                async for event in _chat_sse_event_to_responses("\n".join(event_lines), state):
+                for event in _chat_sse_event_to_responses(event_lines, state):
                     yield event
                 event_lines.clear()
                 if state.finished:
                     return
-        buffer += decoder.decode(b"", final=True)
-        while (line := _pop_sse_line(buffer, final=True)) is not None:
-            value, buffer = line
-            if value:
-                event_lines.append(value)
+        for line in line_reader.feed(b"", final=True):
+            if line:
+                event_lines.append(line)
             elif event_lines:
-                async for event in _chat_sse_event_to_responses("\n".join(event_lines), state):
+                for event in _chat_sse_event_to_responses(event_lines, state):
                     yield event
                 event_lines.clear()
                 if state.finished:
                     return
-        if buffer:
-            event_lines.append(buffer)
         if event_lines:
-            async for event in _chat_sse_event_to_responses("\n".join(event_lines), state):
+            for event in _chat_sse_event_to_responses(event_lines, state):
                 yield event
             if state.finished:
                 return
@@ -163,17 +162,59 @@ async def chat_stream_to_responses(
                 await close()
 
 
-def _pop_sse_line(buffer: str, *, final: bool = False) -> tuple[str, str] | None:
-    for index, character in enumerate(buffer):
-        if character == "\n":
-            return buffer[:index], buffer[index + 1 :]
-        if character != "\r":
-            continue
-        if index + 1 == len(buffer) and not final:
-            return None
-        end = index + 2 if buffer[index + 1 : index + 2] == "\n" else index + 1
-        return buffer[:index], buffer[end:]
-    return None
+class _SSELineReader:
+    def __init__(self) -> None:
+        self.fragments: list[bytes] = []
+        self.pending_carriage_return = False
+
+    def _decode_line(self, fragment: bytes) -> str:
+        if not self.fragments:
+            return fragment.decode("utf-8", errors="replace")
+        if fragment:
+            self.fragments.append(fragment)
+        line = b"".join(self.fragments)
+        self.fragments.clear()
+        return line.decode("utf-8", errors="replace")
+
+    def feed(self, chunk: bytes, *, final: bool = False) -> Iterator[str]:
+        start = 0
+        if self.pending_carriage_return:
+            if not chunk and not final:
+                return
+            if chunk.startswith(b"\n"):
+                start = 1
+            self.pending_carriage_return = False
+            yield self._decode_line(b"")
+
+        while start < len(chunk):
+            newline = chunk.find(b"\n", start)
+            if newline < 0:
+                carriage_return = chunk.find(b"\r", start)
+            else:
+                carriage_return = chunk.find(b"\r", start, newline)
+            if newline < 0 and carriage_return < 0:
+                self.fragments.append(chunk[start:])
+                return
+
+            if carriage_return >= 0:
+                if carriage_return + 1 == len(chunk) and not final:
+                    if carriage_return > start:
+                        self.fragments.append(chunk[start:carriage_return])
+                    self.pending_carriage_return = True
+                    return
+                end = carriage_return + 1
+                if end < len(chunk) and chunk[end] == 10:
+                    end += 1
+                line_end = carriage_return
+            else:
+                line_end = newline
+                end = newline + 1
+
+            yield self._decode_line(chunk[start:line_end])
+            start = end
+
+        if final and self.fragments:
+            yield self._decode_line(b"")
 
 
 class _ChatStreamState:
@@ -184,11 +225,14 @@ class _ChatStreamState:
         self.created_at = time()
         self.message_id = f"msg_{uuid4().hex}"
         self.text = ""
+        self.text_chunks: list[str] = []
         self.refusal = ""
+        self.refusal_chunks: list[str] = []
         self.message_started = False
         self.message_output_index: int | None = None
         self.content_order: list[str] = []
         self.content_indices: dict[str, int] = {}
+        self.content_delta_frames: dict[str, tuple[bytes, bytes]] = {}
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.next_output_index = 0
         self.sequence_number = 0
@@ -220,6 +264,26 @@ class _ChatStreamState:
             content_index = len(self.content_order)
             self.content_order.append(kind)
             self.content_indices[kind] = content_index
+            event_type = (
+                "response.output_text.delta" if kind == "output_text" else "response.refusal.delta"
+            )
+            prefix = (
+                b'data: {"type":'
+                + encode_basestring_ascii(event_type).encode("ascii")
+                + b',"item_id":'
+                + encode_basestring_ascii(self.message_id).encode("ascii")
+                + b',"output_index":'
+                + str(self.message_output_index).encode("ascii")
+                + b',"content_index":'
+                + str(content_index).encode("ascii")
+                + b',"delta":'
+            )
+            suffix = (
+                b',"logprobs":[],"sequence_number":'
+                if kind == "output_text"
+                else b',"sequence_number":'
+            )
+            self.content_delta_frames[kind] = (prefix, suffix)
             events.append(
                 self.event(
                     {
@@ -234,23 +298,11 @@ class _ChatStreamState:
         else:
             content_index = self.content_indices[kind]
         if kind == "output_text":
-            self.text += delta
-            event_type = "response.output_text.delta"
+            self.text_chunks.append(delta)
         else:
-            self.refusal += delta
-            event_type = "response.refusal.delta"
-        events.append(
-            self.event(
-                {
-                    "type": event_type,
-                    "item_id": self.message_id,
-                    "output_index": self.message_output_index,
-                    "content_index": content_index,
-                    "delta": delta,
-                    **({"logprobs": []} if kind == "output_text" else {}),
-                }
-            )
-        )
+            self.refusal_chunks.append(delta)
+        prefix, suffix = self.content_delta_frames[kind]
+        events.append(self._string_delta_event(prefix, delta, suffix))
         return events
 
     def tool_call_delta_events(self, delta: Any) -> list[bytes]:
@@ -278,20 +330,31 @@ class _ChatStreamState:
             raise ValueError("invalid tool call delta")
 
         if index not in self.tool_calls:
+            tool_call_id = f"fc_{uuid4().hex}"
+            output_index = self._allocate_output_index()
             self.tool_calls[index] = {
-                "id": f"fc_{uuid4().hex}",
+                "id": tool_call_id,
                 "call_id": call_id or f"call_{uuid4().hex}",
                 "name": "",
-                "arguments": "",
-                "emitted_arguments": 0,
-                "output_index": self._allocate_output_index(),
+                "arguments": None,
+                "argument_chunks": [],
+                "emitted_argument_chunks": 0,
+                "output_index": output_index,
+                "delta_prefix": (
+                    b'data: {"type":"response.function_call_arguments.delta","item_id":'
+                    + encode_basestring_ascii(tool_call_id).encode("ascii")
+                    + b',"output_index":'
+                    + str(output_index).encode("ascii")
+                    + b',"delta":'
+                ),
                 "added": False,
             }
         tool_call = self.tool_calls[index]
         if call_id:
             tool_call["call_id"] = call_id
         tool_call["name"] += name_delta
-        tool_call["arguments"] += arguments_delta
+        if arguments_delta:
+            tool_call["argument_chunks"].append(arguments_delta)
 
         events: list[bytes] = []
         name_is_known = not self.tool_names or tool_call["name"] in self.tool_names
@@ -317,18 +380,16 @@ class _ChatStreamState:
 
     def _tool_argument_delta_events(self, tool_call: dict[str, Any]) -> list[bytes]:
         events: list[bytes] = []
-        emitted_arguments = tool_call["emitted_arguments"]
-        if len(tool_call["arguments"]) > emitted_arguments:
-            argument_delta = tool_call["arguments"][emitted_arguments:]
-            tool_call["emitted_arguments"] = len(tool_call["arguments"])
+        emitted_chunks = tool_call["emitted_argument_chunks"]
+        argument_chunks = tool_call["argument_chunks"]
+        if len(argument_chunks) > emitted_chunks:
+            argument_delta = "".join(argument_chunks[emitted_chunks:])
+            tool_call["emitted_argument_chunks"] = len(argument_chunks)
             events.append(
-                self.event(
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": tool_call["id"],
-                        "output_index": tool_call["output_index"],
-                        "delta": argument_delta,
-                    }
+                self._string_delta_event(
+                    tool_call["delta_prefix"],
+                    argument_delta,
+                    b',"sequence_number":',
                 )
             )
         return events
@@ -342,6 +403,19 @@ class _ChatStreamState:
         payload["sequence_number"] = self.sequence_number
         self.sequence_number += 1
         return _sse(payload)
+
+    def _string_delta_event(self, prefix: bytes, delta: str, suffix: bytes) -> bytes:
+        sequence_number = self.sequence_number
+        self.sequence_number += 1
+        return b"".join(
+            (
+                prefix,
+                encode_basestring_ascii(delta).encode("ascii"),
+                suffix,
+                str(sequence_number).encode("ascii"),
+                b"}\n\n",
+            )
+        )
 
     def text_part(self, text: str) -> dict[str, Any]:
         return {"type": "output_text", "text": text, "annotations": []}
@@ -380,11 +454,20 @@ class _ChatStreamState:
             "type": "function_call",
             "id": tool_call["id"],
             "call_id": tool_call["call_id"],
-            "arguments": tool_call["arguments"] if arguments is None else arguments,
+            "arguments": self._tool_arguments(tool_call) if arguments is None else arguments,
             "status": status,
         }
         item.update(identity)
         return item
+
+    @staticmethod
+    def _tool_arguments(tool_call: dict[str, Any]) -> str:
+        arguments = tool_call["arguments"]
+        if arguments is None:
+            arguments = "".join(tool_call["argument_chunks"])
+            tool_call["arguments"] = arguments
+            tool_call["argument_chunks"].clear()
+        return arguments
 
     def response(
         self,
@@ -454,6 +537,11 @@ class _ChatStreamState:
         return events
 
     def _output_events(self, status: str) -> tuple[list[bytes], list[dict[str, Any]]]:
+        self.text = "".join(self.text_chunks)
+        self.text_chunks.clear()
+        self.refusal = "".join(self.refusal_chunks)
+        self.refusal_chunks.clear()
+
         events: list[bytes] = []
         output: list[dict[str, Any]] = []
         items: list[tuple[int, dict[str, Any], dict[str, Any] | None]] = []
@@ -478,7 +566,7 @@ class _ChatStreamState:
                             "type": "response.function_call_arguments.done",
                             "item_id": tool_call["id"],
                             "output_index": output_index,
-                            "arguments": tool_call["arguments"],
+                            "arguments": self._tool_arguments(tool_call),
                             "name": identity["name"],
                         }
                     )
@@ -528,20 +616,32 @@ class _ChatStreamState:
         return events, output
 
 
-async def _chat_sse_event_to_responses(raw: str, state: _ChatStreamState) -> AsyncIterator[bytes]:
+def _load_stream_json(data: str) -> Any:
+    digit_limit = sys.get_int_max_str_digits()
+    if digit_limit and len(data) >= digit_limit:
+        return json.loads(data)
+    try:
+        payload = from_json(data, cache_strings=False, allow_partial=False)
+    except ValueError:
+        return json.loads(data)
+    # Usage numbers reach the response unchanged; retain stdlib float rounding.
+    if isinstance(payload, dict) and payload.get("usage") is not None:
+        return json.loads(data)
+    return payload
+
+
+def _chat_sse_event_to_responses(raw_lines: list[str], state: _ChatStreamState) -> Iterator[bytes]:
     if state.finished:
         return
-    event_name = next(
-        (
-            line.removeprefix("event:").lstrip()
-            for line in raw.splitlines()
-            if line.startswith("event:")
-        ),
-        None,
-    )
-    data = "\n".join(
-        line.removeprefix("data:").lstrip() for line in raw.splitlines() if line.startswith("data:")
-    )
+    if len(raw_lines) == 1:
+        line = raw_lines[0]
+        if line.startswith("data:") and _SSE_NON_CRLF_LINE_BREAK.search(line) is None:
+            event_name = None
+            data = line[5:].lstrip()
+        else:
+            event_name, data = _chat_sse_event_fields(raw_lines)
+    else:
+        event_name, data = _chat_sse_event_fields(raw_lines)
     if not data:
         return
     if data == "[DONE]":
@@ -549,7 +649,7 @@ async def _chat_sse_event_to_responses(raw: str, state: _ChatStreamState) -> Asy
             yield event
         return
     try:
-        payload = json.loads(data)
+        payload = _load_stream_json(data)
     except json.JSONDecodeError:
         for event in state.failure_events(
             "upstream_stream_invalid", "Upstream stream contained invalid JSON."
@@ -656,6 +756,21 @@ async def _chat_sse_event_to_responses(raw: str, state: _ChatStreamState) -> Asy
                 return
             for event in events:
                 yield event
+
+
+def _chat_sse_event_fields(raw_lines: list[str]) -> tuple[str | None, str]:
+    if any(_SSE_NON_CRLF_LINE_BREAK.search(line) for line in raw_lines):
+        lines = "\n".join(raw_lines).splitlines()
+    else:
+        lines = raw_lines
+    event_name = next(
+        (line.removeprefix("event:").lstrip() for line in lines if line.startswith("event:")),
+        None,
+    )
+    data = "\n".join(
+        line.removeprefix("data:").lstrip() for line in lines if line.startswith("data:")
+    )
+    return event_name, data
 
 
 def _responses_messages_to_chat(payload: dict[str, Any]) -> list[dict[str, Any]]:

@@ -700,7 +700,7 @@ PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
 docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.4
+  ghcr.io/bvolpato/promptlatch:0.2.5
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz
@@ -750,8 +750,8 @@ helm uninstall promptlatch
 Release asset:
 
 ```bash
-helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.4/promptlatch-0.2.4.tgz
-helm install promptlatch ./promptlatch-0.2.4.tgz \
+helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.5/promptlatch-0.2.5.tgz
+helm install promptlatch ./promptlatch-0.2.5.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 ```

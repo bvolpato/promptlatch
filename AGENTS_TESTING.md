@@ -19,13 +19,14 @@ docker build -t promptlatch:release-check .
 docker run --rm --entrypoint promptlatch promptlatch:release-check version
 ```
 
-Before release, also run checks under Python 3.12, 3.13, and 3.14:
+Before release, also run checks under Python 3.12, 3.13, and 3.14. Prepend each
+environment's `bin` directory so subprocess CLI tests use tested version:
 
 ```bash
 UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py312 uv sync --python 3.12 --extra dev --locked
-UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py312 uv run pytest
+PATH="/tmp/promptlatch-py312/bin:$PATH" UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py312 uv run --no-sync pytest
 UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py313 uv sync --python 3.13 --extra dev --locked
-UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py313 uv run pytest
+PATH="/tmp/promptlatch-py313/bin:$PATH" UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py313 uv run --no-sync pytest
 UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py314 uv sync --python 3.14 --extra dev --locked
-UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py314 uv run pytest
+PATH="/tmp/promptlatch-py314/bin:$PATH" UV_PROJECT_ENVIRONMENT=/tmp/promptlatch-py314 uv run --no-sync pytest
 ```

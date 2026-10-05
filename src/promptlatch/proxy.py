@@ -16,6 +16,7 @@ from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, u
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from promptlatch.audit import AuditLogger
 from promptlatch.compat import (
@@ -122,17 +123,10 @@ async def forward_request(request: Request, path: str) -> Response:
     await _validate_target(target_url, settings)
 
     body = await _read_request_body(request, settings.server.max_request_body_bytes)
-    redactor = _redactor_for_request(request, settings)
-    audit: AuditLogger = request.app.state.audit
-    query_params, query_stats = _redact_query_params(request, redactor)
-    audit.redaction(f"query:{path}", query_stats)
     compat_responses_to_chat = _should_bridge_responses_to_chat(request, path, settings)
-    content, body_stats, json_payload = _redact_request_body(
-        request, body, redactor, parse_json=compat_responses_to_chat
+    query_params, content, stats, json_payload = await run_in_threadpool(
+        _redact_request, request, path, body, settings, compat_responses_to_chat
     )
-    audit.redaction(path, body_stats)
-    stats = query_stats
-    stats.merge(body_stats)
 
     if compat_responses_to_chat:
         if not isinstance(json_payload, dict):
@@ -217,6 +211,23 @@ async def forward_request(request: Request, path: str) -> Response:
     )
 
 
+def _redact_request(
+    request: Request, path: str, body: bytes, settings: Settings, parse_json: bool
+) -> tuple[list[tuple[str, str]], bytes, RedactionStats, Any | None]:
+    redactor = _redactor_for_request(request, settings)
+    audit: AuditLogger = request.app.state.audit
+    query_params, query_stats = _redact_query_params(request, redactor)
+    audit.redaction(f"query:{path}", query_stats)
+    content, body_stats, json_payload = _redact_request_body(
+        request, body, redactor, parse_json=parse_json
+    )
+    audit.redaction(path, body_stats)
+    stats = query_stats
+    stats.merge(body_stats)
+
+    return query_params, content, stats, json_payload
+
+
 def _redactor_for_request(request: Request, settings: Settings) -> SecretRedactor:
     raw_rules = request.headers.get("x-redact-extra-rules")
     if not raw_rules:
@@ -237,7 +248,7 @@ def _redactor_for_request(request: Request, settings: Settings) -> SecretRedacto
         raise HTTPException(status_code=400, detail="invalid X-Redact-Extra-Rules header") from None
     request_redaction = deepcopy(redaction)
     request_redaction.rules.extend(rules)
-    return SecretRedactor(request_redaction)
+    return SecretRedactor(request_redaction, _cache_from=request.app.state.redactor)
 
 
 async def _read_request_body(request: Request, limit: int) -> bytes:

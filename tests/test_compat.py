@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from uuid import UUID
 
 import pytest
 from openai.types.chat import ChatCompletionMessageParam
@@ -77,6 +78,44 @@ async def test_chat_stream_preserves_utf8_split_across_chunks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_delta_events_escape_text_and_tool_arguments() -> None:
+    value = 'quote " slash \\ newline\n nul\x00 emoji 😀 separator\u2028'
+    payload = {
+        "choices": [
+            {
+                "delta": {
+                    "content": value,
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_fixture",
+                            "function": {"name": "inspect", "arguments": value},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    output = await _collect(
+        [
+            f"data: {json.dumps(payload)}\n\n".encode(),
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    events = _events(output)
+    text_delta = next(event for event in events if event["type"] == "response.output_text.delta")
+    argument_delta = next(
+        event for event in events if event["type"] == "response.function_call_arguments.delta"
+    )
+    assert text_delta["delta"] == value
+    assert argument_delta["delta"] == value
+    assert events[-1]["response"]["output"][0]["content"][0]["text"] == value
+    assert events[-1]["response"]["output"][1]["arguments"] == value
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_accepts_crlf_events_split_between_chunks() -> None:
     raw = (
         b'data: {"choices":[{"delta":{"content":"hello"}}]}\r\n\r\n'
@@ -90,6 +129,34 @@ async def test_chat_stream_accepts_crlf_events_split_between_chunks() -> None:
     deltas = [event["delta"] for event in _events(output) if event["type"].endswith(".delta")]
     assert deltas == ["hello"]
     assert any(event["type"] == "response.completed" for event in _events(output))
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_keeps_unicode_line_separator_fallback() -> None:
+    payload = json.dumps(
+        {"choices": [{"delta": {"content": "before\u2028after"}}]},
+        ensure_ascii=False,
+    )
+    output = await _collect([f"data: {payload}\n\n".encode()])
+
+    events = _events(output)
+    assert not any(event["type"] == "response.output_text.delta" for event in events)
+    assert events[-2]["code"] == "upstream_stream_invalid"
+    assert events[-1]["type"] == "response.failed"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_single_data_line_matches_generic_field_parse(monkeypatch) -> None:
+    import promptlatch.compat as compat
+
+    monkeypatch.setattr(compat, "uuid4", lambda: UUID(int=1))
+    monkeypatch.setattr(compat, "time", lambda: 1.0)
+    data = b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+
+    fast_path = await _collect([data])
+    generic_path = await _collect([b"event: message\n" + data])
+
+    assert fast_path == generic_path
 
 
 @pytest.mark.asyncio
@@ -479,6 +546,93 @@ async def test_chat_stream_emits_refusal_events_and_content() -> None:
     assert events[-1]["response"]["output"][0]["content"] == [
         {"type": "refusal", "refusal": "I cannot help with that."}
     ]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_preserves_content_across_many_deltas() -> None:
+    text_chunks = [f"text-{index}," for index in range(128)]
+    refusal_chunks = [f"refusal-{index}," for index in range(128)]
+    delayed_arguments = ["x"] * 128
+    streamed_arguments = ["x"] * 128
+    expected_arguments = '{"value":"' + "x" * 256 + '"}'
+
+    def frame(delta: dict) -> bytes:
+        return f"data: {json.dumps({'choices': [{'delta': delta}]})}\n\n".encode()
+
+    tool_deltas = [
+        {
+            "index": 0,
+            "id": "call_fixture",
+            "function": {"name": "inspect_", "arguments": '{"value":"'},
+        }
+    ]
+    tool_deltas.extend(
+        {"index": 0, "function": {"arguments": chunk}} for chunk in delayed_arguments
+    )
+    tool_deltas.append({"index": 0, "function": {"name": "config"}})
+    tool_deltas.extend(
+        {"index": 0, "function": {"arguments": chunk}} for chunk in streamed_arguments
+    )
+    tool_deltas.append({"index": 0, "function": {"arguments": '"}'}})
+
+    parts = [frame({"content": chunk}) for chunk in text_chunks]
+    parts.extend(frame({"refusal": chunk}) for chunk in refusal_chunks)
+    parts.extend(frame({"tool_calls": [delta]}) for delta in tool_deltas)
+    parts.append(
+        b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n'
+    )
+
+    output = await _collect(
+        parts,
+        {
+            "model": "fixture-model",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "inspect_config",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        },
+    )
+
+    events = _events(output)
+    text_deltas = [
+        event["delta"] for event in events if event["type"] == "response.output_text.delta"
+    ]
+    refusal_deltas = [
+        event["delta"] for event in events if event["type"] == "response.refusal.delta"
+    ]
+    argument_deltas = [
+        event["delta"]
+        for event in events
+        if event["type"] == "response.function_call_arguments.delta"
+    ]
+    assert text_deltas == text_chunks
+    assert refusal_deltas == refusal_chunks
+    assert "".join(argument_deltas) == expected_arguments
+
+    function_added_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["type"] == "response.output_item.added"
+        and event["item"]["type"] == "function_call"
+    )
+    first_argument_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["type"] == "response.function_call_arguments.delta"
+    )
+    assert function_added_index < first_argument_index
+
+    response = events[-1]["response"]
+    message, function_call = response["output"]
+    assert message["content"] == [
+        {"type": "output_text", "text": "".join(text_chunks), "annotations": []},
+        {"type": "refusal", "refusal": "".join(refusal_chunks)},
+    ]
+    assert function_call["name"] == "inspect_config"
+    assert function_call["arguments"] == expected_arguments
 
 
 @pytest.mark.asyncio

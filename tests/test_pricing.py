@@ -4,6 +4,7 @@ import stat
 import subprocess
 import sys
 from importlib import metadata
+from pathlib import Path
 
 import httpx
 import pytest
@@ -106,8 +107,8 @@ print(json.dumps(result))
     )
     result = json.loads(completed.stdout)
     distribution = metadata.distribution("litellm")
-    payload = distribution.locate_file(
-        "litellm/model_prices_and_context_window_backup.json"
+    payload = Path(
+        str(distribution.locate_file("litellm/model_prices_and_context_window_backup.json"))
     ).read_bytes()
     rate = json.loads(payload)["gpt-6.1-sol"]
     expected = (

@@ -1,0 +1,19 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+
+target:
+  default_base_url: https://api.openai.com/v1
+  forward_client_authorization: true
+  allowed_base_urls:
+    - https://chatgpt.com/backend-api/codex
+    - https://api.openai.com/v1
+    - https://api.anthropic.com
+  block_private_targets: true
+
+redaction:
+  enabled: true
+  redact_mode: full
+
+observability:
+  dashboard_enabled: true

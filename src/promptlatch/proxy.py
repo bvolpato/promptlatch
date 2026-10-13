@@ -15,7 +15,7 @@ from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, u
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from promptlatch.audit import AuditLogger
@@ -26,6 +26,11 @@ from promptlatch.compat import (
     responses_to_chat_payload,
 )
 from promptlatch.config import RuleConfig, Settings, expand_env_values, get_settings
+from promptlatch.observability import (
+    Observability,
+    ObservabilityMiddleware,
+    RequestObservation,
+)
 from promptlatch.patterns import SENSITIVE_FIELD_RE
 from promptlatch.redaction import RedactionKeyCollisionError, RedactionStats, SecretRedactor
 from promptlatch.version import __version__
@@ -86,9 +91,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         timeout = httpx.Timeout(expanded.target.timeout_seconds)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            _app.state.client = client
-            yield
+        monitoring = Observability(expanded) if expanded.observability.enabled else None
+        price_task = None
+        if monitoring is not None:
+            await run_in_threadpool(monitoring.start)
+            _app.state.observability = monitoring
+            price_task = asyncio.create_task(monitoring.refresh_prices())
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                _app.state.client = client
+                yield
+        finally:
+            try:
+                if price_task is not None:
+                    price_task.cancel()
+                    try:
+                        await price_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        logger.warning("Pricing refresh failed (%s)", type(exc).__name__)
+            finally:
+                try:
+                    if monitoring is not None:
+                        await run_in_threadpool(monitoring.close)
+                finally:
+                    _app.state.observability = None
 
     app = FastAPI(
         title="PromptLatch",
@@ -99,14 +127,71 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = expanded
     app.state.redactor = SecretRedactor(expanded.redaction)
     app.state.audit = AuditLogger(expanded.audit)
+    app.state.observability = None
+    app.add_middleware(ObservabilityMiddleware)
+
+    if expanded.observability.dashboard_enabled:
+        from promptlatch.dashboard import create_dashboard_app, dashboard_shell
+        from promptlatch.security import load_private_token
+
+        database_path = expanded.observability.database_path
+        token = load_private_token(database_path.with_name(database_path.name + ".dashboard-token"))
+
+        @app.get("/", include_in_schema=False)
+        async def dashboard_root() -> Response:
+            return dashboard_shell("/_promptlatch")
+
+        @app.api_route(
+            "/_promptlatch",
+            methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            include_in_schema=False,
+        )
+        async def dashboard_redirect() -> Response:
+            return RedirectResponse("/_promptlatch/", status_code=307)
+
+        app.mount(
+            "/_promptlatch",
+            create_dashboard_app(
+                database_path, token, url_prefix="/_promptlatch", loopback_only=False
+            ),
+        )
+    else:
+
+        @app.api_route(
+            "/_promptlatch",
+            methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            include_in_schema=False,
+        )
+        @app.api_route(
+            "/_promptlatch/{path:path}",
+            methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            include_in_schema=False,
+        )
+        async def dashboard_disabled() -> Response:
+            # A stale dashboard tab must not forward its bearer token upstream.
+            return JSONResponse({"detail": "Dashboard is disabled"}, status_code=404)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
+        monitoring = app.state.observability
         return {
             "ok": True,
             "redaction": expanded.redaction.enabled,
             "engine": expanded.redaction.engine,
             "telemetry": False,
+            "client_shims": {
+                "native_auth": expanded.target.forward_client_authorization
+                and not expanded.server.api_key
+                and not expanded.target.api_key,
+                "native_responses": not expanded.compat.responses_to_chat,
+            },
+            "observability": {
+                "enabled": expanded.observability.enabled,
+                "healthy": monitoring is not None
+                and monitoring.store.status["running"]
+                and not monitoring.store.status["write_errors"]
+                and not monitoring.store.status["dropped_writes"],
+            },
         }
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -118,6 +203,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 async def forward_request(request: Request, path: str) -> Response:
     settings: Settings = request.app.state.settings
+    observation: RequestObservation | None = getattr(request.state, "observation", None)
     _check_proxy_auth(request, settings)
     target_url = _target_url(request, path, settings)
     await _validate_target(target_url, settings)
@@ -161,10 +247,18 @@ async def forward_request(request: Request, path: str) -> Response:
             await client.aclose()
         raise HTTPException(status_code=502, detail=f"upstream request failed: {exc}") from exc
 
+    if observation is not None:
+        observation.response_headers(upstream.headers, upstream.status_code)
     if _is_streaming(upstream.headers):
         transform_stream = compat_responses_to_chat and upstream.is_success
-        response_headers = _response_headers(upstream.headers, transformed=transform_stream)
-        stream = _stream_upstream(upstream, close_client, client, decoded=transform_stream)
+        response_headers = _response_headers(
+            upstream.headers,
+            transformed=transform_stream,
+            protect_dashboard=settings.observability.dashboard_enabled,
+        )
+        stream = _stream_upstream(
+            upstream, close_client, client, decoded=transform_stream, observation=observation
+        )
         if transform_stream:
             stream = chat_stream_to_responses(stream, json_payload)
             response_headers["content-type"] = "text/event-stream; charset=utf-8"
@@ -176,10 +270,16 @@ async def forward_request(request: Request, path: str) -> Response:
         )
 
     transform_response = compat_responses_to_chat and upstream.is_success
-    response_headers = _response_headers(upstream.headers, transformed=transform_response)
+    response_headers = _response_headers(
+        upstream.headers,
+        transformed=transform_response,
+        protect_dashboard=settings.observability.dashboard_enabled,
+    )
     try:
         upstream_content = (
-            await upstream.aread() if transform_response else await _read_raw_upstream(upstream)
+            await upstream.aread()
+            if transform_response
+            else await _read_raw_upstream(upstream, observation=observation)
         )
     except httpx.RequestError:
         raise HTTPException(status_code=502, detail="upstream response failed") from None
@@ -189,6 +289,8 @@ async def forward_request(request: Request, path: str) -> Response:
             await client.aclose()
 
     upstream_payload: Any | None = None
+    if observation is not None and transform_response:
+        observation.observe(upstream_content, streaming=False, decoded=transform_response)
     if transform_response and _is_json_content(upstream.headers):
         try:
             upstream_payload = json.loads(upstream_content)
@@ -224,6 +326,21 @@ def _redact_request(
     audit.redaction(path, body_stats)
     stats = query_stats
     stats.merge(body_stats)
+
+    observation: RequestObservation | None = getattr(request.state, "observation", None)
+    if observation is not None:
+        try:
+            observation.prepare(request, content, json_payload, stats, redactor)
+        except Exception as exc:
+            # Capture failures must not change forwarding or persist an unsafe body.
+            observation.record.update(
+                request_body=None,
+                body_omitted_reason="capture_failed",
+                session_preview=None,
+                user_preview=None,
+                assistant_preview=None,
+            )
+            logger.warning("history request capture failed (%s)", type(exc).__name__)
 
     return query_params, content, stats, json_payload
 
@@ -477,7 +594,7 @@ def _forward_headers(request: Request, settings: Settings) -> dict[str, str]:
     dropped = DROP_REQUEST_HEADERS | _connection_header_names(request.headers)
     for key, value in request.headers.items():
         lowered = key.lower()
-        if lowered in dropped:
+        if lowered in dropped or lowered == "x-promptlatch-thread-id":
             continue
         if lowered in {
             "x-target-base-url",
@@ -595,10 +712,13 @@ async def _stream_upstream(
     client: httpx.AsyncClient,
     *,
     decoded: bool,
+    observation: RequestObservation | None = None,
 ) -> AsyncIterator[bytes]:
     try:
         iterator = upstream.aiter_bytes() if decoded else upstream.aiter_raw()
         async for chunk in iterator:
+            if observation is not None:
+                observation.observe(chunk, streaming=True, decoded=decoded)
             yield chunk
     finally:
         await upstream.aclose()
@@ -606,17 +726,33 @@ async def _stream_upstream(
             await client.aclose()
 
 
-async def _read_raw_upstream(upstream: httpx.Response) -> bytes:
-    return b"".join([chunk async for chunk in upstream.aiter_raw()])
+async def _read_raw_upstream(
+    upstream: httpx.Response, *, observation: RequestObservation | None = None
+) -> bytes:
+    parts: list[bytes] = []
+    async for chunk in upstream.aiter_raw():
+        if observation is not None:
+            observation.observe(chunk, streaming=False, decoded=False)
+        parts.append(chunk)
+    return b"".join(parts)
 
 
-def _response_headers(headers: httpx.Headers, *, transformed: bool) -> dict[str, str]:
+def _response_headers(
+    headers: httpx.Headers, *, transformed: bool, protect_dashboard: bool = False
+) -> dict[str, str]:
     dropped = (
         DROP_RESPONSE_HEADERS
         | _connection_header_names(headers)
         | (DROP_TRANSFORMED_RESPONSE_HEADERS if transformed else set())
     )
-    return {key: value for key, value in headers.items() if key.lower() not in dropped}
+    result = {key: value for key, value in headers.items() if key.lower() not in dropped}
+    if protect_dashboard:
+        # Upstream documents share the dashboard origin but must never execute there.
+        result["content-security-policy"] = (
+            "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'"
+        )
+        result["x-content-type-options"] = "nosniff"
+    return result
 
 
 def _connection_header_names(headers: Mapping[str, str]) -> set[str]:

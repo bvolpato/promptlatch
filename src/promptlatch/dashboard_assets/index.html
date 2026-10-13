@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <base href="__PROMPTLATCH_BASE__">
+  <title>PromptLatch · Request inspector</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/app.js" defer></script>
+</head>
+<body>
+  <section id="signin" class="signin" aria-labelledby="signin-title">
+    <div class="signin-card">
+      <div class="brand"><span class="brand-icon" aria-hidden="true">P</span> PromptLatch <span class="local-label">LOCAL</span></div>
+      <h1 id="signin-title">Request inspector</h1>
+      <p class="muted">Inspect sessions, request payloads, and performance on your server.</p>
+      <form id="signin-form">
+        <label for="dashboard-token">Dashboard token</label>
+        <input id="dashboard-token" type="password" autocomplete="off" spellcheck="false" required placeholder="Enter your dashboard token" aria-describedby="dashboard-token-help">
+        <div id="dashboard-token-help" class="field-help">
+          <p>On the server, the token is usually available with:</p>
+          <pre class="token-command"><code>cat ~/.local/state/promptlatch/requests.sqlite3.dashboard-token</code></pre>
+          <p>For custom locations, use the token file path printed at server startup.</p>
+        </div>
+        <button type="submit" class="primary" id="signin-submit">Unlock inspector <span aria-hidden="true">→</span></button>
+        <button type="button" class="quiet" id="retry-session" hidden>Retry session check</button>
+        <p id="signin-error" class="error-text" role="alert" hidden></p>
+      </form>
+      <p class="privacy-note">The dashboard token is exchanged for an HttpOnly browser session that expires 30 days after sign-in. PromptLatch does not retain the token in browser storage. Request bodies are captured after redaction; response bodies are not stored.</p>
+    </div>
+  </section>
+
+  <div id="dashboard" class="dashboard" hidden>
+    <header class="topbar">
+      <button id="session-toggle" class="icon-button mobile-only" aria-label="Show sessions" aria-expanded="false" aria-controls="sidebar">☰</button>
+      <a href="./" class="brand"><span class="brand-icon" aria-hidden="true">P</span><span>PromptLatch</span><span class="brand-description">request console</span></a>
+      <nav class="topnav" aria-label="Workspace"><button id="nav-inspector" class="nav-button selected" aria-current="page">Requests</button><button id="nav-overview" class="nav-button" aria-label="Global statistics">Stats</button></nav>
+      <div class="header-actions"><span id="live-status" class="live-status" role="status">Connecting</span><button id="refresh-now" class="quiet" aria-label="Refresh activity">Refresh</button><button id="signout" class="quiet">Lock</button></div>
+    </header>
+    <div class="warnings"><div id="load-error" class="notice error-notice" role="alert" hidden></div><div id="capture-warning" class="notice capture-warning" role="alert" hidden><strong>History capture has gaps.</strong> <span id="capture-warning-text"></span></div></div>
+    <div id="workbench" class="workbench">
+      <button id="sidebar-backdrop" class="sidebar-backdrop" aria-label="Close sessions" tabindex="-1"></button>
+      <aside id="sidebar" class="sidebar" aria-label="Session browser">
+        <div class="sidebar-controls">
+          <label class="sr-only" for="filter-traffic">Traffic scope</label><select id="filter-traffic" class="traffic-filter"><option value="inference">Inference requests</option><option value="all">All HTTP traffic</option></select>
+          <div class="session-search"><label class="sr-only" for="thread-search">Search loaded prompts, models, providers, or sessions</label><span aria-hidden="true" class="search-icon">⌕</span><input id="thread-search" type="search" placeholder="Search prompts, models, sessions" autocomplete="off"><kbd aria-hidden="true">/</kbd></div>
+          <div class="session-filters"><label class="sr-only" for="filter-status">Latest request status</label><select id="filter-status"><option value="">Any status</option><option value="active">Active</option><option value="success">Completed</option><option value="error">Failed</option></select><label class="sr-only" for="filter-provider">Latest provider</label><select id="filter-provider"><option value="">Any provider</option></select><label class="sr-only" for="filter-model">Latest model</label><select id="filter-model"><option value="">Any model</option></select></div>
+        </div>
+        <div class="sidebar-heading"><span id="session-total">0 sessions</span><span class="sidebar-live"><span class="live-dot"></span>Live</span></div>
+        <nav id="session-tree" class="session-tree" aria-label="Sessions and request iterations"></nav>
+        <div class="sidebar-pager"><button id="threads-prev" class="icon-button" aria-label="Previous sessions">←</button><span id="threads-page">0 sessions</span><button id="threads-next" class="icon-button" aria-label="Next sessions">→</button></div>
+        <p id="filter-scope" class="sidebar-footnote">Inference requests shown by default. Other filters apply to loaded sessions.</p>
+      </aside>
+
+      <main id="main-pane" class="main-pane">
+        <section id="empty-view" class="view empty-view" aria-live="polite"><div><span class="empty-symbol" aria-hidden="true">⌁</span><h1 id="empty-title">Waiting for requests</h1><p id="empty-description">Sessions appear here when traffic passes through the proxy with history enabled.</p></div></section>
+
+        <section id="session-view" class="view" aria-labelledby="session-title" hidden>
+          <header class="view-heading"><div><h1 id="session-title">Session</h1><p id="session-subtitle" class="muted mono"></p></div><span id="session-source" class="tag"></span></header>
+          <div id="session-summary" class="session-summary"></div>
+          <div id="session-history" class="scroll-pane"><div class="section-heading"><h2>Requests</h2><span id="session-range" class="muted small"></span></div><p class="context-note">Newest first. Previous answers come from redacted request history.</p><div class="table-scroll"><table><thead><tr><th>Iteration / request preview</th><th>Model</th><th>Status</th><th>Tokens</th><th>TTFT</th><th>Est. TPS</th><th>Redactions</th><th>Est. USD</th></tr></thead><tbody id="session-requests"></tbody></table></div><p id="session-empty" class="empty-small" hidden>No retained requests in this session.</p><div class="content-pager"><button id="session-prev" class="quiet">← Newer</button><span id="session-page" class="muted small"></span><button id="session-next" class="quiet">Older →</button></div></div>
+        </section>
+
+        <section id="request-view" class="view" aria-labelledby="request-title" hidden>
+          <header class="request-heading"><div class="request-breadcrumb"><span class="request-label">Request</span><span id="request-id" class="mono"></span><div class="iteration-nav"><button id="request-prev" class="quiet" aria-label="Newer iteration">← Newer</button><button id="request-next" class="quiet" aria-label="Older iteration">Older →</button></div><button id="copy-request-link" class="quiet" disabled>Copy link</button><button id="clear-selection" class="quiet">Clear</button><span id="copy-link-status" class="sr-only" role="status"></span><input id="request-link" class="request-link" type="text" readonly aria-label="Request link" hidden></div><div class="request-status-row"><span id="request-status"></span><span id="request-provider" class="tag"></span><span id="request-started" class="request-date"></span></div><div class="request-title-row"><h1 id="request-title">Request</h1></div><div class="request-subtitle"><button id="request-session" class="breadcrumb-button">Session</button><span id="request-ordinal">Iteration</span><span id="request-endpoint" class="mono"></span></div></header>
+          <div id="request-strip" class="request-strip" aria-label="Selected request metrics"></div>
+          <div id="request-metric-notes" class="request-metric-notes"></div>
+          <div class="tabbar" role="tablist" aria-label="Request inspector"><button id="tab-conversation" role="tab" aria-selected="true" aria-controls="panel-conversation" tabindex="0">Conversation <span id="conversation-count" class="tab-count"></span></button><button id="tab-payload" role="tab" aria-selected="false" aria-controls="panel-payload" tabindex="-1">Payload</button><button id="tab-metrics" role="tab" aria-selected="false" aria-controls="panel-metrics" tabindex="-1">Request metrics &amp; redactions</button></div>
+          <section id="panel-conversation" class="inspector-panel" role="tabpanel" aria-labelledby="tab-conversation" tabindex="0"><div id="conversation-notices"></div><div class="section-heading"><h2>Captured conversation</h2><span class="muted small">Newest first</span></div><p class="context-note">Request context only. Upstream responses are not stored.</p><div id="conversation-content" class="conversation-content"></div></section>
+          <section id="panel-payload" class="inspector-panel" role="tabpanel" aria-labelledby="tab-payload" tabindex="0" hidden><div id="payload-notices"></div><div class="section-heading"><h2>Redacted request payload</h2><span id="payload-size" class="muted small"></span></div><pre id="request-payload" class="payload-code"></pre></section>
+          <section id="panel-metrics" class="inspector-panel" role="tabpanel" aria-labelledby="tab-metrics" tabindex="0" hidden><div id="request-metrics"></div></section>
+        </section>
+
+        <section id="overview-view" class="view" aria-labelledby="overview-title" hidden>
+          <header class="view-heading"><div><h1 id="overview-title">Global statistics</h1><p class="muted small">Across all recorded requests in this period. Independent of the selected request and sidebar filters.</p></div><label class="range-control"><span class="sr-only">Global statistics period</span><select id="days"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option><option value="365">Last year</option><option value="36500">All time</option></select></label></header>
+          <div class="scroll-pane overview-content">
+            <div id="overview-metrics" class="overview-metrics"></div>
+            <p id="aggregate-history-note" class="body-notice" hidden></p>
+            <section class="overview-section"><div class="section-heading"><h2>Daily requests <span class="muted small">UTC</span></h2><span id="trend-total" class="muted small"></span></div><div id="trend-chart" class="trend-chart" role="img" aria-label="No requests recorded"></div><div class="chart-labels"><span id="trend-start">—</span><span id="trend-end">—</span></div></section>
+            <div class="overview-columns"><section class="overview-section"><h2>Token usage</h2><p id="overview-usage-note" class="context-note" hidden></p><dl id="overview-tokens" class="metrics-grid"></dl></section><section class="overview-section"><h2>Redaction categories</h2><p class="context-note">Rule matches, not unique credentials. No secret values.</p><div id="overview-rules" class="rule-list"></div></section></div>
+            <section class="overview-section"><h2>Models</h2><div class="table-scroll"><table><thead><tr><th>Model / provider</th><th>Requests</th><th>Tokens</th><th>Est. cost (USD)</th><th>Priced requests</th></tr></thead><tbody id="overview-models"></tbody></table></div></section>
+            <p id="overview-storage" class="context-note"></p>
+          </div>
+        </section>
+      </main>
+    </div>
+    <footer class="statusbar"><span id="retention-note">Local SQLite history</span><span id="auth-session-expiry" class="muted small" hidden></span><span id="updated-at">Waiting for first refresh</span></footer>
+  </div>
+</body>
+</html>

@@ -70,6 +70,13 @@ _ASCII_ASSIGNMENT_CANDIDATES = {
 _ASSIGNMENT_FIELD_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-İıſK"
 )
+_CODE_REFERENCE_PREFIX = re.compile(
+    r"[A-Za-z_]\w*(?:[ \t]*\.[ \t]*[A-Za-z_]\w*|[ \t]*\([ \t]*\))*[ \t]*[\[(]?",
+    re.ASCII,
+)
+_CREDENTIAL_PLACEHOLDER = re.compile(
+    r"(?i)<your[-_](?:api[-_]key|client[-_]secret|password|token|secret)(?:[-_]here)?>"
+)
 
 # Scan results are kept per string, so repeated text is scanned once.
 _CACHE_MAX_ENTRIES = 16_384
@@ -80,6 +87,21 @@ def _ascii_ignorecase(value: str) -> str:
     if value.isascii():
         return value.lower()
     return value.translate(_ASCII_IGNORECASE_TRANSLATION).lower()
+
+
+def _is_code_reference(value: str, start: int, end: int) -> bool:
+    """Recognize unquoted assignment prefixes, never literals inside a call."""
+    position = start
+    while position and value[position - 1] in " \t":
+        position -= 1
+    if not position or value[position - 1] != "=":
+        return False
+    if position > 1 and value[position - 2] in "=!<>:":
+        return False
+    if "(" not in value[start:end] and value[end : end + 1] not in {"(", "["}:
+        return False
+    reference = _CODE_REFERENCE_PREFIX.match(value, start)
+    return reference is not None and reference.end() >= end
 
 
 @dataclass
@@ -940,25 +962,41 @@ class SecretRedactor:
             secret_value = getattr(found_secret, "secret_value", None)
             if not secret_value:
                 continue
-            value, count = self._replace_detected_secret(secret_value, value)
+            value, count = self._replace_detected_secret(
+                secret_value, value, keyword=found_secret.type == "Secret Keyword"
+            )
             stats.add(f"detect_secrets:{found_secret.type}", count)
         return value
 
-    def _replace_detected_secret(self, secret_value: str, value: str) -> tuple[str, int]:
-        if "," not in secret_value:
+    def _replace_detected_secret(
+        self, secret_value: str, value: str, *, keyword: bool = False
+    ) -> tuple[str, int]:
+        if not keyword and "," not in secret_value:
             return re.subn(re.escape(secret_value), self._replacement, value)
 
         total = 0
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal total
+            if keyword and _is_code_reference(match.string, match.start(), match.end()):
+                return match.group(0)
+            total += 1
+            return self._replacement(match)
+
+        if "," not in secret_value:
+            value = re.sub(re.escape(secret_value), replace, value)
+            return value, total
+
         for segment in secret_value.split(","):
             candidate = segment.strip().strip("\"'")
             if not candidate:
                 continue
-            value, count = re.subn(re.escape(candidate), self._replacement, value)
-            total += count
+            value = re.sub(re.escape(candidate), replace, value)
 
         if total:
             return value, total
-        return re.subn(re.escape(secret_value), self._replacement, value)
+        value = re.sub(re.escape(secret_value), replace, value)
+        return value, total
 
     def _sub_builtin_pattern(
         self, name: str, pattern: re.Pattern[str], value: str
@@ -1024,6 +1062,10 @@ class SecretRedactor:
                     continue
                 match = pattern.match(value, candidate)
                 if match is None:
+                    continue
+                if _is_code_reference(value, match.start("secret"), match.end("secret")):
+                    continue
+                if _CREDENTIAL_PLACEHOLDER.fullmatch(match.group("secret")):
                     continue
                 chunks.append(value[consumed : match.start()])
                 chunks.append(

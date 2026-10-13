@@ -5,12 +5,14 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import yaml
 from typer.testing import CliRunner
 
 from promptlatch.cli import app
+from promptlatch.security import load_private_token
 from promptlatch.version import __version__
 
 
@@ -78,6 +80,10 @@ def test_serve_does_not_log_request_url_secrets(tmp_path, debug_requests: bool) 
                 },
                 "target": {"default_base_url": "https://example.invalid/v1"},
                 "redaction": {"engine": "basic"},
+                "observability": {
+                    "database_path": str(tmp_path / "requests.sqlite3"),
+                    "pricing_enabled": False,
+                },
             }
         ),
         encoding="utf-8",
@@ -153,3 +159,99 @@ def test_encrypt_rules_is_idempotent(tmp_path) -> None:
         == encrypted
     )
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
+
+
+def test_dashboard_token_creation_is_private_and_race_safe(tmp_path) -> None:
+    token_file = tmp_path / "state" / "requests.sqlite3.dashboard-token"
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        tokens = list(executor.map(load_private_token, [token_file] * 8))
+
+    assert len(set(tokens)) == 1
+    assert len(tokens[0]) == 43
+    assert token_file.read_text(encoding="ascii").strip() == tokens[0]
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+def test_dashboard_token_rejects_symlink_without_modifying_target(tmp_path) -> None:
+    target = tmp_path / "other-file"
+    target.write_text("private unrelated content", encoding="utf-8")
+    token_file = tmp_path / "token"
+    token_file.symlink_to(target)
+
+    with pytest.raises(OSError):
+        load_private_token(token_file)
+
+    assert target.read_text(encoding="utf-8") == "private unrelated content"
+    assert token_file.is_symlink()
+
+
+def test_dashboard_token_rejects_public_permissions(tmp_path) -> None:
+    token_file = tmp_path / "token"
+    token = load_private_token(token_file)
+    token_file.chmod(0o644)
+
+    with pytest.raises(ValueError, match="private regular file"):
+        load_private_token(token_file)
+
+    assert token_file.read_text(encoding="ascii").strip() == token
+
+
+@pytest.mark.parametrize("enable_with_flag", [False, True])
+def test_serve_dashboard_uses_proxy_port(monkeypatch, tmp_path, enable_with_flag: bool) -> None:
+    database = tmp_path / "requests.sqlite3"
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "server": {"api_key": "FixtureProxyKeyMustNotAuthenticateDashboard"},
+                "observability": {
+                    "database_path": str(database),
+                    "dashboard_enabled": not enable_with_flag,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = {}
+    application = object()
+
+    def create_app(settings):
+        calls["settings"] = settings
+        return application
+
+    def run(app, **kwargs):
+        calls["app"] = app
+        calls.update(kwargs)
+
+    monkeypatch.setattr("promptlatch.cli.create_app", create_app)
+    monkeypatch.setattr("promptlatch.cli.uvicorn.run", run)
+
+    arguments = ["serve", "--config", str(config), "--host", "::1", "--port", "8090"]
+    if enable_with_flag:
+        arguments.append("--dashboard")
+    result = CliRunner().invoke(app, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert calls["settings"].observability.database_path == database
+    assert calls["settings"].observability.dashboard_enabled is True
+    assert calls["app"] is application
+    assert calls["host"] == "::1"
+    assert calls["port"] == 8090
+    assert calls["access_log"] is False
+    assert "FixtureProxyKeyMustNotAuthenticateDashboard" not in result.output
+    assert "http://[::1]:8090/" in result.output
+    assert str(database) + ".dashboard-token" in result.output
+
+
+def test_serve_without_dashboard_does_not_print_token_path(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setattr("promptlatch.cli.create_app", lambda settings: object())
+    monkeypatch.setattr("promptlatch.cli.uvicorn.run", lambda app, **kwargs: None)
+
+    result = CliRunner().invoke(app, ["serve", "--config", str(tmp_path / "missing.yaml")])
+
+    assert result.exit_code == 0
+    assert "Dashboard:" not in result.output
+    assert "Token file:" not in result.output
+    assert not (tmp_path / "promptlatch").exists()

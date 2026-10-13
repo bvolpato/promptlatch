@@ -9,7 +9,12 @@ import typer
 import uvicorn
 import yaml
 
-from promptlatch.config import DEFAULT_CONFIG_PATH, DEFAULT_KEY_PATH, config_template, load_settings
+from promptlatch.config import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_KEY_PATH,
+    config_template,
+    load_settings,
+)
 from promptlatch.proxy import create_app
 from promptlatch.redaction import SecretRedactor
 from promptlatch.security import encrypt_text, load_key, write_key_file, write_private_text
@@ -49,6 +54,9 @@ def serve(
             ),
         ),
     ] = False,
+    dashboard: Annotated[
+        bool, typer.Option("--dashboard", help="Enable the authenticated dashboard at /.")
+    ] = False,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("promptlatch").setLevel(logging.INFO)
@@ -60,8 +68,22 @@ def serve(
         settings.server.port = port
     if debug_requests:
         settings.server.debug_requests = True
+    if dashboard:
+        settings.observability.dashboard_enabled = True
+    application = create_app(settings)
+    if settings.observability.dashboard_enabled:
+        token_file = settings.observability.database_path.with_name(
+            settings.observability.database_path.name + ".dashboard-token"
+        )
+        bind_host = settings.server.host
+        url_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(bind_host, bind_host)
+        if ":" in url_host:
+            url_host = f"[{url_host}]"
+        typer.echo(f"Dashboard: http://{url_host}:{settings.server.port}/")
+        typer.echo(f"Token file: {token_file}")
+        typer.echo("Enter the token from this file in the dashboard. Keep it private.")
     uvicorn.run(
-        create_app(settings),
+        application,
         host=settings.server.host,
         port=settings.server.port,
         access_log=False,

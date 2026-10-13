@@ -132,12 +132,36 @@ class CompatConfig(BaseModel):
     responses_to_chat: bool = False
 
 
+def _default_database_path() -> Path:
+    state_home = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return state_home / "promptlatch" / "requests.sqlite3"
+
+
+class ObservabilityConfig(BaseModel):
+    enabled: bool = True
+    database_path: Path = Field(default_factory=_default_database_path)
+    max_database_bytes: int = Field(default=1024**3, ge=1024**2)
+    max_body_bytes: int = Field(default=256 * 1024, ge=0, le=32 * 1024**2)
+    store_request_bodies: bool = True
+    queue_size: int = Field(default=1024, ge=1, le=65536)
+    pricing_enabled: bool = True
+    pricing_file: Path | None = None
+    pricing_refresh_hours: float = Field(default=24, gt=0)
+    dashboard_enabled: bool = False
+
+    @field_validator("database_path", "pricing_file")
+    @classmethod
+    def expand_paths(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
+
+
 class Settings(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     target: TargetConfig = Field(default_factory=TargetConfig)
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
     compat: CompatConfig = Field(default_factory=CompatConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
     @model_validator(mode="after")
     def validate_auth_forwarding(self) -> Settings:
@@ -186,6 +210,19 @@ def _env_overrides() -> dict[str, Any]:
         ),
         "PROMPTLATCH_ALLOW_EXTRA_REGEX_RULES": ("redaction", "allow_extra_regex_rules"),
         "PROMPTLATCH_RESPONSES_TO_CHAT": ("compat", "responses_to_chat"),
+        "PROMPTLATCH_OBSERVABILITY_ENABLED": ("observability", "enabled"),
+        "PROMPTLATCH_OBSERVABILITY_DATABASE_PATH": ("observability", "database_path"),
+        "PROMPTLATCH_OBSERVABILITY_MAX_DATABASE_BYTES": ("observability", "max_database_bytes"),
+        "PROMPTLATCH_OBSERVABILITY_MAX_BODY_BYTES": ("observability", "max_body_bytes"),
+        "PROMPTLATCH_OBSERVABILITY_STORE_REQUEST_BODIES": ("observability", "store_request_bodies"),
+        "PROMPTLATCH_OBSERVABILITY_QUEUE_SIZE": ("observability", "queue_size"),
+        "PROMPTLATCH_OBSERVABILITY_PRICING_ENABLED": ("observability", "pricing_enabled"),
+        "PROMPTLATCH_OBSERVABILITY_PRICING_FILE": ("observability", "pricing_file"),
+        "PROMPTLATCH_OBSERVABILITY_PRICING_REFRESH_HOURS": (
+            "observability",
+            "pricing_refresh_hours",
+        ),
+        "PROMPTLATCH_DASHBOARD_ENABLED": ("observability", "dashboard_enabled"),
     }
     data: dict[str, Any] = {}
     for env_name, path in mapping.items():
@@ -328,6 +365,14 @@ def config_template(target_base_url: str, target_api_key_env: str) -> str:
             },
             "audit": {"enabled": True, "file": None},
             "compat": {"responses_to_chat": False},
+            "observability": {
+                "enabled": True,
+                "max_database_bytes": 1073741824,
+                "max_body_bytes": 262144,
+                "store_request_bodies": True,
+                "pricing_enabled": True,
+                "dashboard_enabled": False,
+            },
         },
         sort_keys=False,
     )

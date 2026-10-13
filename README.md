@@ -14,7 +14,9 @@ coding agents and clients that support a custom base URL. Use the library to red
 prompt text, message arrays, SDK parameters, and structured request payloads before
 your application calls an LLM SDK.
 
-Scanning stays local. PromptLatch has no telemetry or phone-home behavior.
+Scanning and monitoring stay local. PromptLatch sends no telemetry. Server mode
+downloads public LiteLLM pricing metadata for cost estimates; disable this with
+`observability.pricing_enabled: false`.
 
 ![PromptLatch site preview](https://raw.githubusercontent.com/bvolpato/promptlatch/main/site/hero.png)
 
@@ -27,6 +29,7 @@ Agent integration prompt: [`PROMPT.md`](https://github.com/bvolpato/promptlatch/
 | Need | Use |
 | --- | --- |
 | Protect coding agents and IDEs | Run `promptlatch serve` and point OpenAI-compatible clients at `http://127.0.0.1:8000/v1`. |
+| Inspect proxy traffic and usage | Run `promptlatch serve --dashboard`, then open `http://127.0.0.1:8000/`. Monitoring works without the web app. |
 | Protect SDK calls in Python | Import `redact_text`, `redact_messages`, `redact_params`, or `redact_payload` and pass each returned value to the SDK. |
 
 ## Coverage
@@ -43,6 +46,8 @@ Entropy-only matching is disabled to avoid unpredictable false positives.
 
 - Request bodies and query parameters are scanned before they leave your machine.
 - Audit logs record redaction counts and rule names without storing secret values.
+- Local request history stores redacted bodies and metrics. Redacted prompts can
+  still contain private information; use metadata-only storage when needed.
 - PromptLatch strips cookies and secret-named client headers. Provider credentials are
   added from config or dedicated `X-Target-*` headers after that filtering step.
 - Unknown private token formats need a custom exact-tail or regex rule.
@@ -84,6 +89,16 @@ cd promptlatch
 uv sync --extra dev --locked
 uv run promptlatch doctor
 ```
+
+Install this checkout and the `codex-latch` / `claude-latch` commands:
+
+```bash
+./install.sh
+```
+
+Requires `uv`. Installs into uv's tool bin directory without editing Codex, Claude
+Code, shell startup files, or proxy configuration. See [coding-agent shims](#coding-agent-shims)
+for server setup.
 
 ASGI servers can load `promptlatch.asgi:app` directly. Importing CLI or proxy
 helpers does not load user config until a command or app requests it.
@@ -415,10 +430,153 @@ redaction:
     - type: regex
       value: sk-[A-Za-z0-9_-]{20,}
       name: openai-style-token
+
+observability:
+  enabled: true
+  max_database_bytes: 1073741824
+  max_body_bytes: 262144
+  store_request_bodies: true
+  pricing_enabled: true
+  dashboard_enabled: false
 ```
 
 Store only key tails in exact rules. Full masking is default; partial masking is
 available through `redact_mode: partial`.
+
+## Local monitoring
+
+Server mode records request metrics automatically. Python library calls do not
+create monitoring databases. Enable the optional dashboard on the same server:
+
+```bash
+promptlatch serve --dashboard --config ~/.config/promptlatch/config.yaml
+```
+
+Open `http://127.0.0.1:8000/`. The command prints the path of a private dashboard
+token file. Enter that file's token in the app. This token is separate from the
+proxy API key, is not printed in logs, and is never added to a URL. Set
+`observability.dashboard_enabled: true` to enable it through config. The dashboard
+shares the proxy's bind address and port. Keep the default loopback binding for
+local use; remote access requires a protected transport such as an HTTPS reverse
+proxy or SSH tunnel.
+
+Signing in creates a browser session that expires 30 days after authentication.
+The session uses an HttpOnly cookie and survives page reloads, browser restarts,
+and server restarts. Activity does not extend its expiry. The app does not retain
+the file token in browser storage. Lock removes the browser session cookie.
+Changing the file token and restarting the server invalidates all sessions;
+otherwise, a copied session cookie remains valid until its expiry.
+Cookies belong to one hostname and browser profile. Keep using the same address;
+`localhost` and `127.0.0.1` have separate cookies. Signing in clears a stale
+root-path dashboard cookie that could otherwise collide with the current cookie.
+
+When enabled, `/` serves the app and `/_promptlatch/` is reserved for its assets
+and authenticated monitoring API. These requests are not proxied or included in
+request history. Provider routes continue on their existing paths.
+The monitoring namespace remains local when the dashboard is disabled, so stale
+browser tabs cannot forward their access token upstream. With the dashboard
+enabled, forwarded responses receive a browser sandbox policy that prevents
+upstream HTML or scripts from accessing its origin. API response bodies are unchanged.
+
+The dashboard opens a compact request inspector with a session tree in the sidebar.
+Sessions show status, model, retained duration and cost, and message previews.
+Requests and captured conversation history appear newest first. Search and
+status/provider/model filters apply to loaded sessions.
+Each selected request has a `#request=<request-id>` deep link. Copy link copies
+that address; opening it restores the request after sign-in, including older
+session and iteration pages. Evicted requests show an unavailable notice.
+Session and turn rows include the beginning of the user request. Each iteration
+also previews the latest user text and previous assistant answer from its captured
+request history. Previews are redacted, capped at 200 characters each, and evicted
+with request details; they are not part of long-lived usage statistics. A positive
+body capture limit allows previews even when the body is truncated. Setting
+`max_body_bytes: 0` disables both. Incremental requests may omit the previous
+answer from their context.
+Expand a session to browse user turns and request iterations, then select an
+iteration to inspect its conversation history, raw payload, metrics, and
+redactions in the main pane. User-turn groups are inferred from submitted
+history; tool-result iterations stay under the preceding user turn. Incremental
+Responses requests expose retained parent links when available. Older records
+without turn metadata remain ungrouped iterations. Stats is global, independent
+of the selected request and sidebar filters. It shows token totals, latency,
+estimated cost, and redaction counts by rule. All time uses preserved lifetime
+totals; daily, model, and rule breakdowns cover retained aggregate history.
+The request tree defaults to inference calls. Select **All HTTP traffic** to
+inspect ancillary GETs and other proxy calls. Their records remain retained;
+deep links to those requests open the matching traffic view automatically.
+Conversation omits entries without readable content, including encrypted-only
+reasoning and tool metadata declarations. Payload preserves the captured data.
+
+Counts describe matches, not unique leaked credentials. Request details contain
+the redacted payload, capped at 256 KiB by default, without secret samples, raw
+headers, or response text.
+Bodies are omitted when redaction is disabled, partial masking is selected, or
+content is binary or encoded.
+
+- **TTFT:** elapsed time from request start to first generated output, rather than
+  upstream response headers. Nonstreaming responses do not provide TTFT.
+- **TPS after first output:** `(output_tokens - 1) / (last_output - first_output)`.
+  Stream chunks can contain multiple tokens, so this is approximate. Missing
+  usage or fewer than two timed output events leaves TPS unknown.
+- **Usage:** provider-reported input, output, and total tokens. Missing usage stays
+  unknown; PromptLatch does not substitute character counts. Reasoning, cached
+  input, and cache-write tokens appear when supplied. Response parsing recognizes
+  JSON and SSE even when the content type is missing or incorrect. Requests show
+  why metrics are unavailable; old captures cannot recover unrecorded usage.
+- **Cost:** estimates from the installed [LiteLLM package](https://docs.litellm.ai/docs/completion/token_usage) and its public pricing map for supported exact model
+  matches. Unknown models, usage, or unsupported pricing remain unknown. Estimates
+  are not invoices. The map refreshes in the background daily; no prompts, keys,
+  model selections, or usage are sent to the pricing source.
+  ChatGPT subscription calls use equivalent OpenAI API token rates, labelled
+  **API-price equivalent**. These estimates compare API usage costs; they are
+  not subscription charges. Non-LLM requests do not count as missing LLM usage
+  or pricing.
+  Retained subscription requests with complete usage can also receive estimates
+  in background batches. Request details and aggregate costs update together;
+  missing usage remains unknown. Historical comparisons use current standard
+  API text-token rates, excluding extra media and hosted-tool charges. They do
+  not reconstruct an earlier bill or service tier.
+
+For reliable grouping, send `X-PromptLatch-Thread-ID` with a stable conversation
+identifier. PromptLatch strips this header before forwarding. Thread identifiers
+are HMAC-hashed locally. Metadata thread/conversation/session IDs and Responses
+`previous_response_id` links also group related requests. Without those, matching
+first-user-message and preceding system content provides best-effort grouping,
+labelled as inferred. Requests without usable history remain ungrouped.
+
+Storage defaults to `$XDG_STATE_HOME/promptlatch/requests.sqlite3`, or
+`~/.local/state/promptlatch/requests.sqlite3` when `XDG_STATE_HOME` is unset.
+Set `observability.database_path` to choose another location. Both the request
+database and `<database_path>.stats.sqlite3` share the configured physical cap,
+1 GiB by default, including rollback journals. SQLite page limits reserve journal
+headroom, leaving roughly half the budget for database pages. Oldest request
+details are evicted first, then oldest daily/model aggregates if needed. Lifetime
+request, token, cost, latency, and redaction totals survive eviction. The dashboard
+shows combined storage and pruning counts. Startup checks existing files and
+installs page limits before writing. Legacy files without room for safe journal
+copies are refused without growth and require offline compaction; startup does
+not create a temporary `VACUUM` copy. A bounded background writer keeps
+SQLite work off the request event loop; dropped records are reported when
+storage cannot keep up. Graceful shutdown drains queued events. Abrupt process
+termination can lose events that have not reached SQLite.
+
+One server process can write to each history database. Use separate database paths
+for multiple proxy workers; starting a second writer against the same path fails.
+
+Redaction is not anonymization. Stored prompts can retain source code, personal
+information, and unrecognized credentials. Set
+`observability.store_request_bodies: false` for metadata-only monitoring, or
+`observability.enabled: false` to disable recording. These settings affect future
+requests; existing history remains on disk. Keep the state directory private.
+
+Additional settings: `queue_size` (default 1024), `pricing_refresh_hours` (24), and
+`pricing_file` for a local LiteLLM-format JSON price map. Environment overrides use
+`PROMPTLATCH_OBSERVABILITY_` followed by the uppercase setting name; the dashboard
+override is `PROMPTLATCH_DASHBOARD_ENABLED`.
+
+For containers, mount a persistent writable volume and set `XDG_STATE_HOME` or
+`PROMPTLATCH_OBSERVABILITY_DATABASE_PATH` inside it. Enable the dashboard on that
+server when needed; it uses the same history and listening port.
 
 ## Supported routes
 
@@ -614,7 +772,74 @@ For another Chat Completions target, replace base URL, environment variable, and
 model ID. Use `PROMPTLATCH_TARGET_BASE_URL` and `PROMPTLATCH_TARGET_API_KEY` instead
 when PromptLatch owns one fixed upstream.
 
-## Claude Code
+## Coding-agent shims
+
+Run Codex and Claude Code through one local PromptLatch server, using their own
+provider credentials and the official upstream endpoints:
+
+```bash
+./install.sh
+promptlatch serve --config examples/promptlatch-agents.config.yaml
+
+# In another terminal:
+codex-latch
+claude-latch
+```
+
+Install and sign in to the original CLIs first (`codex login`, `claude auth login`).
+Requires Codex 0.162.1+ and Claude Code 2.1.220+. These versions support the
+configuration checks and provider settings used to keep requests on the proxy.
+The shims preserve client credentials and configuration files. The example binds
+to loopback, enables client-auth forwarding, restricts targets to the three official
+endpoints below, and enables the inspector at `http://127.0.0.1:8000/`.
+Use your existing server instead if it has equivalent authentication and native
+Responses settings. Do not start a second server on an occupied port.
+
+| Command / authentication | Upstream |
+| --- | --- |
+| `codex-latch`, saved ChatGPT login | `https://chatgpt.com/backend-api/codex` |
+| `codex-latch`, OpenAI API key | `https://api.openai.com/v1` |
+| `claude-latch`, Claude login or Anthropic API key | `https://api.anthropic.com` |
+
+Codex detects the saved login mode using `codex login status`; its output is never
+printed by the shim. Set `PROMPTLATCH_CODEX_AUTH=chatgpt` or `api-key` to select
+explicitly. API-key mode uses `OPENAI_API_KEY` when set, otherwise Codex's saved
+API-key login. Claude keeps its normal authentication precedence, including
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and its saved login.
+
+```bash
+codex-latch exec "Review this repository"
+PROMPTLATCH_CODEX_AUTH=api-key codex-latch
+PROMPTLATCH_PROXY_URL=http://127.0.0.1:8001 claude-latch
+codex-latch --latch-help
+claude-latch --latch-help
+```
+
+The shims check proxy readiness and redaction before launching. They stop if the
+proxy is unavailable, redaction is disabled, or native client authentication cannot
+be forwarded. This mode requires no `server.api_key` or `target.api_key`; keep the
+listener local. Normal keyed-proxy configuration remains available for other clients.
+`PROMPTLATCH_PROXY_URL` accepts loopback addresses only. Use
+`PROMPTLATCH_CODEX_BIN` or `PROMPTLATCH_CLAUDE_BIN` to select a CLI executable explicitly.
+
+Codex's effective provider configuration is checked before launch. Conflicting
+provider settings, managed routing requirements, and Codex Cloud commands stop with
+an error. Profiles work unless they redefine the reserved `promptlatch-official`
+provider. Claude's host-managed provider setting prevents settings files from
+replacing the proxy route.
+
+Codex uses a local process and HTTP Responses streaming. Both shims disable request
+compression so request bodies remain scannable. Claude's nonessential traffic is
+disabled for the invocation. These wrappers cover model-provider requests, including
+conversation history and tool outputs sent back to the model. Login, MCP servers,
+tool subprocesses, plugins, and other network connections are separate. Files and
+images embedded as binary or encoded content retain the limits in [SECURITY.md](SECURITY.md).
+
+Configuration references: [Codex gateway authentication](https://learn.chatgpt.com/docs/enterprise/sign-in-with-chatgpt-through-a-gateway),
+[Claude Code gateways](https://code.claude.com/docs/en/llm-gateway), and
+[Claude Code networking](https://code.claude.com/docs/en/corporate-proxy).
+
+## Claude Code manual configuration
 
 Claude Code sends Anthropic Messages requests. Configure provider key on PromptLatch,
 then use separate local bearer token for proxy authentication:

@@ -31,3 +31,11 @@ audit:
 
 compat:
   responses_to_chat: false
+
+observability:
+  enabled: true
+  max_database_bytes: 1073741824
+  max_body_bytes: 262144
+  store_request_bodies: true
+  pricing_enabled: true
+  dashboard_enabled: false

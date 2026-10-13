@@ -232,6 +232,97 @@ def test_auth_and_assignment_patterns_avoid_similar_prose_and_fields(text: str) 
     assert result.stats.redactions == 0
 
 
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        'api_key = os.environ["OPENAI_API_KEY"]',
+        'token = settings.credentials.get("access_token")',
+        "client_secret = load_config().client_secret",
+        'authorization = os.getenv("AUTHORIZATION")',
+        '```python\napi_key = os.environ["OPENAI_API_KEY"]\n```',
+    ],
+)
+def test_code_references_are_not_credentials(
+    engine: Literal["basic", "detect-secrets"], text: str
+) -> None:
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(text)
+
+    assert result.value == text
+    assert result.stats.redactions == 0
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+def test_explicit_credential_placeholder_is_preserved(
+    engine: Literal["basic", "detect-secrets"],
+) -> None:
+    text = 'password = "<your-password-here>"; token = "<OpaqueFixtureCredential>"'
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(text)
+
+    assert result.value == 'password = "<your-password-here>"; token = "[REDACTED_SECRET]"'
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize(
+    "secret", ["os.environ", "load_config().client_secret", "OpaqueFixtureValue"]
+)
+def test_quoted_code_shaped_credentials_are_still_redacted(
+    engine: Literal["basic", "detect-secrets"], secret: str
+) -> None:
+    text = f'api_key = "{secret}"'
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(text)
+
+    assert result.value == 'api_key = "[REDACTED_SECRET]"'
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize("annotation", [" (production)", " [production]", " (rotated yesterday)"])
+def test_unquoted_credential_with_annotation_is_still_redacted(
+    engine: Literal["basic", "detect-secrets"], annotation: str
+) -> None:
+    secret = "OpaqueFixtureValue123"
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(
+        f"api_key = {secret}{annotation}"
+    )
+
+    assert secret not in result.value
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+def test_code_reference_exemption_is_per_occurrence(
+    engine: Literal["basic", "detect-secrets"],
+) -> None:
+    text = 'client_secret = load_config().client_secret; password = "load_config().client_secret"'
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(text)
+
+    assert result.value == (
+        'client_secret = load_config().client_secret; password = "[REDACTED_SECRET]"'
+    )
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+def test_provider_key_inside_code_reference_is_still_redacted(
+    engine: Literal["basic", "detect-secrets"],
+) -> None:
+    text = f'api_key = os.getenv("OPENAI_API_KEY", "{OPENAI_FAKE}")'
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(text)
+
+    assert result.value == 'api_key = os.getenv("OPENAI_API_KEY", "[REDACTED_SECRET]")'
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize("secret", ["load_config().client_secret", "<your-password-here>"])
+def test_custom_rule_still_redacts_code_references(
+    engine: Literal["basic", "detect-secrets"],
+    secret: str,
+) -> None:
+    config = RedactionConfig(engine=engine, rules=[RuleConfig(type="exact", value=secret)])
+
+    result = SecretRedactor(config).redact_text(f"client_secret = {secret}")
+
+    assert result.value == "client_secret = [REDACTED_SECRET]"
+
+
 def test_connection_string_password_is_redacted() -> None:
     redactor = SecretRedactor(RedactionConfig(engine="basic"))
     password = "db-password-without-known-prefix"

@@ -1,6 +1,7 @@
 .DS_Store
 .pytest_cache/
 .ruff_cache/
+.playwright-mcp/
 .venv/
 __pycache__/
 *.egg-info/

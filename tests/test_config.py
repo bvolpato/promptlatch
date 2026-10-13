@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from promptlatch.config import (
+    ObservabilityConfig,
     RedactionConfig,
     RuleConfig,
     ServerConfig,
@@ -129,3 +130,62 @@ def test_proxy_auth_rejects_forwarding_client_authorization() -> None:
             server=ServerConfig(api_key="local-fixture-token"),
             target=TargetConfig(forward_client_authorization=True),
         )
+
+
+def test_observability_default_path_uses_state_home(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    settings = Settings()
+
+    assert settings.observability.enabled is True
+    assert settings.observability.dashboard_enabled is False
+    assert settings.observability.database_path == tmp_path / "promptlatch" / "requests.sqlite3"
+    assert settings.observability.max_database_bytes == 1024**3
+
+
+def test_observability_environment_overrides(monkeypatch, tmp_path) -> None:
+    values = {
+        "ENABLED": "false",
+        "DATABASE_PATH": str(tmp_path / "history.sqlite3"),
+        "MAX_DATABASE_BYTES": str(2 * 1024**2),
+        "MAX_BODY_BYTES": "0",
+        "STORE_REQUEST_BODIES": "false",
+        "QUEUE_SIZE": "16",
+        "PRICING_ENABLED": "false",
+        "PRICING_FILE": str(tmp_path / "prices.json"),
+        "PRICING_REFRESH_HOURS": "12.5",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(f"PROMPTLATCH_OBSERVABILITY_{name}", value)
+    monkeypatch.setenv("PROMPTLATCH_DASHBOARD_ENABLED", "true")
+
+    monitoring = load_settings(tmp_path / "missing.yaml").observability
+
+    assert monitoring.model_dump() == {
+        "enabled": False,
+        "database_path": tmp_path / "history.sqlite3",
+        "max_database_bytes": 2 * 1024**2,
+        "max_body_bytes": 0,
+        "store_request_bodies": False,
+        "queue_size": 16,
+        "pricing_enabled": False,
+        "pricing_file": tmp_path / "prices.json",
+        "pricing_refresh_hours": 12.5,
+        "dashboard_enabled": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_database_bytes", 1024**2 - 1),
+        ("max_body_bytes", -1),
+        ("max_body_bytes", 32 * 1024**2 + 1),
+        ("queue_size", 0),
+        ("queue_size", 65537),
+        ("pricing_refresh_hours", 0),
+    ],
+)
+def test_observability_rejects_invalid_limits(field, value) -> None:
+    with pytest.raises(ValidationError):
+        ObservabilityConfig.model_validate({field: value})

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import io
@@ -13,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
-from typing import Any
+from typing import Any, Literal
 
 from detect_secrets.custom_types import NamedIO
 
@@ -81,6 +83,77 @@ _CREDENTIAL_PLACEHOLDER = re.compile(
 # Scan results are kept per string, so repeated text is scanned once.
 _CACHE_MAX_ENTRIES = 16_384
 _CACHE_MAX_CHARS = 8_000_000
+_OPAQUE_RESPONSE_ENCODING = re.compile(r"[A-Za-z0-9_-]+={0,2}")
+_PayloadContext = Literal[
+    "responses-request",
+    "responses-input-item",
+    "responses-opaque-item",
+    "responses-message",
+    "responses-tool-output",
+    "responses-image-part",
+]
+_IMAGE_MIME_SIGNATURES = {
+    "data:image/png;base64": (b"\x89PNG\r\n\x1a\n",),
+    "data:image/jpeg;base64": (b"\xff\xd8\xff",),
+    "data:image/gif;base64": (b"GIF87a", b"GIF89a"),
+    "data:image/webp;base64": (b"RIFF",),
+}
+
+
+def _is_opaque_response_content(value: Any) -> bool:
+    """Recognize a canonical Fernet envelope, without decrypting provider state."""
+    if (
+        not isinstance(value, str)
+        or len(value) < 100
+        or len(value) % 4
+        or not value.startswith("g")
+        or _OPAQUE_RESPONSE_ENCODING.fullmatch(value) is None
+    ):
+        return False
+    try:
+        envelope = base64.b64decode(value, altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    return (
+        envelope[0] == 0x80
+        and len(envelope) >= 73
+        and (len(envelope) - 57) % 16 == 0
+        and base64.urlsafe_b64encode(envelope).decode("ascii") == value
+    )
+
+
+def _is_response_image_data(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith("data:image/"):
+        return False
+    header, separator, encoded = value.partition(",")
+    signatures = _IMAGE_MIME_SIGNATURES.get(header)
+    if not separator or signatures is None or not encoded or len(encoded) % 4:
+        return False
+    try:
+        image = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    if not image.startswith(signatures) or base64.b64encode(image).decode("ascii") != encoded:
+        return False
+    if header == "data:image/webp;base64":
+        return len(image) >= 12 and image[8:12] == b"WEBP"
+    return True
+
+
+def _response_object_context(value: Any, context: _PayloadContext | None) -> _PayloadContext | None:
+    if context not in ("responses-input-item", "responses-image-part"):
+        return context
+    item_type = value.get("type") if isinstance(value, Mapping) else getattr(value, "type", None)
+    if context == "responses-image-part":
+        return context if item_type == "input_image" else None
+    if item_type in ("reasoning", "compaction"):
+        return "responses-opaque-item"
+    if item_type in ("function_call_output", "custom_tool_call_output"):
+        return "responses-tool-output"
+    role = value.get("role") if isinstance(value, Mapping) else getattr(value, "role", None)
+    if item_type in (None, "message") and role in ("user", "assistant", "system", "developer"):
+        return "responses-message"
+    return None
 
 
 def _ascii_ignorecase(value: str) -> str:
@@ -667,11 +740,16 @@ class SecretRedactor:
         )
         self._context_keys: dict[tuple[str, str], bytes] = {}
 
-    def redact_payload(self, payload: Any) -> RedactionResult:
+    def redact_payload(
+        self, payload: Any, *, protocol: Literal["openai-responses"] | None = None
+    ) -> RedactionResult:
+        if protocol not in (None, "openai-responses"):
+            raise ValueError("unsupported redaction protocol")
         stats = RedactionStats()
         if not self.config.enabled:
             return RedactionResult(payload, stats)
-        return RedactionResult(self._walk(payload, stats), stats)
+        context = "responses-request" if protocol == "openai-responses" else None
+        return RedactionResult(self._walk(payload, stats, context=context), stats)
 
     def redact_text(self, text: str) -> RedactionResult:
         stats = RedactionStats()
@@ -703,12 +781,16 @@ class SecretRedactor:
                 patterns.append((name, re.compile(re.escape(rule.value))))
         return patterns
 
-    def _walk(self, value: Any, stats: RedactionStats) -> Any:
+    def _walk(
+        self, value: Any, stats: RedactionStats, *, context: _PayloadContext | None = None
+    ) -> Any:
         if isinstance(value, str):
             return self._redact_string(value, stats)
+        if context is not None:
+            context = _response_object_context(value, context)
         model_fields = self._model_fields(value)
         if model_fields is not None:
-            return self._redact_model(value, model_fields, stats)
+            return self._redact_model(value, model_fields, stats, context=context)
         if isinstance(value, list):
             return [self._walk(item, stats) for item in value]
         if isinstance(value, tuple):
@@ -719,7 +801,7 @@ class SecretRedactor:
                 redacted_key = self._redact_string(key, stats) if isinstance(key, str) else key
                 if redacted_key in redacted:
                     raise RedactionKeyCollisionError("mapping keys collide after redaction")
-                redacted[redacted_key] = self._redact_field_value(key, item, stats)
+                redacted[redacted_key] = self._redact_field_value(key, item, stats, context=context)
             return redacted
         return value
 
@@ -738,6 +820,7 @@ class SecretRedactor:
         *,
         sensitive: bool = False,
         strict: bool = False,
+        context: _PayloadContext | None = None,
     ) -> Any:
         updates: dict[str, Any] = {}
         for name in model_fields:
@@ -749,7 +832,7 @@ class SecretRedactor:
             redacted = (
                 self._redact_sensitive_field(item, stats, strict=strict)
                 if sensitive
-                else self._redact_field_value(name, item, stats)
+                else self._redact_field_value(name, item, stats, context=context)
             )
             if stats.redactions > before:
                 updates[name] = redacted
@@ -764,16 +847,45 @@ class SecretRedactor:
                 redacted = (
                     self._redact_sensitive_field(item, stats, strict=strict)
                     if sensitive
-                    else self._redact_field_value(name, item, stats)
+                    else self._redact_field_value(name, item, stats, context=context)
                 )
                 if stats.redactions > before:
                     updates[name] = redacted
 
         return value.model_copy(update=updates)
 
-    def _redact_field_value(self, key: Any, value: Any, stats: RedactionStats) -> Any:
+    def _redact_field_value(
+        self,
+        key: Any,
+        value: Any,
+        stats: RedactionStats,
+        *,
+        context: _PayloadContext | None = None,
+    ) -> Any:
+        if (
+            context == "responses-opaque-item"
+            and key == "encrypted_content"
+            and _is_opaque_response_content(value)
+        ):
+            return value
+        if (
+            context == "responses-image-part"
+            and key == "image_url"
+            and _is_response_image_data(value)
+        ):
+            return value
         if self._is_sensitive_field(key):
             return self._redact_sensitive_field(value, stats, strict=self._is_strict_field(key))
+        child_context: _PayloadContext | None = None
+        if context == "responses-request" and key == "input":
+            child_context = "responses-input-item"
+        elif (context == "responses-message" and key == "content") or (
+            context == "responses-tool-output" and key == "output"
+        ):
+            child_context = "responses-image-part"
+        if child_context is not None and isinstance(value, (list, tuple)):
+            items = [self._walk(item, stats, context=child_context) for item in value]
+            return tuple(items) if isinstance(value, tuple) else items
         return self._walk(value, stats)
 
     def _is_sensitive_field(self, key: Any) -> bool:

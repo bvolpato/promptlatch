@@ -13,10 +13,12 @@ from copy import deepcopy
 from typing import Any
 from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
+import anyio
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.types import Receive, Scope, Send
 
 from promptlatch.audit import AuditLogger
 from promptlatch.compat import (
@@ -242,10 +244,14 @@ async def forward_request(request: Request, path: str) -> Response:
             params=httpx.QueryParams(tuple(query_params)),
         )
         upstream = await client.send(upstream_request, stream=True)
-    except httpx.RequestError as exc:
+    except BaseException as exc:
         if close_client:
-            await client.aclose()
-        raise HTTPException(status_code=502, detail=f"upstream request failed: {exc}") from exc
+            await _close_upstream(None, close_client, client)
+        if isinstance(exc, httpx.RequestError):
+            if observation is not None:
+                observation.transport_error(exc)
+            raise HTTPException(status_code=502, detail=f"upstream request failed: {exc}") from exc
+        raise
 
     if observation is not None:
         observation.response_headers(upstream.headers, upstream.status_code)
@@ -262,8 +268,11 @@ async def forward_request(request: Request, path: str) -> Response:
         if transform_stream:
             stream = chat_stream_to_responses(stream, json_payload)
             response_headers["content-type"] = "text/event-stream; charset=utf-8"
-        return StreamingResponse(
+        return _UpstreamStreamingResponse(
             stream,
+            upstream=upstream,
+            close_client=close_client,
+            client=client,
             status_code=upstream.status_code,
             headers=response_headers,
             media_type=response_headers.get("content-type"),
@@ -281,12 +290,12 @@ async def forward_request(request: Request, path: str) -> Response:
             if transform_response
             else await _read_raw_upstream(upstream, observation=observation)
         )
-    except httpx.RequestError:
+    except httpx.RequestError as exc:
+        if observation is not None:
+            observation.transport_error(exc)
         raise HTTPException(status_code=502, detail="upstream response failed") from None
     finally:
-        await upstream.aclose()
-        if close_client:
-            await client.aclose()
+        await _close_upstream(upstream, close_client, client)
 
     upstream_payload: Any | None = None
     if observation is not None and transform_response:
@@ -321,7 +330,23 @@ def _redact_request(
     query_params, query_stats = _redact_query_params(request, redactor)
     audit.redaction(f"query:{path}", query_stats)
     content, body_stats, json_payload = _redact_request_body(
-        request, body, redactor, parse_json=parse_json
+        request,
+        body,
+        redactor,
+        parse_json=parse_json,
+        preserve_responses=(
+            request.method == "POST"
+            and not parse_json
+            and path.rstrip("/")
+            in {
+                "/responses",
+                "/responses/compact",
+                "/v1/responses",
+                "/v1/responses/compact",
+                "/backend-api/codex/responses",
+                "/backend-api/codex/responses/compact",
+            }
+        ),
     )
     audit.redaction(path, body_stats)
     stats = query_stats
@@ -396,6 +421,7 @@ def _redact_request_body(
     redactor: SecretRedactor,
     *,
     parse_json: bool = False,
+    preserve_responses: bool = False,
 ) -> tuple[bytes, RedactionStats, Any | None]:
     stats = RedactionStats()
     media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
@@ -434,7 +460,11 @@ def _redact_request_body(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="invalid JSON request body") from None
         try:
-            result = redactor.redact_payload(payload)
+            result = (
+                redactor.redact_payload(payload, protocol="openai-responses")
+                if preserve_responses
+                else redactor.redact_payload(payload)
+            )
         except RedactionKeyCollisionError:
             raise HTTPException(
                 status_code=400,
@@ -720,10 +750,57 @@ async def _stream_upstream(
             if observation is not None:
                 observation.observe(chunk, streaming=True, decoded=decoded)
             yield chunk
+    except httpx.RequestError as exc:
+        if observation is not None:
+            observation.transport_error(exc)
+        raise
     finally:
-        await upstream.aclose()
+        await _close_upstream(upstream, close_client, client)
+
+
+class _UpstreamStreamingResponse(StreamingResponse):
+    def __init__(
+        self,
+        content: AsyncIterator[bytes],
+        *,
+        upstream: httpx.Response,
+        close_client: bool,
+        client: httpx.AsyncClient,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(content, **kwargs)
+        self._upstream = upstream
+        self._close_client = close_client
+        self._client = client
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Sending can fail while the body iterator is suspended at a yield.
+            await _close_upstream(self._upstream, self._close_client, self._client)
+
+
+async def _close_upstream(
+    upstream: httpx.Response | None, close_client: bool, client: httpx.AsyncClient
+) -> None:
+    try:
+        if upstream is not None:
+            await _close_http_resource(upstream)
+    finally:
         if close_client:
-            await client.aclose()
+            await _close_http_resource(client)
+
+
+async def _close_http_resource(resource: httpx.Response | httpx.AsyncClient) -> None:
+    try:
+        with anyio.move_on_after(5, shield=True) as scope:
+            await resource.aclose()
+        if scope.cancel_called:
+            logger.warning("Upstream resource cleanup timed out")
+    except Exception as exc:
+        # Cleanup must not replace an upstream failure or client disconnect.
+        logger.warning("Upstream resource cleanup failed (%s)", type(exc).__name__)
 
 
 async def _read_raw_upstream(

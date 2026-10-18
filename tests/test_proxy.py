@@ -550,11 +550,11 @@ async def test_proxy_offloads_redaction_so_healthz_stays_responsive(
     redactor = app.state.redactor
     original = redactor.redact_payload
 
-    def blocking(payload):
+    def blocking(payload, **kwargs):
         entered.set()
         if not release.wait(timeout=5):
             raise TimeoutError("redaction release timed out")
-        return original(payload)
+        return original(payload, **kwargs)
 
     monkeypatch.setattr(redactor, "redact_payload", blocking)
 

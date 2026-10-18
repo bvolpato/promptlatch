@@ -13,13 +13,15 @@ import brotli
 import httpx
 import pytest
 import respx
+from starlette.requests import Request
 
 from promptlatch.config import ObservabilityConfig, RedactionConfig, Settings, TargetConfig
 from promptlatch.history import HistoryReader, HistoryStore
 from promptlatch.observability import Observability
 from promptlatch.pricing import CATALOG_URL, PricingCatalog
-from promptlatch.proxy import create_app
+from promptlatch.proxy import _stream_upstream, create_app
 from promptlatch.response_metrics import ResponseMetrics, zstd
+from promptlatch.upstream_errors import ERROR_FIELD_BYTES
 from tests.fixtures import OPENAI_FAKE
 
 
@@ -41,6 +43,436 @@ def records(path: Path) -> list[dict]:
         assert record is not None
         result.append(record)
     return result
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("kind", ["responses", "anthropic", "named", "http_json", "gzip"])
+async def test_upstream_error_details_are_redacted_persisted_and_do_not_change_wire(tmp_path, kind):
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.target.api_key = "ConfiguredOpaqueCredential"
+    settings.redaction.allow_extra_regex_rules = True
+    private_detail = (
+        f"FAILURE_DETAIL_SENTINEL {OPENAI_FAKE} ConfiguredOpaqueCredential "
+        "HeaderOpaqueCredential request-opaque-credential"
+    )
+    error = {
+        "type": "invalid_request_error",
+        "code": "invalid_input",
+        "param": "input",
+        "message": private_detail,
+        "request": "IGNORED_ERROR_BODY_SENTINEL",
+    }
+    status = 400 if kind == "http_json" else 200
+    headers = {"content-type": "application/json" if kind == "http_json" else "text/event-stream"}
+    if kind == "responses" or kind == "gzip":
+        payload = {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": error,
+                "output": "IGNORED_RESPONSE_OUTPUT_SENTINEL",
+            },
+        }
+    elif kind == "anthropic":
+        payload = {"type": "error", "error": error}
+    else:
+        payload = {"error": error}
+    encoded = json.dumps(payload).encode()
+    wire = encoded if kind == "http_json" else b"data: " + encoded + b"\n\n"
+    if kind == "named":
+        wire = b"event: error\n" + wire
+    if kind == "gzip":
+        headers["content-encoding"] = "gzip"
+    respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(
+            status, content=gzip.compress(wire) if kind == "gzip" else wire, headers=headers
+        )
+    )
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        response = await client.post(
+            "/v1/responses",
+            headers={
+                "authorization": "Bearer HeaderOpaqueCredential",
+                "x-redact-extra-rules": json.dumps(
+                    [{"type": "regex", "value": "request-[a-z]+-credential"}]
+                ),
+            },
+            json={"model": "fixture-model", "input": "hello", "stream": kind != "http_json"},
+        )
+        assert response.status_code == status
+        assert response.content == wire
+    saved = records(path)[0]
+    assert saved["outcome"] == ("http_error" if kind == "http_json" else "stream_error")
+    assert saved["upstream_error"]["code"] == "invalid_input"
+    assert saved["upstream_error"]["type"] == "invalid_request_error"
+    assert saved["upstream_error"]["param"] == "input"
+    assert saved["upstream_error"]["message"].startswith("FAILURE_DETAIL_SENTINEL")
+    assert "[REDACTED_SECRET]" in saved["upstream_error"]["message"]
+    assert saved["redactions"] == 0
+    assert saved["total_tokens"] is None
+    assert "upstream_error" not in HistoryReader(path).requests()["items"][0]
+    assert (
+        "upstream_error" not in HistoryReader(path).thread_requests(saved["thread_id"])["items"][0]
+    )
+    for secret in (
+        OPENAI_FAKE,
+        "ConfiguredOpaqueCredential",
+        "HeaderOpaqueCredential",
+        "request-opaque-credential",
+        "IGNORED_ERROR_BODY_SENTINEL",
+        "IGNORED_RESPONSE_OUTPUT_SENTINEL",
+    ):
+        assert secret not in json.dumps(saved)
+        for database in tmp_path.glob("*.sqlite3"):
+            assert secret.encode() not in database.read_bytes()
+    assert (
+        b"FAILURE_DETAIL_SENTINEL" not in path.with_name(path.name + ".stats.sqlite3").read_bytes()
+    )
+    assert "FAILURE_DETAIL_SENTINEL" not in json.dumps(HistoryReader(path).summary())
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("capture", ["disabled", "zero_limit", "redaction_disabled", "partial"])
+async def test_error_detail_capture_honors_content_settings_and_forces_full_redaction(
+    tmp_path, capture
+):
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    if capture == "disabled":
+        settings.observability.store_request_bodies = False
+    elif capture == "zero_limit":
+        settings.observability.max_body_bytes = 0
+    elif capture == "redaction_disabled":
+        settings.redaction.enabled = False
+    else:
+        settings.redaction.redact_mode = "partial"
+    error = {"error": {"message": f"Failure: {OPENAI_FAKE}"}}
+    respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(400, json=error)
+    )
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        assert (await client.post("/v1/responses", json={"input": "hello"})).json() == error
+    saved = records(path)[0]
+    if capture in {"disabled", "zero_limit"}:
+        assert saved["upstream_error"] is None
+    else:
+        assert saved["upstream_error"] == {"message": "Failure: [REDACTED_SECRET]"}
+    for database in tmp_path.glob("*.sqlite3"):
+        assert OPENAI_FAKE.encode() not in database.read_bytes()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_error_details_redact_before_utf8_truncation_and_fail_closed(tmp_path, monkeypatch):
+    path = tmp_path / "history.sqlite3"
+    credential = "OpaqueHeaderCredentialCrossingTheOutputBoundary"
+    settings = settings_for(path)
+    payload = {"error": {"message": "é" * 1020 + credential + "é" * 100, "code": "failure"}}
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(400, json=payload)
+    )
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        response = await client.post(
+            "/v1/responses",
+            headers={"authorization": f"Bearer {credential}"},
+            json={"input": "hello"},
+        )
+        assert response.json() == payload
+        from promptlatch.redaction import SecretRedactor
+
+        original = SecretRedactor.redact_text
+
+        def broken_redactor(self, text):
+            if "failure detail" in text:
+                raise ValueError("private redaction failure")
+            return original(self, text)
+
+        monkeypatch.setattr(SecretRedactor, "redact_text", broken_redactor)
+        route.mock(return_value=httpx.Response(400, json={"error": {"message": "failure detail"}}))
+        assert (await client.post("/v1/responses", json={"input": "hello"})).status_code == 400
+    saved = sorted(records(path), key=lambda record: record["started_at"])
+    detail = saved[0]["upstream_error"]
+    assert set(detail) == {"message", "code"}
+    assert len(detail["message"].encode()) <= ERROR_FIELD_BYTES["message"]
+    assert detail["message"].endswith("…")
+    assert "OpaqueHeader" not in detail["message"]
+    assert saved[1]["upstream_error"] == {
+        "message": "Upstream error details unavailable: redaction failed."
+    }
+    assert "failure detail" not in json.dumps(saved)
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("stage", ["send", "body", "stream"])
+async def test_transport_error_details_are_redacted_and_preserve_failures(tmp_path, stage):
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.target.api_key = "ConfiguredOpaqueCredential"
+    settings.redaction.allow_extra_regex_rules = True
+    private_detail = (
+        f"TRANSPORT_DETAIL_SENTINEL {OPENAI_FAKE} ConfiguredOpaqueCredential "
+        "HeaderOpaqueCredential request-opaque-credential "
+        "https://upstream.example/path?cursor=opaquequerystate "
+        "Location: https://redirect.example/path?state=opaqueredirectstate"
+    )
+    error = (
+        httpx.ConnectError(private_detail) if stage == "send" else httpx.ReadError(private_detail)
+    )
+
+    class FailedStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b'data: {"type":"response.created"}\n\n' if stage == "stream" else b'{"output":'
+            raise error
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = FailedStream()
+    route = respx.post("https://upstream.example/v1/responses")
+    if stage == "send":
+        route.mock(side_effect=error)
+    else:
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                stream=stream,
+                headers={
+                    "content-type": "text/event-stream" if stage == "stream" else "application/json"
+                },
+            )
+        )
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        request = client.post(
+            "/v1/responses",
+            headers={
+                "authorization": "Bearer HeaderOpaqueCredential",
+                "x-redact-extra-rules": json.dumps(
+                    [{"type": "regex", "value": "request-[a-z]+-credential"}]
+                ),
+            },
+            json={"model": "fixture-model", "input": "hello", "stream": stage == "stream"},
+        )
+        if stage == "stream":
+            with pytest.raises(httpx.ReadError) as raised:
+                await request
+            assert raised.value is error
+        else:
+            response = await request
+            assert response.status_code == 502
+            assert response.json()["detail"] == (
+                f"upstream request failed: {private_detail}"
+                if stage == "send"
+                else "upstream response failed"
+            )
+    saved = records(path)[0]
+    assert saved["outcome"] == ("transport_error" if stage == "stream" else "http_error")
+    assert saved["upstream_error"] == {
+        "event": "transport",
+        "type": type(error).__name__,
+        "code": "upstream_transport_error",
+        "message": (
+            "Could not establish an upstream connection."
+            if stage == "send"
+            else "Upstream connection failed while reading the response."
+        ),
+    }
+    assert stage == "send" or stream.closed
+    assert "upstream_error" not in HistoryReader(path).requests()["items"][0]
+    assert "TRANSPORT_DETAIL_SENTINEL" not in json.dumps(HistoryReader(path).summary())
+    assert (
+        b"TRANSPORT_DETAIL_SENTINEL"
+        not in path.with_name(path.name + ".stats.sqlite3").read_bytes()
+    )
+    for secret in (
+        OPENAI_FAKE,
+        "ConfiguredOpaqueCredential",
+        "HeaderOpaqueCredential",
+        "request-opaque-credential",
+        "opaquequerystate",
+        "opaqueredirectstate",
+        "Location:",
+    ):
+        assert secret not in json.dumps(saved)
+        for database in tmp_path.glob("*.sqlite3"):
+            assert secret.encode() not in database.read_bytes()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_error_credentials_are_known_even_if_request_preparation_fails(tmp_path, monkeypatch):
+    from promptlatch.observability import RequestObservation
+
+    def failed_prepare(*args, **kwargs):
+        raise ValueError("capture failed")
+
+    monkeypatch.setattr(RequestObservation, "prepare", failed_prepare)
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.target.api_key = "ConfiguredOpaqueCredential"
+    respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(
+            400,
+            json={"error": {"message": "ConfiguredOpaqueCredential HeaderOpaqueCredential"}},
+        )
+    )
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        assert (
+            await client.post(
+                "/v1/responses",
+                headers={"authorization": "Bearer HeaderOpaqueCredential"},
+                json={"input": "hello"},
+            )
+        ).status_code == 400
+    saved = records(path)[0]
+    assert saved["upstream_error"]["message"] == "[REDACTED_SECRET] [REDACTED_SECRET]"
+    assert saved["request_body"] is None
+    assert saved["body_omitted_reason"] == "capture_failed"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unrelated_stream_errors_are_not_transport_diagnostics(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    failure = ValueError("fixture bug")
+
+    class FailedStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b'data: {"type":"response.created"}\n\n'
+            raise failure
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = FailedStream()
+    respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(
+            200, stream=stream, headers={"content-type": "text/event-stream"}
+        )
+    )
+    app = create_app(settings_for(path))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        with pytest.raises(type(failure)) as raised:
+            await client.post("/v1/responses", json={"input": "hello", "stream": True})
+        assert raised.value is failure
+    saved = records(path)[0]
+    assert stream.closed
+    assert saved["outcome"] == "transport_error"
+    assert saved["upstream_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_stream_cancellation_propagates_and_closes_owned_resources_without_error_detail(
+    tmp_path,
+):
+    path = tmp_path / "history.sqlite3"
+    failure = asyncio.CancelledError()
+
+    class CancelledStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b'data: {"type":"response.created"}\n\n'
+            raise failure
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = CancelledStream()
+    upstream = httpx.Response(200, stream=stream)
+    owner = Observability(settings_for(path))
+    owner.start()
+    try:
+        observation = owner.begin(
+            Request({"type": "http", "method": "POST", "path": "/v1/responses", "headers": []})
+        )
+        observation.response_headers({"content-type": "text/event-stream"}, 200)
+        async with httpx.AsyncClient() as client:
+            chunks = _stream_upstream(
+                upstream, True, client, decoded=False, observation=observation
+            )
+            assert await anext(chunks) == b'data: {"type":"response.created"}\n\n'
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await anext(chunks)
+            assert raised.value is failure
+            assert stream.closed
+            assert upstream.is_closed
+            assert client.is_closed
+        observation.finish(200, "cancelled")
+    finally:
+        owner.close()
+    saved = records(path)[0]
+    assert saved["outcome"] == "cancelled"
+    assert saved["upstream_error"] is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_clean_stream_eof_is_interrupted_with_explicit_diagnostic_and_unchanged_wire(
+    tmp_path,
+):
+    path = tmp_path / "history.sqlite3"
+    wire = b'data: {"type":"response.created"}\n\n'
+    respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(
+            200, content=wire, headers={"content-type": "text/event-stream"}
+        )
+    )
+    app = create_app(settings_for(path))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        response = await client.post("/v1/responses", json={"input": "hello", "stream": True})
+        assert response.status_code == 200
+        assert response.content == wire
+    saved = records(path)[0]
+    assert saved["outcome"] == "interrupted"
+    assert saved["upstream_error"]["code"] == "stream_incomplete"
 
 
 @pytest.mark.asyncio

@@ -487,6 +487,188 @@ def test_terminal_failures_override_http_success(payload: dict[str, Any], expect
     assert "private error" not in json.dumps(metrics.snapshot())
 
 
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        (
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {"code": "server_error", "message": "failure detail"},
+                    "output": "not retained",
+                },
+            },
+            {"event": "response.failed", "code": "server_error", "message": "failure detail"},
+        ),
+        (
+            {"type": "error", "error": {"type": "overloaded_error", "message": "failure detail"}},
+            {"event": "error", "type": "overloaded_error", "message": "failure detail"},
+        ),
+        (
+            {
+                "type": "error",
+                "code": 429,
+                "message": "failure detail",
+                "param": "input",
+                "headers": "not retained",
+            },
+            {
+                "event": "error",
+                "type": "error",
+                "code": "429",
+                "message": "failure detail",
+                "param": "input",
+            },
+        ),
+        ({"error": "failure detail"}, {"message": "failure detail"}),
+    ],
+)
+def test_error_fields_are_separate_from_content_free_metrics(payload, expected):
+    metrics = ResponseMetrics(1)
+    wire = event(payload)
+    for position in range(0, len(wire), 7):
+        metrics.feed(wire[position : position + 7])
+    metrics.finish_stream()
+    assert "failure detail" not in json.dumps(metrics.snapshot())
+    assert metrics.take_error_details() == expected
+    assert metrics.take_error_details() == {}
+
+
+def test_named_error_event_and_http_json_error_details():
+    metrics = ResponseMetrics(1)
+    metrics.feed(b'event: error\ndata: {"detail":"failure detail"}\n\n')
+    metrics.finish_stream()
+    assert metrics.take_error_details() == {"event": "error", "message": "failure detail"}
+
+    metrics = ResponseMetrics(1)
+    metrics.response_headers({"content-type": "application/json"}, 422)
+    metrics.observe_body(b'{"detail":"failure detail","input":"not retained"}')
+    assert metrics.take_error_details() == {"message": "failure detail"}
+
+
+def test_error_fields_omit_oversized_raw_values_without_cutting_secrets():
+    metrics = ResponseMetrics(1)
+    metrics.feed(
+        event(
+            {
+                "error": {
+                    "message": "x" * 16380 + "secret-crossing-source-limit",
+                    "code": {"unexpected": "not retained"},
+                }
+            }
+        )
+    )
+    metrics.finish_stream()
+    details = metrics.take_error_details()
+    assert details == {"message": "[Upstream error detail omitted: size limit]"}
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        event({"type": "response.created"}),
+        chat_delta({"content": "first"}),
+        event({"type": "message_start", "message": {"role": "assistant"}}),
+        event({"type": "content_block_delta", "delta": {"text": "first"}}),
+    ],
+)
+def test_clean_sse_eof_without_completion_has_explicit_diagnostic(wire):
+    metrics = ResponseMetrics(1)
+    metrics.response_headers({"content-type": "text/event-stream"}, 200)
+    metrics.feed_response(wire)
+    metrics.finish_response()
+    assert metrics.snapshot()["outcome_override"] == "incomplete"
+    assert metrics.take_error_details() == {
+        "event": "stream",
+        "type": "stream_error",
+        "code": "stream_incomplete",
+        "message": "Upstream stream ended before a completion event.",
+    }
+
+
+@pytest.mark.parametrize("wire", [b"", b'event: progress\ndata: {"step":1}\n\n'])
+def test_generic_finite_sse_does_not_fabricate_a_provider_error(wire):
+    metrics = ResponseMetrics(1)
+    metrics.response_headers({"content-type": "text/event-stream"}, 200)
+    metrics.feed_response(wire)
+    metrics.finish_response()
+    assert metrics.snapshot()["outcome_override"] == "incomplete"
+    assert metrics.take_error_details() == {}
+
+
+@pytest.mark.parametrize(
+    "kind", ["malformed", "compressed", "limit", "cancelled", "complete", "json"]
+)
+def test_eof_diagnostic_does_not_mislabel_other_responses(kind):
+    metrics = ResponseMetrics(1)
+    if kind == "json":
+        metrics.observe_body(b'{"output":[]}')
+    else:
+        metrics.response_headers(
+            {"content-type": "text/event-stream", "content-encoding": "gzip"}
+            if kind == "compressed"
+            else {"content-type": "text/event-stream"},
+            200,
+        )
+        wire = {
+            "malformed": b"data: not JSON\n\n",
+            "compressed": gzip.compress(event({"type": "response.created"}))[:-8],
+            "limit": b"data: " + b"x" * (1024 * 1024 + 1),
+            "cancelled": event({"type": "response.created"}),
+            "complete": event({"type": "response.completed"}),
+        }[kind]
+        metrics.feed_response(wire)
+        metrics.finish_response(complete=kind != "cancelled")
+    assert metrics.take_error_details() == {}
+
+
+@pytest.mark.parametrize("buffered", [False, True])
+def test_provider_error_details_take_precedence_over_transport_fallback(buffered):
+    metrics = ResponseMetrics(1)
+    metrics.feed(
+        event({"type": "error", "error": {"message": "provider failure"}}).rstrip(b"\n")
+        if buffered
+        else event({"type": "error", "error": {"message": "provider failure"}})
+    )
+    metrics.transport_error("RemoteProtocolError")
+    metrics.finish_stream(complete=False)
+    assert metrics.take_error_details() == {"event": "error", "message": "provider failure"}
+    assert metrics.take_error_details() == {}
+
+
+@pytest.mark.parametrize(
+    "error_type,retained_type,reason",
+    [
+        ("ReadTimeout", "ReadTimeout", "Timed out reading the upstream response."),
+        (
+            "RemoteProtocolError",
+            "RemoteProtocolError",
+            "Upstream returned an invalid or incomplete HTTP response.",
+        ),
+        (
+            "TooManyRedirects",
+            "TooManyRedirects",
+            "The upstream response exceeded the redirect limit.",
+        ),
+        ("OpaquePrivateSubclass", "RequestError", "Upstream request failed."),
+    ],
+)
+def test_transport_error_fallback_uses_only_allowlisted_classes_and_static_reasons(
+    error_type, retained_type, reason
+):
+    metrics = ResponseMetrics(1)
+    metrics.feed(event({"type": "response.created"}))
+    metrics.transport_error(error_type)
+    metrics.finish_response(complete=False)
+    assert metrics.take_error_details() == {
+        "event": "transport",
+        "type": retained_type,
+        "code": "upstream_transport_error",
+        "message": reason,
+    }
+    assert metrics.take_error_details() == {}
+
+
 @pytest.mark.parametrize("same_time", [False, True])
 def test_tps_is_unknown_for_one_event_or_zero_interval(same_time: bool) -> None:
     metrics = ResponseMetrics(1, clock=lambda: 2)

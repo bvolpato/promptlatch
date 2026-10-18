@@ -25,6 +25,7 @@ classifiers = [
 ]
 
 dependencies = [
+  "anyio>=4.0,<5",
   "backports.zstd>=1.1.0,<2; python_version < '3.14'",
   "bc-detect-secrets>=1.5.50,<2",
   "brotli>=1.2.0,<2",

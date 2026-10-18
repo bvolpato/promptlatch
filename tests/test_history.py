@@ -947,6 +947,7 @@ def test_thread_summaries_use_retained_metrics_and_latest_metadata(tmp_path):
     measured = summaries["thread-metrics"]
     assert measured["duration_ms"] == 300
     assert measured["total_tokens"] == 8
+    assert measured["known_token_requests"] == 1
     assert measured["cost_usd"] == pytest.approx(0.03)
     assert measured["known_cost_requests"] == 2
     assert measured["latest_model"] == "latest-model"
@@ -963,6 +964,7 @@ def test_thread_summaries_use_retained_metrics_and_latest_metadata(tmp_path):
     unknown = summaries["thread-unknown"]
     assert unknown["duration_ms"] is None
     assert unknown["total_tokens"] is None
+    assert unknown["known_token_requests"] == 0
     assert unknown["cost_usd"] is None
     assert unknown["known_cost_requests"] == 0
     assert unknown["session_preview"] is None

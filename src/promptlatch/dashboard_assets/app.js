@@ -9,7 +9,7 @@
     threadId: null, threadInfo: null, expanded: true,
     session: { items: [], total: 0, offset: 0, limit: 100 },
     sessionLoading: false, treeVersion: 0, collapsedTurns: new Set(),
-    requestId: null, detail: null, detailVersion: 0, tab: "conversation",
+    requestId: null, detail: null, detailVersion: 0, tab: "conversation", payloadPending: false, payloadWrap: true,
     view: "empty", inspectorView: "empty", initialized: false,
     refreshing: false, refreshAgain: false, treeSignature: "", sessionSignature: "",
     routeVersion: 0, locationHash: null,
@@ -17,17 +17,20 @@
   const number = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
   const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
   const decimal = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
-  const money = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 4 });
+  const money = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 6 });
+  const percentage = new Intl.NumberFormat(undefined, { style: "percent", maximumFractionDigits: 1 });
   const known = (value) => typeof value === "number" && Number.isFinite(value);
   const count = (value) => known(value) ? number.format(value) : "—";
   const tokens = (value) => known(value) ? compact.format(value) : "—";
-  const cost = (value) => known(value) ? money.format(value) : "—";
+  const cost = (value) => known(value) ? value > 0 && value < 0.000001 ? `<${money.format(0.000001)}` : money.format(value) : "—";
+  const fraction = (part, total) => known(part) && known(total) && total > 0 && part >= 0 && part <= total ? part / total : null;
+  const tokenTotal = (item) => known(item.total_tokens) ? `${tokens(item.total_tokens)}${!known(item.known_token_requests) || item.known_token_requests < item.requests ? "+" : ""}` : "—";
   const apiEquivalent = (item) => ["litellm_api_equivalent", "custom_api_equivalent"].includes(item.cost_source);
   const duration = (value) => known(value) ? value >= 1000 ? `${decimal.format(value / 1000)}s` : `${number.format(value)}ms` : "—";
   const speed = (value) => known(value) ? decimal.format(value) : "—";
   const text = (id, value) => { $(id).textContent = value; };
   const shortId = (id) => id ? id.length > 17 ? `${id.slice(0, 9)}…${id.slice(-5)}` : id : "Unknown";
-  const date = (timestamp, full = false) => known(timestamp) ? new Date(timestamp * 1000).toLocaleString(undefined, full ? {} : { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
+  const date = (timestamp, full = false) => known(timestamp) ? new Date(timestamp * 1000).toLocaleString(undefined, full ? { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short" } : { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
   const time = (timestamp) => known(timestamp) ? new Date(timestamp * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—";
   const element = (tag, className, value) => {
     const node = document.createElement(tag);
@@ -42,12 +45,158 @@
     node.addEventListener("click", handler);
     return node;
   };
-  const pretty = (value) => {
+  function jsonPresentation(value, truncated = false) {
+    let source, partial = false;
     if (typeof value === "string") {
-      try { return JSON.stringify(JSON.parse(value), null, 2); } catch { return value; }
+      source = value;
+      try { JSON.parse(source); } catch {
+        if (!truncated || !/^[ \t\r\n]*[\[{]/.test(source)) return null;
+        partial = true;
+      }
+    } else {
+      source = JSON.stringify(value);
+      if (source === undefined) return null;
     }
-    return JSON.stringify(value, null, 2) ?? "";
-  };
+    const parts = [];
+    const numberToken = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+    const literalToken = /true|false|null/y;
+    const outputLimit = Math.min(source.length * 4 + 256, 8 * 1024 * 1024);
+    let position = 0, depth = 0, previous = "", size = 0, highlights = 0, limited = false, formatting = true;
+    const stack = [{ type: "root", expect: "value" }];
+    function accept(token) {
+      if (!partial) return true;
+      const frame = stack.at(-1);
+      const valueExpected = frame.expect === "value" || frame.expect === "valueOrEnd";
+      if (token === "{" || token === "[") {
+        if (!valueExpected || stack.length >= 1024) return false;
+        frame.expect = "comma";
+        stack.push({ type: token, expect: token === "{" ? "keyOrEnd" : "valueOrEnd" });
+      } else if (token === "}" || token === "]") {
+        if (frame.type !== (token === "}" ? "{" : "[")) return false;
+        if (!["keyOrEnd", "valueOrEnd", "comma"].includes(frame.expect)) return false;
+        stack.pop();
+      } else if (token === ",") {
+        if (frame.type === "root" || frame.expect !== "comma") return false;
+        frame.expect = frame.type === "{" ? "key" : "value";
+      } else if (token === ":") {
+        if (frame.expect !== "colon") return false;
+        frame.expect = "value";
+      } else if (frame.expect === "key" || frame.expect === "keyOrEnd") {
+        if (!token.startsWith('"')) return false;
+        frame.expect = "colon";
+      } else {
+        if (!valueExpected) return false;
+        frame.expect = "comma";
+      }
+      return true;
+    }
+    function append(text, kind = "") {
+      if (!text) return;
+      size += text.length;
+      if (kind && highlights >= 5000) { kind = ""; limited = true; }
+      if (kind) highlights++;
+      const last = parts.at(-1);
+      if (last?.kind === kind) last.text += text;
+      else parts.push({ text, kind });
+    }
+    const newline = () => "\n" + "  ".repeat(Math.min(depth, 24));
+    while (position < source.length) {
+      if (/[ \t\r\n]/.test(source[position])) { position++; continue; }
+      const start = position;
+      const char = source[position];
+      let token, kind = "";
+      if (char === '"') {
+        position++;
+        while (position < source.length) {
+          const next = source[position++];
+          if (next === "\\") {
+            if (position < source.length) {
+              const escape = source[position++];
+              if (partial && !'"\\/bfnrtu'.includes(escape)) return null;
+              if (partial && escape === "u") {
+                for (let digit = 0; digit < 4 && position < source.length; digit++) {
+                  if (!/[0-9a-f]/i.test(source[position++])) return null;
+                }
+              }
+            }
+          }
+          else if (next === '"') break;
+          else if (partial && next.charCodeAt(0) < 32) return null;
+        }
+        token = source.slice(start, position);
+        let lookahead = position;
+        while (lookahead < source.length && /[ \t\r\n]/.test(source[lookahead])) lookahead++;
+        kind = source[lookahead] === ":" ? "key" : "string";
+      } else if ("{}[],:".includes(char)) {
+        token = char; position++;
+      } else {
+        numberToken.lastIndex = literalToken.lastIndex = position;
+        const match = numberToken.exec(source) || literalToken.exec(source);
+        if (!match) {
+          const suffix = source.slice(start);
+          if (!partial || !["true", "false", "null", "-"].some((literal) => literal.startsWith(suffix)) || !accept(suffix)) return null;
+          if (formatting) {
+            if (previous === "{" || previous === "[") append(newline());
+            append(suffix);
+          }
+          break;
+        }
+        token = match[0]; position += token.length;
+        kind = token === "null" ? "null" : /^(true|false)$/.test(token) ? "boolean" : "number";
+        if (partial && kind === "number") {
+          const suffix = source.slice(start);
+          if (/^-?(?:0|[1-9]\d*)(?:\.\d*)?$|^-?(?:0|[1-9]\d*)(?:\.\d+)?[eE][+-]?\d*$/.test(suffix)) {
+            token = suffix; position = source.length;
+          }
+        }
+      }
+      if (!accept(token)) return null;
+      // Deep or very large captures keep their suffix verbatim instead of expanding without bound.
+      if (formatting && size > outputLimit) {
+        append(source.slice(start)); limited = true; formatting = false;
+      }
+      if (!formatting) continue;
+      if ((previous === "{" || previous === "[") && token !== "}" && token !== "]") append(newline());
+      if (token === "{" || token === "[") {
+        append(token); depth++;
+      } else if (token === "}" || token === "]") {
+        depth = Math.max(0, depth - 1);
+        if (previous !== "{" && previous !== "[") append(newline());
+        append(token);
+      } else if (token === ",") {
+        append("," + newline());
+      } else if (token === ":") {
+        append(": ");
+      } else {
+        append(token, kind);
+      }
+      previous = token;
+    }
+    return { parts, limited };
+  }
+
+  function renderJSON(node, value, truncated = false) {
+    const presentation = jsonPresentation(value, truncated);
+    node.classList.toggle("json-code", presentation !== null);
+    if (!presentation) { node.textContent = typeof value === "string" ? value : ""; return; }
+    const fragment = document.createDocumentFragment();
+    for (const part of presentation.parts) {
+      fragment.append(part.kind ? element("span", `json-${part.kind}`, part.text) : document.createTextNode(part.text));
+    }
+    node.replaceChildren(fragment);
+  }
+
+  // Pure presentation helpers also run in Node's test runner without booting the dashboard.
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { jsonPresentation, renderJSON, fraction, tokenTotal, cost };
+    return;
+  }
+
+  function codeBlock(value, className = "code-block") {
+    const block = element("pre", className);
+    renderJSON(block, value);
+    return block;
+  }
   const preview = (value, limit = 220) => {
     if (typeof value !== "string") return "";
     const normalized = value.replace(/\s+/g, " ").trim();
@@ -194,6 +343,7 @@
     state.routeVersion += 1;
     state.locationHash = null;
     state.threadId = state.requestId = state.detail = state.threadInfo = null;
+    state.payloadPending = false;
     state.threads = { items: [], total: 0 };
     state.session = { items: [], total: 0, offset: 0, limit: 100 };
     state.threadOffset = 0;
@@ -212,8 +362,12 @@
     $("signout").disabled = false;
     $("signout").textContent = "Lock";
     $("load-error").hidden = true;
-    for (const id of ["session-tree", "session-requests", "conversation-content", "request-metrics"]) $(id).replaceChildren();
-    text("request-payload", "");
+    for (const id of ["session-tree", "session-requests", "session-summary", "conversation-content", "conversation-notices", "payload-notices", "request-metrics", "request-strip", "request-metric-notes", "request-payload"]) $(id).replaceChildren();
+    for (const id of ["request-id", "request-title", "request-provider", "request-status", "request-started", "request-session", "request-ordinal", "request-endpoint", "request-capture-state", "conversation-count", "payload-size", "payload-copy-status", "session-title", "session-subtitle"]) text(id, "");
+    $("request-capture-state").removeAttribute("title");
+    $("copy-payload").disabled = true;
+    $("copy-payload").textContent = "Copy payload";
+    $("payload-wrap").disabled = true;
     $("request-link").hidden = true;
     $("request-link").value = "";
     $("copy-request-link").disabled = true;
@@ -436,7 +590,7 @@
       const price = element("span", "row-cost", threadCost(item));
       if (known(item.cost_usd)) price.title = `Estimated cost for ${count(item.known_cost_requests)} of ${count(item.requests)} requests${item.known_cost_requests < item.requests ? "; unpriced requests excluded" : ""}`;
       const name = item.latest_model || (item.latest_method ? `${item.latest_method} ${item.latest_path || ""}`.trim() : `Session ${shortId(item.thread_id)}`);
-      top.append(element("span", "session-name", name), element("span", "count-badge", `${count(item.requests)} requests`), element("span", "row-duration", duration(item.duration_ms)), price);
+      top.append(element("span", "session-name", name), element("span", "count-badge", `${count(item.requests)} request${item.requests === 1 ? "" : "s"}`), element("span", "row-duration", duration(item.duration_ms)), price);
       select.append(top);
       const meta = element("span", "session-meta");
       meta.append(element("span", "session-prompt", sessionPreview || `${item.latest_provider || "Unknown provider"} · ${shortId(item.thread_id)}`), element("span", "session-time", time(item.latest_started_at ?? item.last_started_at)));
@@ -544,9 +698,12 @@
     text("session-source", `${info.thread_source || "unknown"} grouping`);
     const summary = $("session-summary");
     summary.replaceChildren();
-    for (const [value, label] of [[count(info.requests ?? state.session.total), "requests"], [duration(info.duration_ms), "duration"], [threadCost(info), "estimated cost"], [tokens(info.total_tokens), "tokens"], [count(info.redactions || 0), "redaction matches"], [count(info.active_requests || 0), "active"]]) {
-      const item = element("span"); item.append(element("strong", "", value), document.createTextNode(label));
-      if (label === "estimated cost" && known(info.cost_usd) && info.known_cost_requests < info.requests) item.title = `Estimated cost for ${count(info.known_cost_requests)} of ${count(info.requests)} requests; unpriced requests excluded.`;
+    for (const [value, label] of [[count(info.requests ?? state.session.total), "requests"], [duration(info.duration_ms), "combined request time"], [threadCost(info), "estimated API cost"], [tokenTotal(info), "reported tokens"], [count(info.redactions || 0), "redaction matches"], [count(info.active_requests || 0), "active"]]) {
+      const coverage = label === "reported tokens" && known(info.known_token_requests) ? ` · ${count(info.known_token_requests)}/${count(info.requests)} requests with usage` : "";
+      const item = element("span"); item.append(element("strong", "", value), document.createTextNode(label + coverage));
+      if (label === "estimated API cost" && known(info.cost_usd) && info.known_cost_requests < info.requests) item.title = `Estimated cost for ${count(info.known_cost_requests)} of ${count(info.requests)} requests; unpriced requests excluded.`;
+      if (label === "combined request time") item.title = "Sum of request durations. Concurrent requests overlap, so this is not session elapsed time.";
+      if (label === "reported tokens") item.title = known(info.known_token_requests) ? `Token usage reported for ${count(info.known_token_requests)} of ${count(info.requests)} retained requests. Missing usage is excluded.` : "Sum of reported token usage. Coverage is unavailable from this server.";
       summary.append(item);
     }
     summary.append(element("span", "", `Started ${date(info.started_at)}`));
@@ -657,6 +814,10 @@
     text("request-status", "");
     text("conversation-count", "");
     text("request-payload", "Loading request…");
+    text("request-capture-state", "");
+    text("payload-copy-status", "");
+    $("copy-payload").disabled = true;
+    $("payload-wrap").disabled = true;
     for (const target of ["request-strip", "request-metric-notes", "conversation-content", "conversation-notices", "payload-notices", "request-metrics"]) $(target).replaceChildren();
     for (const tab of ["conversation", "payload", "metrics"]) $("panel-" + tab).scrollTop = 0;
     updateIterationNavigation();
@@ -693,6 +854,10 @@
       $("tab-" + tab).setAttribute("aria-selected", String(selected));
       $("tab-" + tab).tabIndex = selected ? 0 : -1;
       $("panel-" + tab).hidden = !selected;
+    }
+    if (name === "payload" && state.payloadPending && state.detail) {
+      state.payloadPending = false;
+      renderJSON($("request-payload"), state.detail.request_body ?? "No request body retained.", state.detail.body_truncated === true);
     }
     if (focus) $("tab-" + name).focus();
   }
@@ -738,6 +903,30 @@
     return notes;
   }
 
+  function upstreamErrorNotice(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const fields = ["event", "type", "code", "message", "param"]
+      .filter((name) => typeof value[name] === "string" && value[name].trim())
+      .map((name) => [name, value[name]]);
+    if (!fields.length) return null;
+
+    const notice = element("section", "upstream-error-notice");
+    notice.tabIndex = 0;
+    notice.setAttribute("role", "group");
+    notice.setAttribute("aria-label", "Upstream error details");
+    const title = value.code === "stream_incomplete" ? "Stream ended early" : value.event === "transport" ? "Upstream connection failed" : "Upstream error";
+    notice.append(element("strong", "upstream-error-title", title));
+    const list = element("dl", "upstream-error-fields");
+    for (const [name, fieldValue] of fields) {
+      list.append(element("dt", "", name));
+      const detail = element("dd", name === "code" || name === "param" ? "mono" : "");
+      renderJSON(detail, fieldValue);
+      list.append(detail);
+    }
+    notice.append(list);
+    return notice;
+  }
+
   function renderDetail(item, renderBody) {
     const record = metadata(item.request_id);
     text("request-title", item.model || (item.usage_applicable === false ? "HTTP request" : "Unknown model"));
@@ -752,17 +941,24 @@
     if (!record) text("request-ordinal", `Request ${shortId(item.request_id)}`);
     updateIterationNavigation();
     $("request-strip").replaceChildren();
-    const tokenUsage = item.usage_applicable === false ? "Not applicable" : `${count(item.input_tokens)} in · ${count(item.output_tokens)} out`;
+    const tokenUsage = item.usage_applicable === false ? "Not applicable" : `${tokens(item.input_tokens)} in · ${tokens(item.output_tokens)} out`;
     const costLabel = apiEquivalent(item) ? "Est. API cost" : "Est. cost";
-    const metrics = [["Latency", duration(item.duration_ms)], ["TTFT", duration(item.ttft_ms)], ["Tokens", tokenUsage], [costLabel, cost(item.cost_usd)], ["Est. TPS", speed(item.tps)], ["Redactions", count(item.redactions || 0)]];
-    if (known(item.cached_input_tokens)) metrics.push(["Cached tokens", count(item.cached_input_tokens)]);
-    if (known(item.reasoning_tokens)) metrics.push(["Reasoning tokens", count(item.reasoning_tokens)]);
-    for (const [label, value] of metrics) {
+    const cached = fraction(item.cached_input_tokens, item.input_tokens);
+    const tokenNotes = [];
+    if (known(item.total_tokens)) tokenNotes.push(`${tokens(item.total_tokens)} total`);
+    if (cached !== null) tokenNotes.push(`${percentage.format(cached)} cached`);
+    const redactionCategories = Object.keys(item.rule_hits || {}).length;
+    const metrics = [["Latency", duration(item.duration_ms), item.outcome === "active" ? "Request in progress" : "Request to completion"], ["TTFT", duration(item.ttft_ms), "To first output"], ["Tokens", tokenUsage, tokenNotes.join(" · ") || "Provider-reported usage"], [costLabel, cost(item.cost_usd), apiEquivalent(item) ? "API-price equivalent" : known(item.cost_usd) ? "Reported or estimated" : "Pricing unavailable"], ["Est. TPS", speed(item.tps), "After first output"], ["Redactions", count(item.redactions), redactionCategories ? `${count(redactionCategories)} categories matched` : "No secret values stored"]];
+    for (const [label, value, note] of metrics) {
       const metric = element("span", "strip-metric");
-      metric.append(element("span", "", label), element("strong", "", value));
+      metric.append(element("span", "", label), element("strong", "", value), element("span", "strip-metric-note", note));
+      if (label === "Tokens") metric.title = `${count(item.input_tokens)} input · ${count(item.output_tokens)} output · ${count(item.total_tokens)} total · ${count(item.cached_input_tokens)} cached input · ${count(item.reasoning_tokens)} reasoning (included in output)`;
       $("request-strip").append(metric);
     }
-    $("request-metric-notes").replaceChildren(...metricsNotes(item).map((note) => element("p", "context-note", note)));
+    const notes = metricsNotes(item).map((note) => element("p", "context-note", note));
+    const upstreamError = upstreamErrorNotice(item.upstream_error);
+    if (upstreamError) notes.unshift(upstreamError);
+    $("request-metric-notes").replaceChildren(...notes);
     const scroll = $("panel-metrics").scrollTop;
     renderMetrics(item);
     $("panel-metrics").scrollTop = scroll;
@@ -770,7 +966,15 @@
       $("conversation-notices").replaceChildren(...bodyNotices(item));
       $("payload-notices").replaceChildren(...bodyNotices(item));
       text("payload-size", typeof item.request_body === "string" ? `${count(new TextEncoder().encode(item.request_body).length)} bytes retained` : "No body retained");
-      text("request-payload", item.request_body == null ? "No request body retained." : pretty(item.request_body));
+      const capture = item.request_body == null ? ["unavailable", "No payload"] : item.body_truncated ? ["partial", "Partial capture"] : ["complete", "Captured"];
+      $("request-capture-state").className = `tag capture-state ${capture[0]}`;
+      text("request-capture-state", capture[1]);
+      $("request-capture-state").title = item.body_truncated ? "Only the stored troubleshooting copy was truncated. This does not truncate the forwarded request." : item.request_body == null ? `Request body unavailable${item.body_omitted_reason ? `: ${item.body_omitted_reason}` : "."}` : "Redacted request body retained.";
+      $("copy-payload").disabled = item.request_body == null;
+      $("payload-wrap").disabled = item.request_body == null;
+      text("payload-copy-status", "");
+      $("copy-payload").textContent = "Copy payload";
+      state.payloadPending = true;
       renderConversation(item);
     }
     setTab(state.tab);
@@ -781,7 +985,7 @@
     details.append(element("summary", "", label));
     let rendered = false;
     details.addEventListener("toggle", () => {
-      if (details.open && !rendered) { rendered = true; details.append(element("pre", "code-block", pretty(value))); }
+      if (details.open && !rendered) { rendered = true; details.append(codeBlock(value)); }
     });
     return details;
   }
@@ -791,7 +995,7 @@
     const header = element("div", "tool-heading");
     header.append(element("strong", "", name || "Tool call"));
     if (callId) header.append(element("span", "", `call ${callId}`));
-    block.append(header, element("pre", "code-block", pretty(argumentsValue)));
+    block.append(header, codeBlock(argumentsValue));
     return block;
   }
 
@@ -801,7 +1005,7 @@
       return;
     }
     if (typeof content === "string") {
-      container.append(element("pre", "message-text", content));
+      container.append(codeBlock(content, "message-text"));
       return;
     }
     if (!Array.isArray(content)) {
@@ -809,17 +1013,17 @@
       return;
     }
     for (const part of content.slice(0, 100)) {
-      if (typeof part === "string") { container.append(element("pre", "message-text", part)); continue; }
+      if (typeof part === "string") { container.append(codeBlock(part, "message-text")); continue; }
       if (!part || typeof part !== "object") continue;
       const type = typeof part.type === "string" ? part.type : "content";
-      if (typeof part.text === "string") container.append(element("pre", "message-text", part.text));
-      else if (typeof part.text?.value === "string") container.append(element("pre", "message-text", part.text.value));
+      if (typeof part.text === "string") container.append(codeBlock(part.text, "message-text"));
+      else if (typeof part.text?.value === "string") container.append(codeBlock(part.text.value, "message-text"));
       else if (type === "tool_use" || type === "function_call") container.append(toolBlock(part.name, part.input ?? part.arguments, part.id ?? part.call_id));
       else if (type === "tool_result" || type === "function_call_output") {
         const block = element("div", "tool-block");
         block.append(element("div", "tool-heading", `Tool output${part.tool_use_id || part.call_id ? ` · ${part.tool_use_id || part.call_id}` : ""}`));
         const body = element("div", "message-body"); renderContent(body, part.content ?? part.output, depth + 1); block.append(body); container.append(block);
-      } else if (typeof part.refusal === "string") container.append(element("pre", "message-text", part.refusal));
+      } else if (typeof part.refusal === "string") container.append(codeBlock(part.refusal, "message-text"));
       else container.append(structured(`${type.replaceAll("_", " ")} · captured metadata only`, part));
     }
     if (content.length > 100) container.append(structured(`${content.length} content blocks · first 100 shown above; open complete structure`, content));
@@ -985,9 +1189,10 @@
     const root = $("request-metrics");
     root.replaceChildren();
     for (const note of metricsNotes(item)) root.append(element("p", "body-notice", note));
-    root.append(metricsSection("Timing", [["Total duration", duration(item.duration_ms)], ["Time to first token", duration(item.ttft_ms)], ["Generation time", duration(item.generation_ms)], ["Estimated tokens / second", speed(item.tps)], ["Streaming", item.stream ? "Yes" : "No"], ["Outcome", statusLabel(item)]]));
+    root.append(metricsSection("Timing", [["Total duration", duration(item.duration_ms)], ["Time to first token", duration(item.ttft_ms)], ["Generation time", duration(item.generation_ms)], ["Estimated tokens / second", speed(item.tps)], ["Streaming", typeof item.stream === "boolean" ? item.stream ? "Yes" : "No" : "Unknown"], ["Outcome", statusLabel(item)]]));
     root.append(element("p", "context-note", "TTFT measures request start to first output content. TPS estimates (output tokens − 1) / time between first and last output. Providers batch tokens, so this is an estimate."));
-    root.append(metricsSection("Token usage", [["Input tokens", count(item.input_tokens)], ["Output tokens", count(item.output_tokens)], ["Total tokens", count(item.total_tokens)], ["Cached input tokens", count(item.cached_input_tokens)], ["Cache write tokens", count(item.cache_write_tokens)], ["Reasoning tokens", count(item.reasoning_tokens)], ["Usage source", item.usage_source], ["Token usage applicable", item.usage_applicable === true ? "Yes" : item.usage_applicable === false ? "No" : "Unknown"], ["Observed response format", ({ json: "JSON", sse: "Event stream", unknown: "Unknown" })[item.response_format] || "Unknown"]]));
+    const cached = fraction(item.cached_input_tokens, item.input_tokens);
+    root.append(metricsSection("Token usage", [["Input tokens", count(item.input_tokens)], ["Output tokens", count(item.output_tokens)], ["Total tokens", count(item.total_tokens)], ["Cached input tokens", count(item.cached_input_tokens)], ["Input served from cache", cached === null ? "Unknown" : percentage.format(cached)], ["Cache write tokens", count(item.cache_write_tokens)], ["Reasoning (included in output)", count(item.reasoning_tokens)], ["Usage source", item.usage_source], ["Token usage applicable", item.usage_applicable === true ? "Yes" : item.usage_applicable === false ? "No" : "Unknown"], ["Observed response format", ({ json: "JSON", sse: "Event stream", unknown: "Unknown" })[item.response_format] || "Unknown"]]));
     const equivalent = apiEquivalent(item);
     const priceSource = item.cost_source === "custom_api_equivalent" ? "Configured API pricing" : equivalent ? "LiteLLM API pricing" : item.cost_source;
     root.append(metricsSection(equivalent ? "Estimated API-price equivalent" : "Estimated cost", [["Cost (USD)", cost(item.cost_usd)], ["Cost source", priceSource], ["Pricing model", item.pricing_model], ["Pricing snapshot", item.pricing_as_of], ["Provider", item.provider]]));
@@ -995,6 +1200,8 @@
     const redactions = element("section", "metrics-section");
     redactions.append(element("h2", "", `${count(item.redactions || 0)} redaction matches`), element("p", "context-note", "Rule matches, not unique credentials. Categories only; secret values are not included in these counts."), rulesList(item.rule_hits));
     root.append(redactions);
+    const bodyBytes = typeof item.request_body === "string" ? new TextEncoder().encode(item.request_body).length : null;
+    root.append(metricsSection("Capture & diagnostics", [["Request body", item.request_body == null ? "Unavailable" : item.body_truncated ? "Partial capture" : "Captured after redaction"], ["Retained payload", bodyBytes === null ? "Unknown" : `${count(bodyBytes)} bytes`], ["Body omission reason", item.body_omitted_reason || "None"], ["Usage capture", item.metrics_incomplete === true ? "Incomplete" : item.metrics_incomplete === false ? "Complete" : "Unknown"], ["Metrics diagnostic", item.metrics_unavailable_reason || "None"], ["Pricing diagnostic", item.cost_unavailable_reason || "None"]]));
     const record = metadata(item.request_id) || item;
     const identity = metricsSection("Request identity", [["Request ID", item.request_id, true], ["Session ID", item.thread_id, true], ["Session grouping", item.thread_source], ["Started", date(item.started_at, true)], ["Completed", date(item.completed_at, true)], ["Endpoint", `${item.method || ""} ${item.path || ""}`, true]]);
     if (known(record.user_turn)) field(identity.querySelector("dl"), "User turn", `${record.user_turn}${record.turn_source === "inferred" ? " · inferred" : ""}`);
@@ -1030,12 +1237,14 @@
       if ($("capture-warning-text").textContent !== warning) text("capture-warning-text", warning);
     }
     const metrics = [
-      ["Recorded requests", count(requests), `${count(totals.successes || 0)} successful · ${count(totals.errors || 0)} errors`],
+      ["Finished requests", count(requests), `${count(totals.successes || 0)} successful · ${count(totals.errors || 0)} errors`],
       ["Total tokens", tokens(totals.total_tokens), `${count(unknownUsage)} ${coverageLabel} with unknown token usage`],
       ["Estimated API cost · USD", cost(totals.cost_usd), `Cost recorded for ${count(pricedRequests)}/${count(applicableRequests)} ${coverageLabel}${unknownCost ? " · partial total" : ""}. Includes API-price equivalents for subscription requests.`],
       ["Average time to first token", duration(totals.avg_ttft_ms), "Observed output streams"],
       ["Average estimated TPS", known(totals.avg_tps) ? `${speed(totals.avg_tps)}/s` : "—", "After first output token"],
       ["Redaction matches", count(totals.redactions || 0), `${count(totals.redacted_requests || 0)} requests · not unique credentials`],
+      ["Average latency", duration(totals.avg_duration_ms), "Requests with captured timing"],
+      ["Error rate", fraction(totals.errors, requests) === null ? "—" : percentage.format(fraction(totals.errors, requests)), `${count(totals.cancelled || 0)} cancelled · ${count(totals.interrupted || 0)} interrupted`],
     ];
     $("overview-metrics").replaceChildren();
     for (const [label, value, note] of metrics) {
@@ -1058,7 +1267,9 @@
       const modelApplicable = known(model.usage_applicable_requests) ? model.usage_applicable_requests : model.requests;
       const modelCoverage = element("td", "", `${count(model.cost_usd_known_requests)}/${count(modelApplicable)}`);
       modelCoverage.title = model.usage_applicability_unknown_requests > 0 || !known(model.usage_applicable_requests) ? "Recorded requests with cost; older request applicability is unknown." : "LLM requests with recorded cost; bookkeeping requests excluded.";
-      row.append(identity, element("td", "", count(model.requests)), element("td", "", tokens(model.total_tokens)), element("td", "", cost(model.cost_usd)), modelCoverage);
+      const usage = element("td");
+      usage.append(element("span", "", tokenTotal({ ...model, known_token_requests: model.total_tokens_known_requests, requests: modelApplicable })), element("span", "cell-subtitle", `${count(model.total_tokens_known_requests)}/${count(modelApplicable)} usage known`));
+      row.append(identity, element("td", "", count(model.requests)), usage, element("td", "", cost(model.cost_usd)), modelCoverage);
       $("overview-models").append(row);
     }
     const used = known(storage.detail_bytes) ? `${decimal.format(storage.detail_bytes / 1048576)} MiB` : "—";
@@ -1141,7 +1352,13 @@
       } else if (!state.initialized && state.view !== "overview") {
         showEmpty(state.traffic === "inference" ? "Waiting for inference requests" : "Waiting for requests", state.traffic === "inference" ? "Inference sessions appear here as requests pass through the proxy. Ancillary calls remain available under All HTTP traffic." : "Sessions appear here when traffic passes through the proxy with history enabled.");
       }
-      if (state.detail?.outcome === "active") {
+      const selectedMetadata = metadata(state.requestId);
+      const selectedRequestChanged = selectedMetadata && state.detail && (
+        selectedMetadata.outcome !== state.detail.outcome ||
+        selectedMetadata.status_code !== state.detail.status_code ||
+        selectedMetadata.completed_at !== state.detail.completed_at
+      );
+      if (state.detail && (state.detail.outcome === "active" || selectedRequestChanged)) {
         const id = state.requestId;
         const version = state.detailVersion;
         const item = await api(`/api/requests/${encodeURIComponent(id)}`);
@@ -1239,6 +1456,29 @@
       field.focus(); field.select();
       text("copy-link-status", "Copy this selected request link.");
     }
+  });
+  $("copy-payload").addEventListener("click", async () => {
+    const item = state.detail;
+    const epoch = state.epoch;
+    if (typeof item?.request_body !== "string") return;
+    try {
+      await navigator.clipboard.writeText(item.request_body);
+      if (epoch !== state.epoch || state.requestId !== item.request_id || !state.authenticated) return;
+      $("copy-payload").textContent = "Copied";
+      text("payload-copy-status", "Retained redacted payload copied.");
+    } catch {
+      if (epoch !== state.epoch || state.requestId !== item.request_id || !state.authenticated) return;
+      const range = document.createRange();
+      range.selectNodeContents($("request-payload"));
+      const selection = window.getSelection();
+      selection?.removeAllRanges(); selection?.addRange(range);
+      text("payload-copy-status", "Clipboard unavailable. Displayed payload selected for copying.");
+    }
+  });
+  $("payload-wrap").addEventListener("click", () => {
+    state.payloadWrap = !state.payloadWrap;
+    $("payload-wrap").setAttribute("aria-pressed", String(state.payloadWrap));
+    $("request-payload").classList.toggle("no-wrap", !state.payloadWrap);
   });
   $("threads-prev").addEventListener("click", () => { state.threadOffset = Math.max(0, state.threadOffset - 50); refresh(); });
   $("threads-next").addEventListener("click", () => { state.threadOffset += 50; refresh(); });

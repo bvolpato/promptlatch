@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 import brotli
 from pydantic_core import from_json
 
+from promptlatch.upstream_errors import (
+    ERROR_FIELD_BYTES,
+    MAX_ERROR_SOURCE_BYTES,
+    OVERSIZED_ERROR_FIELD,
+)
+
 if sys.version_info >= (3, 14):
     from compression import zstd
 else:
@@ -60,6 +66,35 @@ _HOSTED_OUTPUT = {
     "server_tool_use",
     "web_search_tool_result",
     "code_execution_tool_result",
+}
+_TRANSPORT_REASONS = {
+    "ConnectTimeout": "Timed out connecting to upstream.",
+    "ReadTimeout": "Timed out reading the upstream response.",
+    "WriteTimeout": "Timed out sending the upstream request.",
+    "PoolTimeout": "Timed out waiting for an upstream connection.",
+    "ConnectError": "Could not establish an upstream connection.",
+    "ReadError": "Upstream connection failed while reading the response.",
+    "WriteError": "Upstream connection failed while sending the request.",
+    "CloseError": "Upstream connection failed while closing.",
+    "RemoteProtocolError": "Upstream returned an invalid or incomplete HTTP response.",
+    "LocalProtocolError": "The upstream request violated the HTTP protocol.",
+    "ProxyError": "Could not establish a connection through the upstream proxy.",
+    "UnsupportedProtocol": "The upstream URL protocol is unsupported.",
+    "DecodingError": "The upstream response could not be decoded.",
+    "TooManyRedirects": "The upstream response exceeded the redirect limit.",
+    "TimeoutException": "The upstream request timed out.",
+    "NetworkError": "The upstream network connection failed.",
+    "ProtocolError": "The upstream connection failed HTTP protocol validation.",
+    "TransportError": "Upstream transport failed.",
+    "RequestError": "Upstream request failed.",
+}
+_ANTHROPIC_STREAM_EVENTS = {
+    "message_start",
+    "message_delta",
+    "message_stop",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
 }
 
 
@@ -112,12 +147,16 @@ class ResponseMetrics:
         self._event_name = ""
         self._skip_event = False
         self._protocol: str | None = None
+        self._llm_stream = False
         self._probe = bytearray()
         self._body = bytearray()
         self._unavailable_reason: str | None = None
+        self._http_error = False
+        self._error_details: dict[str, str] = {}
+        self._transport_error_details: dict[str, str] = {}
 
     def response_headers(self, headers: Mapping[str, str], status_code: int) -> None:
-        del status_code  # The caller records HTTP status independently.
+        self._http_error = status_code >= 400
         fields = {key.lower(): value for key, value in headers.items()}
         self._encoding = fields.get("content-encoding", "").strip().lower()
         if "text/event-stream" in fields.get("content-type", "").lower():
@@ -169,10 +208,13 @@ class ResponseMetrics:
         if self._saw_output:
             self._record_output()
 
-    def finish_stream(self) -> None:
+    def finish_stream(self, *, complete: bool = True) -> None:
         if self._finished:
             return
-        if not self._skip and self._compressed_seen and not self._compression_complete():
+        compression_incomplete = (
+            not self._skip and self._compressed_seen and not self._compression_complete()
+        )
+        if compression_incomplete:
             self._incomplete = True
             if self._outcome != "stream_error":
                 self._outcome = "incomplete"
@@ -186,14 +228,29 @@ class ResponseMetrics:
         if not self._terminal and self._outcome != "stream_error":
             self._outcome = "incomplete"
             self._incomplete = True
+            if (
+                complete
+                and self._llm_stream
+                and not self._skip
+                and not compression_incomplete
+                and not self._unavailable_reason
+                and not self._error_details
+                and not self._transport_error_details
+            ):
+                self._error_details = {
+                    "event": "stream",
+                    "type": "stream_error",
+                    "code": "stream_incomplete",
+                    "message": "Upstream stream ended before a completion event.",
+                }
         self._finished = True
         self._clear_buffers()
 
-    def finish_response(self) -> None:
+    def finish_response(self, *, complete: bool = True) -> None:
         if self._finished:
             return
         if self._protocol == "sse":
-            self.finish_stream()
+            self.finish_stream(complete=complete)
             return
         if not self._skip and self._compressed_seen and not self._compression_complete():
             self._incomplete = True
@@ -212,6 +269,26 @@ class ResponseMetrics:
     def observe_body(self, body: bytes, *, decoded: bool = False) -> None:
         self.feed_response(body, decoded=decoded)
         self.finish_response()
+
+    def take_error_details(self) -> dict[str, str]:
+        """Consume bounded raw error fields; callers must redact before retaining them."""
+        details = self._error_details or self._transport_error_details
+        self._error_details = {}
+        self._transport_error_details = {}
+        return details
+
+    def transport_error(self, error_type: str) -> None:
+        """Retain an allowlisted class and static reason, never exception text."""
+        if self._transport_error_details:
+            return
+        if error_type not in _TRANSPORT_REASONS:
+            error_type = "RequestError"
+        self._transport_error_details = {
+            "event": "transport",
+            "type": error_type,
+            "code": "upstream_transport_error",
+            "message": _TRANSPORT_REASONS[error_type],
+        }
 
     def snapshot(self) -> dict[str, Any]:
         ttft = generation = tps = None
@@ -412,6 +489,7 @@ class ResponseMetrics:
     def _dispatch_event(self) -> None:
         if self._event_name == "error":
             self._outcome = "stream_error"
+            self._error_details.setdefault("event", "error")
         if self._event_data and not self._skip_event:
             data = bytes(self._event_data[:-1])
             self._observe_event_data(data)
@@ -444,6 +522,12 @@ class ResponseMetrics:
         return payload
 
     def _observe_payload(self, payload: dict[str, Any], *, streaming: bool) -> None:
+        if streaming and not self._llm_stream:
+            event_type = payload.get("type")
+            self._llm_stream = isinstance(payload.get("choices"), list) or (
+                isinstance(event_type, str)
+                and (event_type.startswith("response.") or event_type in _ANTHROPIC_STREAM_EVENTS)
+            )
         if streaming and payload.keys() <= _CHAT_EVENT_KEYS:
             if "model" in payload or "id" in payload or "service_tier" in payload:
                 self._metadata(payload)
@@ -473,17 +557,29 @@ class ResponseMetrics:
             self._merge_usage(envelope["usage"], anthropic=anthropic)
         if envelope is not payload and isinstance(payload.get("usage"), dict):
             self._merge_usage(payload["usage"], anthropic=anthropic)
-        if payload.get("error") is not None or envelope.get("error") is not None:
+        error = envelope.get("error")
+        if error is None:
+            error = payload.get("error")
+        failed = event_type in {"error", "response.failed", "response.error"}
+        if error is not None:
             self._outcome = "stream_error"
         status = envelope.get("status")
         if not isinstance(status, str):
             status = ""
-        if event_type in {"error", "response.failed", "response.error"} or status == "failed":
+        if failed or status == "failed":
             self._outcome = "stream_error"
         elif (
             event_type == "response.incomplete" or status in {"incomplete", "cancelled"}
         ) and self._outcome != "stream_error":
             self._outcome = "incomplete"
+        if (
+            error is not None
+            or failed
+            or status == "failed"
+            or self._http_error
+            or self._event_name == "error"
+        ):
+            self._capture_error(payload, error, event_type)
         if event_type in {
             "response.completed",
             "response.failed",
@@ -515,6 +611,29 @@ class ResponseMetrics:
                 self._outcome = "incomplete"
         if streaming and meaningful:
             self._saw_output = True
+
+    def _capture_error(self, payload: dict[str, Any], error: Any, event_type: str) -> None:
+        if isinstance(error, dict):
+            details = error
+        elif isinstance(error, str):
+            details = {"message": error}
+        else:
+            details = payload
+            if isinstance(payload.get("detail"), str):
+                details = {**payload, "message": payload["detail"]}
+        for key in ERROR_FIELD_BYTES:
+            if key in self._error_details:
+                continue
+            value = (
+                event_type or ("error" if self._event_name == "error" else "")
+                if key == "event" and self._protocol == "sse"
+                else details.get(key)
+            )
+            if key == "code" and type(value) is int and 0 <= value <= 999_999_999:
+                value = str(value)
+            if not isinstance(value, str) or not value:
+                continue
+            self._error_details[key] = _bounded_error_source(value)
 
     def _observe_choices(self, choices: Any) -> bool:
         meaningful = False
@@ -688,6 +807,16 @@ class ResponseMetrics:
 
 def _has_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _bounded_error_source(value: str) -> str:
+    # Never cut raw secrets: oversized fields are omitted before redaction.
+    if (
+        len(value) > MAX_ERROR_SOURCE_BYTES
+        or len(value.encode("utf-8", errors="replace")) > MAX_ERROR_SOURCE_BYTES
+    ):
+        return OVERSIZED_ERROR_FIELD
+    return value
 
 
 def _token_count(value: Any) -> int | None:

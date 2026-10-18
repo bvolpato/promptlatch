@@ -22,6 +22,7 @@ from promptlatch.request_previews import (
     bound_preview_text,
     legacy_request_previews,
 )
+from promptlatch.upstream_errors import bound_error_details
 
 _PAGE_SIZE = 4096
 _MIN_DATABASE_BYTES = 256 * 1024
@@ -74,6 +75,7 @@ _FIELDS = frozenset(
         "usage_applicable",
         "cost_unavailable_reason",
         "unsupported_costs",
+        "upstream_error",
     ]
 )
 _TOKEN_FIELDS = (
@@ -375,6 +377,12 @@ class HistoryStore:
                 result[key] = bound_preview_text(value) if isinstance(value, str) else None
         body = result.get("request_body")
         body_bytes = 0
+        if "upstream_error" in result:
+            result["upstream_error"] = (
+                bound_error_details(result["upstream_error"]) if self.max_body_bytes else None
+            )
+            if result["upstream_error"]:
+                body_bytes = len(_encode(result["upstream_error"]).encode("utf-8"))
         if isinstance(body, str):
             bounded = body[: self.max_body_bytes].encode("utf-8")[: self.max_body_bytes]
             trimmed = bounded.decode("utf-8", errors="ignore")
@@ -383,7 +391,7 @@ class HistoryStore:
             result["request_body"] = trimmed if self.max_body_bytes else None
             if not self.max_body_bytes:
                 result["body_omitted_reason"] = "disabled"
-            body_bytes = len(bounded)
+            body_bytes += len(bounded)
         if not self.max_body_bytes:
             for key in PREVIEW_FIELDS:
                 result[key] = None
@@ -403,6 +411,7 @@ class HistoryStore:
                     request_body=None, body_truncated=True, body_omitted_reason="queue_pressure"
                 )
                 record.update(dict.fromkeys(PREVIEW_FIELDS))
+                record["upstream_error"] = None
                 body_bytes = 0
             try:
                 self._queue.put_nowait((kind, record, body_bytes))
@@ -770,7 +779,7 @@ class HistoryStore:
         metadata = {
             key: value
             for key, value in record.items()
-            if key != "request_body" and key not in PREVIEW_FIELDS
+            if key not in {"request_body", "upstream_error"} and key not in PREVIEW_FIELDS
         }
         cursor = connection.execute(
             "INSERT OR IGNORE INTO pending(request_id,record) VALUES (?,?)",
@@ -1112,6 +1121,7 @@ class HistoryReader:
             for row in rows:
                 record = self._record_with_legacy_previews(connection, json.loads(row[0]))
                 record.pop("request_body", None)
+                record.pop("upstream_error", None)
                 result["items"].append(record)
             return result
         finally:
@@ -1150,6 +1160,7 @@ class HistoryReader:
                     COALESCE(SUM(json_extract(record,'$.redactions')),0) AS redactions,
                     SUM(json_extract(record,'$.duration_ms')) AS duration_ms,
                     SUM(json_extract(record,'$.total_tokens')) AS total_tokens,
+                    COUNT(json_extract(record,'$.total_tokens')) AS known_token_requests,
                     SUM(json_extract(record,'$.cost_usd')) AS cost_usd,
                     COUNT(json_extract(record,'$.cost_usd')) AS known_cost_requests
                     FROM requests WHERE {condition} GROUP BY thread_id
@@ -1271,6 +1282,7 @@ class HistoryReader:
             for index, row in enumerate(rows):
                 record = self._record_with_legacy_previews(connection, json.loads(row["record"]))
                 record.pop("request_body", None)
+                record.pop("upstream_error", None)
                 record["ordinal"] = (
                     offset + index + 1 if order == "asc" else result["total"] - offset - index
                 )

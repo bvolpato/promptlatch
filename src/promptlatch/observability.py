@@ -1,4 +1,4 @@
-"""Server-only request accounting. Neither headers nor response bodies are persisted."""
+"""Server-only request accounting with redacted, bounded upstream error details."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import uuid4
 
+import httpx
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -30,6 +31,7 @@ from promptlatch.pricing import PricingCatalog
 from promptlatch.redaction import MASK, RedactionStats, SecretRedactor
 from promptlatch.request_previews import PREVIEW_FIELDS, extract_request_previews
 from promptlatch.response_metrics import ResponseMetrics
+from promptlatch.upstream_errors import bound_error_details
 
 logger = logging.getLogger("promptlatch")
 _LOCAL_ROUTES = {"/healthz", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}
@@ -315,7 +317,7 @@ class RequestObservation:
         self.owner = owner
         self.started = time.perf_counter()
         self.metrics = ResponseMetrics(self.started)
-        self.credentials: tuple[str, ...] = ()
+        self.credentials = _known_secrets(request, owner.settings, owner._metadata_redactor)
         self.metadata_redactor = owner._metadata_redactor
         self.scope = ""
         self.service_tier: str | None = None
@@ -508,7 +510,20 @@ class RequestObservation:
             )
 
     def response_headers(self, headers: Any, status_code: int) -> None:
-        self.metrics.response_headers(headers, status_code)
+        if self.observer_failed:
+            return
+        try:
+            self.metrics.response_headers(headers, status_code)
+        except Exception:
+            self.observer_failed = True
+
+    def transport_error(self, error: httpx.RequestError) -> None:
+        if self.observer_failed:
+            return
+        try:
+            self.metrics.transport_error(type(error).__name__)
+        except Exception:
+            self.observer_failed = True
 
     def observe(self, body: bytes, *, streaming: bool, decoded: bool) -> None:
         del streaming  # Observation follows the actual bytes, not an unreliable content type.
@@ -529,8 +544,9 @@ class RequestObservation:
         if not self.submitted:
             self._discard_preview_memory()
             return
-        self.metrics.finish_response()
+        self.metrics.finish_response(complete=outcome in {"success", "http_error"})
         fields = self.metrics.snapshot()
+        fields["upstream_error"] = self._upstream_error()
         self.record["stream"] = fields["response_format"] == "sse"
         if self.observer_failed:
             fields["metrics_incomplete"] = True
@@ -597,6 +613,29 @@ class RequestObservation:
         )
         self.owner.store.submit_finish(self.record["request_id"], fields)
         self._discard_preview_memory()
+
+    def _upstream_error(self) -> dict[str, str] | None:
+        details = self.metrics.take_error_details()
+        config = self.owner.settings.observability
+        if not details or not config.store_request_bodies or not config.max_body_bytes:
+            return None
+        try:
+            redactor = SecretRedactor(
+                self.metadata_redactor.config.model_copy(
+                    update={"engine": self.owner.settings.redaction.engine}
+                ),
+                _cache_from=self.metadata_redactor,
+            )
+            cleaned = {
+                key: _remove_known(
+                    redactor.redact_text(_remove_known(value, self.credentials)).value,
+                    self.credentials,
+                )
+                for key, value in details.items()
+            }
+            return bound_error_details(cleaned)
+        except Exception:
+            return {"message": "Upstream error details unavailable: redaction failed."}
 
     def _discard_preview_memory(self) -> None:
         self.credentials = ()

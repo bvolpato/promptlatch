@@ -1,13 +1,345 @@
+import base64
+import binascii
 import json
+import struct
 import tempfile
+import zlib
 from typing import Literal
 
 import pytest
 import requests
+from pydantic import BaseModel, ConfigDict
 
 from promptlatch.config import RedactionConfig, RuleConfig
 from promptlatch.redaction import RedactionKeyCollisionError, SecretRedactor
 from tests.fixtures import EXPANDED_PROVIDER_FIXTURES, OPENAI_FAKE, PROVIDER_FIXTURES
+
+
+def _tiny_png_url() -> str:
+    def chunk(name: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack("!I", len(data))
+            + name
+            + data
+            + struct.pack("!I", binascii.crc32(name + data))
+        )
+
+    image = b"\x89PNG\r\n\x1a\n"
+    image += chunk(b"IHDR", struct.pack("!IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    image += chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\xff"))
+    image += chunk(b"IEND", b"")
+    return "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"role": "user"},
+        {"type": "message", "role": "user"},
+        {"type": "message", "role": "assistant"},
+        {"type": "message", "role": "system"},
+        {"type": "message", "role": "developer"},
+        {"type": "function_call_output", "call_id": "call_fixture"},
+        {"type": "custom_tool_call_output", "call_id": "call_fixture"},
+    ],
+)
+@pytest.mark.parametrize("rule_type", ["exact", "regex"])
+def test_responses_preserve_image_data_only_in_supported_content_locations(
+    item: dict, rule_type: Literal["exact", "regex"]
+) -> None:
+    image_url = _tiny_png_url()
+    rule = RuleConfig(
+        type=rule_type,
+        value=image_url[-8:] if rule_type == "exact" else "iVBORw0KGgo",
+    )
+    redactor = SecretRedactor(RedactionConfig(engine="basic", rules=[rule]))
+    field = "content" if "role" in item else "output"
+    parts = [
+        {"type": "input_text", "text": f"API_KEY={OPENAI_FAKE}"},
+        {"type": "input_image", "image_url": image_url},
+    ]
+    payload = {"input": [{**item, field: parts}]}
+
+    assert redactor.redact_payload(payload).value["input"][0][field][1]["image_url"] != image_url
+    result = redactor.redact_payload(payload, protocol="openai-responses")
+
+    assert result.value["input"][0][field][1]["image_url"] == image_url
+    assert OPENAI_FAKE not in result.value["input"][0][field][0]["text"]
+    assert result.stats.redactions == 1
+    assert parts[1]["image_url"] == image_url
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "function_call_output", "content": []},
+        {"type": "message", "role": "tool", "content": []},
+        {"type": "other", "role": "user", "content": []},
+        {"type": "message", "content": []},
+        {"type": "message", "role": "user", "metadata": {"content": []}},
+        {"type": "input_image", "image_url": _tiny_png_url()},
+    ],
+)
+def test_responses_image_data_in_arbitrary_fields_remains_scanned(item: dict) -> None:
+    image_url = _tiny_png_url()
+    parts = [{"type": "input_image", "image_url": image_url}]
+    if "content" in item:
+        item = {**item, "content": parts}
+    elif "metadata" in item:
+        item = {**item, "metadata": {"content": parts}}
+    redactor = SecretRedactor(
+        RedactionConfig(engine="basic", rules=[RuleConfig(type="regex", value="iVBORw0KGgo")])
+    )
+
+    result = redactor.redact_payload({"input": [item]}, protocol="openai-responses")
+
+    assert image_url not in json.dumps(result.value)
+    assert result.stats.redactions == 1
+
+
+@pytest.mark.parametrize(
+    "image_url",
+    [
+        _tiny_png_url().replace("image/png", "image/svg+xml"),
+        _tiny_png_url().replace("image/png", "image/jpeg"),
+        _tiny_png_url() + "!",
+        _tiny_png_url() + "=",
+        _tiny_png_url()[:-3] + "h==",
+        "data:image/png;base64," + base64.b64encode(b"invalid image bytes").decode("ascii"),
+        f"https://example.test/image.png?api_key={OPENAI_FAKE}",
+    ],
+)
+def test_responses_invalid_image_data_and_remote_image_urls_remain_scanned(image_url: str) -> None:
+    redactor = SecretRedactor(
+        RedactionConfig(engine="basic", rules=[RuleConfig(type="regex", value="base64,")])
+    )
+
+    result = redactor.redact_payload(
+        {"input": [{"role": "user", "content": [{"type": "input_image", "image_url": image_url}]}]},
+        protocol="openai-responses",
+    )
+
+    assert result.value["input"][0]["content"][0]["image_url"] != image_url
+    assert result.stats.redactions >= 1
+
+
+def test_responses_image_exemption_does_not_propagate_into_other_parts_or_metadata() -> None:
+    image_url = _tiny_png_url()
+    payload = {
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "image_url": image_url},
+                    {
+                        "type": "input_image",
+                        "image_url": image_url,
+                        "metadata": {"type": "input_image", "image_url": image_url},
+                    },
+                ],
+            }
+        ]
+    }
+    redactor = SecretRedactor(
+        RedactionConfig(engine="basic", rules=[RuleConfig(type="regex", value="iVBORw0KGgo")])
+    )
+
+    result = redactor.redact_payload(payload, protocol="openai-responses")
+
+    parts = result.value["input"][0]["content"]
+    assert parts[0]["image_url"] != image_url
+    assert parts[1]["image_url"] == image_url
+    assert parts[1]["metadata"]["image_url"] != image_url
+    assert result.stats.redactions == 2
+
+
+def test_responses_pydantic_image_content_matches_mapping_scope() -> None:
+    class ImagePart(BaseModel):
+        type: Literal["input_image"] = "input_image"
+        image_url: str
+
+    class Message(BaseModel):
+        type: Literal["message"] = "message"
+        role: Literal["user"] = "user"
+        content: tuple[ImagePart, ...]
+        extra_context: str
+
+    class Request(BaseModel):
+        input: list[Message]
+
+    image_url = _tiny_png_url()
+    request = Request(
+        input=[
+            Message(content=(ImagePart(image_url=image_url),), extra_context=OPENAI_FAKE),
+        ]
+    )
+    redactor = SecretRedactor(
+        RedactionConfig(engine="basic", rules=[RuleConfig(type="regex", value="iVBORw0KGgo")])
+    )
+
+    result = redactor.redact_payload(request, protocol="openai-responses")
+
+    assert isinstance(result.value, Request)
+    assert result.value.input[0].content[0].image_url == image_url
+    assert result.value.input[0].extra_context == "[REDACTED_SECRET]"
+    assert request.input[0].extra_context == OPENAI_FAKE
+    assert result.stats.redactions == 1
+
+
+def _opaque_response_fixture(marker: str = OPENAI_FAKE) -> str:
+    """Synthetic Fernet-shaped bytes, with a detector match in the encoded value."""
+    prefix = f"gAAAAAAAAAAA-{marker}-"
+    # 57-byte header/HMAC plus a positive number of 16-byte blocks, without padding.
+    blocks = max(1, (len(prefix) - 76 + 63) // 64)
+    return prefix.ljust(76 + blocks * 64, "A")
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize("item_type", ["reasoning", "compaction"])
+def test_responses_protocol_preserves_only_direct_opaque_input_items(
+    engine: Literal["basic", "detect-secrets"], item_type: str
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine=engine))
+    ciphertext = _opaque_response_fixture()
+    item = {
+        "type": item_type,
+        "encrypted_content": ciphertext,
+        "summary": [{"type": "summary_text", "text": f"API_KEY={OPENAI_FAKE}"}],
+        "metadata": {"type": item_type, "encrypted_content": ciphertext},
+    }
+    payload = {"input": [item], "metadata": {"encrypted_content": ciphertext}}
+
+    assert redactor.redact_payload(payload).value["input"][0]["encrypted_content"] != ciphertext
+    result = redactor.redact_payload(payload, protocol="openai-responses")
+
+    retained = result.value["input"][0]
+    assert retained["encrypted_content"] == ciphertext
+    assert OPENAI_FAKE not in retained["summary"][0]["text"]
+    assert retained["metadata"]["encrypted_content"] != ciphertext
+    assert result.value["metadata"]["encrypted_content"] != ciphertext
+    assert payload["input"][0]["summary"][0]["text"].endswith(OPENAI_FAKE)
+    assert item["encrypted_content"] == ciphertext
+    assert result.stats.redactions >= 3
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        RuleConfig(type="exact", value="OpaqueRuleFixture0000"),
+        RuleConfig(type="exact", value="AAAAAAAA"),
+        RuleConfig(type="regex", value="OpaqueRuleFixture[0-9]+"),
+    ],
+)
+def test_responses_opaque_content_ignores_custom_rules_without_exempting_readable_fields(
+    rule: RuleConfig,
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine="basic", rules=[rule]))
+    ciphertext = _opaque_response_fixture("OpaqueRuleFixture0000")
+    payload = {
+        "input": [
+            {
+                "type": "reasoning",
+                "encrypted_content": ciphertext,
+                "summary": [{"type": "summary_text", "text": ciphertext}],
+            }
+        ]
+    }
+
+    result = redactor.redact_payload(payload, protocol="openai-responses")
+
+    assert result.value["input"][0]["encrypted_content"] == ciphertext
+    assert result.value["input"][0]["summary"][0]["text"] != ciphertext
+    assert result.stats.redactions >= 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        OPENAI_FAKE,
+        f"API_KEY={OPENAI_FAKE}",
+        _opaque_response_fixture() + "!",
+        _opaque_response_fixture()[1:],
+        "A" + _opaque_response_fixture()[1:],
+        _opaque_response_fixture() + "=",
+        _opaque_response_fixture() + "AAAA",
+    ],
+)
+def test_responses_plaintext_and_invalid_envelopes_are_still_redacted(content: str) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine="basic"))
+
+    result = redactor.redact_payload(
+        {"input": [{"type": "reasoning", "encrypted_content": content}]},
+        protocol="openai-responses",
+    )
+
+    assert result.value["input"][0]["encrypted_content"] != content
+    assert OPENAI_FAKE not in result.value["input"][0]["encrypted_content"]
+    assert result.stats.redactions >= 1
+
+
+@pytest.mark.parametrize("item_type", [None, "message", "function_call", "Reasoning"])
+def test_responses_opaque_encoding_does_not_exempt_other_item_types(item_type: str | None) -> None:
+    ciphertext = _opaque_response_fixture()
+
+    result = SecretRedactor(RedactionConfig(engine="basic")).redact_payload(
+        {"input": [{"type": item_type, "encrypted_content": ciphertext}]},
+        protocol="openai-responses",
+    )
+
+    assert result.value["input"][0]["encrypted_content"] != ciphertext
+    assert result.stats.redactions >= 1
+
+
+@pytest.mark.parametrize("extra_fields", [False, True])
+def test_responses_pydantic_opaque_scope_matches_mapping_scope(extra_fields: bool) -> None:
+    class ResponseItem(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        summary: list[dict[str, str]]
+
+    class ExplicitResponseItem(ResponseItem):
+        type: str
+        encrypted_content: str
+
+    class ResponseRequest(BaseModel):
+        input: tuple[ResponseItem, ...]
+
+    item_class = ResponseItem if extra_fields else ExplicitResponseItem
+    ciphertext = _opaque_response_fixture()
+    item = item_class.model_validate(
+        {
+            "type": "reasoning",
+            "encrypted_content": ciphertext,
+            "summary": [{"type": "summary_text", "text": f"API_KEY={OPENAI_FAKE}"}],
+        }
+    )
+    request = ResponseRequest(input=(item,))
+
+    result = SecretRedactor(RedactionConfig(engine="basic")).redact_payload(
+        request, protocol="openai-responses"
+    )
+
+    assert isinstance(result.value, ResponseRequest)
+    assert isinstance(result.value.input[0], item_class)
+    assert result.value.input[0].model_dump()["encrypted_content"] == ciphertext
+    assert OPENAI_FAKE not in result.value.input[0].summary[0]["text"]
+    assert item.summary[0]["text"].endswith(OPENAI_FAKE)
+
+
+def test_responses_opaque_capture_preserves_padded_envelope() -> None:
+    raw = base64.urlsafe_b64decode(_opaque_response_fixture()) + bytes(16)
+    ciphertext = base64.urlsafe_b64encode(raw).decode("ascii")
+    redactor = SecretRedactor(
+        RedactionConfig(engine="basic", rules=[RuleConfig(type="regex", value="gAAAA")])
+    )
+
+    result = redactor.redact_payload(
+        {"input": [{"type": "compaction", "encrypted_content": ciphertext}]},
+        protocol="openai-responses",
+    )
+
+    assert ciphertext.endswith("==")
+    assert result.value["input"][0]["encrypted_content"] == ciphertext
+    assert result.stats.redactions == 0
 
 
 def test_redacts_nested_openai_key() -> None:

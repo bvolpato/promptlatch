@@ -48,6 +48,9 @@ Entropy-only matching is disabled to avoid unpredictable false positives.
 - Audit logs record redaction counts and rule names without storing secret values.
 - Local request history stores redacted bodies and metrics. Redacted prompts can
   still contain private information; use metadata-only storage when needed.
+- When request history is enabled, it can also retain a small allowlist of upstream
+  error fields after full redaction. Full upstream response bodies and raw headers
+  are not stored.
 - PromptLatch strips cookies and secret-named client headers. Provider credentials are
   added from config or dedicated `X-Target-*` headers after that filtering step.
 - Unknown private token formats need a custom exact-tail or regex rule.
@@ -479,7 +482,9 @@ enabled, forwarded responses receive a browser sandbox policy that prevents
 upstream HTML or scripts from accessing its origin. API response bodies are unchanged.
 
 The dashboard opens a compact request inspector with a session tree in the sidebar.
-Sessions show status, model, retained duration and cost, and message previews.
+Sessions show status, model, combined request time, estimated API cost, and message
+previews. Combined request time sums retained request durations, including overlaps.
+Token totals show a `+` when some retained requests have unknown usage.
 Requests and captured conversation history appear newest first. Search and
 status/provider/model filters apply to loaded sessions.
 Each selected request has a `#request=<request-id>` deep link. Copy link copies
@@ -498,20 +503,52 @@ redactions in the main pane. User-turn groups are inferred from submitted
 history; tool-result iterations stay under the preceding user turn. Incremental
 Responses requests expose retained parent links when available. Older records
 without turn metadata remain ungrouped iterations. Stats is global, independent
-of the selected request and sidebar filters. It shows token totals, latency,
-estimated cost, and redaction counts by rule. All time uses preserved lifetime
+of the selected request and sidebar filters. Active requests enter statistics
+when they finish. It shows token totals, latency, estimated cost, and redaction
+counts by rule. All time uses preserved lifetime
 totals; daily, model, and rule breakdowns cover retained aggregate history.
 The request tree defaults to inference calls. Select **All HTTP traffic** to
 inspect ancillary GETs and other proxy calls. Their records remain retained;
 deep links to those requests open the matching traffic view automatically.
 Conversation omits entries without readable content, including encrypted-only
-reasoning and tool metadata declarations. Payload preserves the captured data.
+reasoning and tool metadata declarations. Payload preserves the captured data,
+with JSON formatting, syntax highlighting, line wrapping, and a copy control.
+The capture badge distinguishes complete, partial, and unavailable request bodies.
 
 Counts describe matches, not unique leaked credentials. Request details contain
 the redacted payload, capped at 256 KiB by default, without secret samples, raw
-headers, or response text.
+headers, or response bodies.
 Bodies are omitted when redaction is disabled, partial masking is selected, or
 content is binary or encoded.
+
+Request details can retain allowlisted upstream error `event`, `type`, `code`,
+`message`, and `param` fields. These fields are always fully redacted, regardless
+of request redaction settings. `message` is capped at 2 KiB; `event` at 128 bytes;
+and `type`, `code`, and `param` at 256 bytes each, with all error fields under
+4 KiB total. Capture is disabled when `store_request_bodies: false` or
+`max_body_bytes: 0`. Error fields are stored with request details, evicted with
+them, and excluded from long-lived aggregates. Full upstream response bodies and
+raw headers are never retained.
+Transport failures retain the exception type and a safe reason, excluding raw
+exception text and URLs. Recognized LLM streams that end without a completion
+event show `stream_incomplete` when no more specific
+provider or transport error is available. Older records cannot recover these details.
+
+Native Responses requests preserve recognized encrypted reasoning and compaction
+envelopes unchanged. Typed image parts also preserve canonical PNG, JPEG, GIF,
+and WebP data URLs with matching binary signatures. Regular URLs remain scanned.
+Readable summaries, prompts, tool output text, and other fields still pass through
+redaction. The stored troubleshooting copy can apply
+additional credential masking; it is never reused as the forwarded request.
+An `invalid_encrypted_content` error identifies rejected encrypted conversation
+state, rather than a connection timeout. Existing corrupted history cannot be
+repaired from a truncated or redacted capture.
+
+Streams close upstream connections on client disconnect, including cancellation
+during cleanup. Native response bytes and upstream errors remain unchanged;
+PromptLatch does not replay partially delivered generations or invent a
+successful completion event. `target.timeout_seconds` limits upstream read
+inactivity, not the total generation time.
 
 - **TTFT:** elapsed time from request start to first generated output, rather than
   upstream response headers. Nonstreaming responses do not provide TTFT.

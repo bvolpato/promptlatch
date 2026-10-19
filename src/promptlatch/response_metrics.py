@@ -15,9 +15,9 @@ import brotli
 from pydantic_core import from_json
 
 from promptlatch.upstream_errors import (
-    ERROR_FIELD_BYTES,
     MAX_ERROR_SOURCE_BYTES,
     OVERSIZED_ERROR_FIELD,
+    PROVIDER_ERROR_FIELDS,
 )
 
 if sys.version_info >= (3, 14):
@@ -621,7 +621,7 @@ class ResponseMetrics:
             details = payload
             if isinstance(payload.get("detail"), str):
                 details = {**payload, "message": payload["detail"]}
-        for key in ERROR_FIELD_BYTES:
+        for key in PROVIDER_ERROR_FIELDS:
             if key in self._error_details:
                 continue
             value = (

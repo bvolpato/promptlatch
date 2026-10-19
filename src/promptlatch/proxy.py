@@ -243,6 +243,9 @@ async def forward_request(request: Request, path: str) -> Response:
             headers=headers,
             params=httpx.QueryParams(tuple(query_params)),
         )
+        if observation is not None:
+            observation.upstream_request(len(content))
+            upstream_request.extensions["trace"] = observation.trace
         upstream = await client.send(upstream_request, stream=True)
     except BaseException as exc:
         if close_client:
@@ -250,7 +253,7 @@ async def forward_request(request: Request, path: str) -> Response:
         if isinstance(exc, httpx.RequestError):
             if observation is not None:
                 observation.transport_error(exc)
-            raise HTTPException(status_code=502, detail=f"upstream request failed: {exc}") from exc
+            raise HTTPException(status_code=502, detail="upstream request failed") from None
         raise
 
     if observation is not None:
@@ -394,6 +397,10 @@ def _redactor_for_request(request: Request, settings: Settings) -> SecretRedacto
 
 
 async def _read_request_body(request: Request, limit: int) -> bytes:
+    limit_detail = (
+        f"request body too large (limit: {limit} bytes; increase "
+        "server.max_request_body_bytes or PROMPTLATCH_MAX_REQUEST_BODY_BYTES)"
+    )
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -401,7 +408,7 @@ async def _read_request_body(request: Request, limit: int) -> bytes:
             if parsed_length < 0:
                 raise ValueError
             if parsed_length > limit:
-                raise HTTPException(status_code=413, detail="request body too large")
+                raise HTTPException(status_code=413, detail=limit_detail)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid Content-Length header") from None
 
@@ -410,7 +417,7 @@ async def _read_request_body(request: Request, limit: int) -> bytes:
     async for chunk in request.stream():
         size += len(chunk)
         if size > limit:
-            raise HTTPException(status_code=413, detail="request body too large")
+            raise HTTPException(status_code=413, detail=limit_detail)
         chunks.append(chunk)
     return b"".join(chunks)
 

@@ -1,4 +1,5 @@
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from promptlatch.config import (
@@ -8,8 +9,26 @@ from promptlatch.config import (
     ServerConfig,
     Settings,
     TargetConfig,
+    config_template,
     load_settings,
 )
+
+
+def test_default_and_generated_request_limits_allow_image_heavy_sessions() -> None:
+    generated = Settings.model_validate(
+        yaml.safe_load(config_template("https://upstream.example/v1", "UPSTREAM_API_KEY"))
+    )
+
+    assert Settings().server.max_request_body_bytes == 128 * 1024**2
+    assert generated.server.max_request_body_bytes == 128 * 1024**2
+
+
+def test_request_limit_environment_overrides_existing_config(monkeypatch, tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("server:\n  max_request_body_bytes: 33554432\n", encoding="utf-8")
+    monkeypatch.setenv("PROMPTLATCH_MAX_REQUEST_BODY_BYTES", str(256 * 1024**2))
+
+    assert load_settings(config).server.max_request_body_bytes == 256 * 1024**2
 
 
 def test_server_api_key_env(monkeypatch, tmp_path) -> None:

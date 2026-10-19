@@ -35,9 +35,9 @@ promptlatch version
 Docker:
 
 ```bash
-docker pull ghcr.io/bvolpato/promptlatch:0.2.5
+docker pull ghcr.io/bvolpato/promptlatch:0.2.6
 docker run --rm --entrypoint promptlatch \
-  ghcr.io/bvolpato/promptlatch:0.2.5 version
+  ghcr.io/bvolpato/promptlatch:0.2.6 version
 ```
 
 Source checkout:

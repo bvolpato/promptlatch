@@ -31,6 +31,7 @@ from promptlatch.pricing import PricingCatalog
 from promptlatch.redaction import MASK, RedactionStats, SecretRedactor
 from promptlatch.request_previews import PREVIEW_FIELDS, extract_request_previews
 from promptlatch.response_metrics import ResponseMetrics
+from promptlatch.transport_diagnostics import UpstreamDiagnostics
 from promptlatch.upstream_errors import bound_error_details
 
 logger = logging.getLogger("promptlatch")
@@ -317,6 +318,7 @@ class RequestObservation:
         self.owner = owner
         self.started = time.perf_counter()
         self.metrics = ResponseMetrics(self.started)
+        self.upstream_diagnostics: UpstreamDiagnostics | None = None
         self.credentials = _known_secrets(request, owner.settings, owner._metadata_redactor)
         self.metadata_redactor = owner._metadata_redactor
         self.scope = ""
@@ -509,10 +511,23 @@ class RequestObservation:
                 ),
             )
 
+    def upstream_request(self, body_bytes: int) -> None:
+        self.upstream_diagnostics = UpstreamDiagnostics(body_bytes)
+
+    async def trace(self, name: str, info: dict[str, Any]) -> None:
+        if self.observer_failed or self.upstream_diagnostics is None:
+            return
+        try:
+            await self.upstream_diagnostics.trace(name, info)
+        except Exception:
+            self.upstream_diagnostics = None
+
     def response_headers(self, headers: Any, status_code: int) -> None:
         if self.observer_failed:
             return
         try:
+            if self.upstream_diagnostics is not None:
+                self.upstream_diagnostics.response_headers(headers, status_code)
             self.metrics.response_headers(headers, status_code)
         except Exception:
             self.observer_failed = True
@@ -521,6 +536,8 @@ class RequestObservation:
         if self.observer_failed:
             return
         try:
+            if self.upstream_diagnostics is not None:
+                self.upstream_diagnostics.transport_error(error)
             self.metrics.transport_error(type(error).__name__)
         except Exception:
             self.observer_failed = True
@@ -530,6 +547,8 @@ class RequestObservation:
         if self.observer_failed:
             return
         try:
+            if self.upstream_diagnostics is not None:
+                self.upstream_diagnostics.observe(len(body))
             self.metrics.feed_response(body, decoded=decoded)
         except Exception:
             # Observability cannot turn a valid upstream response into a proxy failure.
@@ -620,6 +639,15 @@ class RequestObservation:
         if not details or not config.store_request_bodies or not config.max_body_bytes:
             return None
         try:
+            if self.upstream_diagnostics is not None:
+                context = self.upstream_diagnostics.details()
+                if details.get("event") != "transport":
+                    context = {
+                        key: value
+                        for key, value in context.items()
+                        if key in {"upstream_request_id", "upstream_cf_ray"}
+                    }
+                details.update(context)
             redactor = SecretRedactor(
                 self.metadata_redactor.config.model_copy(
                     update={"engine": self.owner.settings.redaction.engine}

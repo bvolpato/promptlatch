@@ -8,16 +8,18 @@ from urllib.parse import parse_qsl
 import httpx
 import pytest
 import respx
+from fastapi import HTTPException, Request
 
 from promptlatch.config import (
     AuditConfig,
     CompatConfig,
+    ObservabilityConfig,
     RedactionConfig,
     ServerConfig,
     Settings,
     TargetConfig,
 )
-from promptlatch.proxy import create_app
+from promptlatch.proxy import _read_request_body, create_app
 from promptlatch.redaction import SecretRedactor
 from tests.fixtures import OPENAI_FAKE, PROVIDER_FIXTURES
 
@@ -696,7 +698,61 @@ async def test_request_body_size_is_limited_while_streaming() -> None:
         )
 
     assert response.status_code == 413
-    assert response.json()["detail"] == "request body too large"
+    detail = response.json()["detail"]
+    assert "limit: 1024 bytes" in detail
+    assert "server.max_request_body_bytes" in detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("size", [1024, 1025])
+@respx.mock
+async def test_request_body_size_boundary(chunked: bool, size: int) -> None:
+    settings = Settings(
+        server=ServerConfig(max_request_body_bytes=1024),
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(enabled=False),
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    body = b"x" * size
+
+    async def body_chunks():
+        yield body[:700]
+        yield body[700:]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(settings)), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "text/plain"},
+            content=body_chunks() if chunked else body,
+        )
+
+    assert response.status_code == (200 if size == 1024 else 413)
+    assert route.called is (size == 1024)
+    if route.called:
+        assert route.calls.last.request.content == body
+    else:
+        assert "PROMPTLATCH_MAX_REQUEST_BODY_BYTES" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_content_length_is_rejected_without_reading_body() -> None:
+    async def receive():
+        pytest.fail("oversized Content-Length must be rejected before reading the body")
+
+    request = Request({"type": "http", "headers": [(b"content-length", b"1025")]}, receive=receive)
+    with pytest.raises(HTTPException) as error:
+        await _read_request_body(request, 1024)
+
+    assert error.value.status_code == 413
+    assert "limit: 1024 bytes" in error.value.detail
 
 
 @pytest.mark.asyncio

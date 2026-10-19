@@ -187,9 +187,7 @@ async def test_metric_setup_failure_preserves_upstream_result(tmp_path, monkeypa
         if stage == "response_headers":
             assert response.content == wire
         else:
-            assert response.json() == {
-                "detail": "upstream request failed: synthetic upstream failure"
-            }
+            assert response.json() == {"detail": "upstream request failed"}
     finally:
         owner.close()
     reader = HistoryReader(path)

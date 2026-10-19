@@ -63,9 +63,13 @@ async def test_upstream_error_details_are_redacted_persisted_and_do_not_change_w
         "param": "input",
         "message": private_detail,
         "request": "IGNORED_ERROR_BODY_SENTINEL",
+        "transport_phase": "IGNORED_ERROR_BODY_SENTINEL",
     }
     status = 400 if kind == "http_json" else 200
     headers = {"content-type": "application/json" if kind == "http_json" else "text/event-stream"}
+    headers["x-request-id"] = "req_support-123"
+    headers["cf-ray"] = "1234567890abcdef-IAD"
+    headers["request-id"] = "ConfiguredOpaqueCredential"
     if kind == "responses" or kind == "gzip":
         payload = {
             "type": "response.failed",
@@ -114,6 +118,8 @@ async def test_upstream_error_details_are_redacted_persisted_and_do_not_change_w
     assert saved["upstream_error"]["code"] == "invalid_input"
     assert saved["upstream_error"]["type"] == "invalid_request_error"
     assert saved["upstream_error"]["param"] == "input"
+    assert saved["upstream_error"]["upstream_request_id"] == "req_support-123"
+    assert saved["upstream_error"]["upstream_cf_ray"] == "1234567890abcdef-IAD"
     assert saved["upstream_error"]["message"].startswith("FAILURE_DETAIL_SENTINEL")
     assert "[REDACTED_SECRET]" in saved["upstream_error"]["message"]
     assert saved["redactions"] == 0
@@ -224,7 +230,6 @@ async def test_error_details_redact_before_utf8_truncation_and_fail_closed(tmp_p
 
 
 @pytest.mark.asyncio
-@respx.mock
 @pytest.mark.parametrize("stage", ["send", "body", "stream"])
 async def test_transport_error_details_are_redacted_and_preserve_failures(tmp_path, stage):
     path = tmp_path / "history.sqlite3"
@@ -240,6 +245,7 @@ async def test_transport_error_details_are_redacted_and_preserve_failures(tmp_pa
     error = (
         httpx.ConnectError(private_detail) if stage == "send" else httpx.ReadError(private_detail)
     )
+    error.__cause__ = ConnectionResetError(104, private_detail)
 
     class FailedStream(httpx.AsyncByteStream):
         closed = False
@@ -252,26 +258,30 @@ async def test_transport_error_details_are_redacted_and_preserve_failures(tmp_pa
             self.closed = True
 
     stream = FailedStream()
-    route = respx.post("https://upstream.example/v1/responses")
-    if stage == "send":
-        route.mock(side_effect=error)
-    else:
-        route.mock(
-            return_value=httpx.Response(
-                200,
-                stream=stream,
-                headers={
-                    "content-type": "text/event-stream" if stage == "stream" else "application/json"
-                },
-            )
+    calls = []
+
+    async def respond(request):
+        calls.append(request)
+        if stage == "send":
+            raise error
+        return httpx.Response(
+            200,
+            stream=stream,
+            headers={
+                "content-type": "text/event-stream" if stage == "stream" else "application/json",
+                "x-request-id": "req_diagnostic-123",
+            },
         )
+
     app = create_app(settings)
     async with (
         app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.MockTransport(respond)) as upstream,
         httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://proxy"
         ) as client,
     ):
+        app.state.client = upstream
         request = client.post(
             "/v1/responses",
             headers={
@@ -290,13 +300,13 @@ async def test_transport_error_details_are_redacted_and_preserve_failures(tmp_pa
             response = await request
             assert response.status_code == 502
             assert response.json()["detail"] == (
-                f"upstream request failed: {private_detail}"
-                if stage == "send"
-                else "upstream response failed"
+                "upstream request failed" if stage == "send" else "upstream response failed"
             )
+            assert "TRANSPORT_DETAIL_SENTINEL" not in response.text
     saved = records(path)[0]
     assert saved["outcome"] == ("transport_error" if stage == "stream" else "http_error")
-    assert saved["upstream_error"] == {
+    details = saved["upstream_error"]
+    assert {key: details[key] for key in ("event", "type", "code", "message")} == {
         "event": "transport",
         "type": type(error).__name__,
         "code": "upstream_transport_error",
@@ -306,6 +316,22 @@ async def test_transport_error_details_are_redacted_and_preserve_failures(tmp_pa
             else "Upstream connection failed while reading the response."
         ),
     }
+    assert details["transport_phase"] == (
+        "send_request" if stage == "send" else "receive_response_body"
+    )
+    assert details["transport_cause"] == "ConnectionResetError"
+    assert details["transport_errno"] == "104"
+    assert int(details["request_body_bytes"]) > 0
+    expected_bytes = (
+        0
+        if stage == "send"
+        else len(b'data: {"type":"response.created"}\n\n' if stage == "stream" else b'{"output":')
+    )
+    assert int(details["response_bytes_observed"]) == expected_bytes
+    if stage != "send":
+        assert details["upstream_request_id"] == "req_diagnostic-123"
+        assert details["upstream_status"] == "200"
+    assert len(calls) == 1
     assert stage == "send" or stream.closed
     assert "upstream_error" not in HistoryReader(path).requests()["items"][0]
     assert "TRANSPORT_DETAIL_SENTINEL" not in json.dumps(HistoryReader(path).summary())
@@ -363,6 +389,67 @@ async def test_error_credentials_are_known_even_if_request_preparation_fails(tmp
     assert saved["upstream_error"]["message"] == "[REDACTED_SECRET] [REDACTED_SECRET]"
     assert saved["request_body"] is None
     assert saved["body_omitted_reason"] == "capture_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["headers", "stream"])
+async def test_real_transport_disconnect_records_phase_without_payloads(tmp_path, stage):
+    received = []
+
+    async def disconnect(reader, writer):
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            length = next(
+                int(line.split(b":", 1)[1])
+                for line in headers.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            )
+            received.append(await reader.readexactly(length))
+            if stage == "stream":
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                    b"Content-Length: 10000\r\nx-request-id: req_local-123\r\n\r\n"
+                    b'data: {"type":"response.created","private":"TRACE_PAYLOAD_SENTINEL"}\n\n'
+                )
+                await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(disconnect, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.target.default_base_url = f"http://127.0.0.1:{port}/v1"
+    app = create_app(settings)
+    async with (
+        server,
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(trust_env=False) as upstream,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        app.state.client = upstream
+        request = client.post("/v1/responses", json={"input": OPENAI_FAKE, "stream": True})
+        if stage == "stream":
+            with pytest.raises(httpx.RemoteProtocolError):
+                await request
+        else:
+            response = await request
+            assert response.status_code == 502
+            assert response.json() == {"detail": "upstream request failed"}
+    details = records(path)[0]["upstream_error"]
+    phase = "receive_response_headers" if stage == "headers" else "receive_response_body"
+    assert details["transport_phase"] == f"http11.{phase}"
+    assert float(details["transport_phase_ms"]) >= 0
+    assert details["transport_cause"] == "RemoteProtocolError"
+    assert int(details["request_body_bytes"]) == len(received[0])
+    assert OPENAI_FAKE.encode() not in received[0]
+    assert "TRACE_PAYLOAD_SENTINEL" not in json.dumps(details)
+    if stage == "stream":
+        assert details["upstream_request_id"] == "req_local-123"
+        assert int(details["response_bytes_observed"]) > 0
 
 
 @pytest.mark.asyncio

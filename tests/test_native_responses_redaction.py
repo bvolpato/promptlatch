@@ -1,3 +1,4 @@
+import base64
 import json
 
 import httpx
@@ -154,3 +155,42 @@ async def test_native_tool_image_data_remains_usable_while_text_is_redacted():
     output = json.loads(route.calls.last.request.content)["input"][0]["output"]
     assert output[0]["text"] == "[REDACTED_SECRET]"
     assert output[1]["image_url"] == data_url
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_native_image_request_larger_than_old_limit_is_redacted_and_forwarded():
+    image = b"\x89PNG\r\n\x1a\n" + bytes(24 * 1024**2)
+    data_url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(enabled=False),
+    )
+    route = respx.post("https://upstream.example/backend-api/codex/responses").mock(
+        return_value=httpx.Response(200, json={"output": []})
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(settings)), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/backend-api/codex/responses",
+            json={
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": OPENAI_FAKE},
+                            {"type": "input_image", "image_url": data_url},
+                        ],
+                    }
+                ]
+            },
+        )
+    assert response.status_code == 200
+    assert len(route.calls.last.request.content) > 32 * 1024**2
+    content = json.loads(route.calls.last.request.content)["input"][0]["content"]
+    assert content[0]["text"] == "[REDACTED_SECRET]"
+    assert content[1]["image_url"] == data_url

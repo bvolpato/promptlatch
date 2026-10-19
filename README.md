@@ -407,7 +407,7 @@ server:
   host: 127.0.0.1
   port: 8000
   api_key: null
-  max_request_body_bytes: 33554432
+  max_request_body_bytes: 134217728
 
 target:
   default_base_url: https://api.openai.com/v1
@@ -445,6 +445,12 @@ observability:
 
 Store only key tails in exact rules. Full masking is default; partial masking is
 available through `redact_mode: partial`.
+
+The default request limit is 128 MiB, including inline base64 images and conversation
+history. Override it with `server.max_request_body_bytes` or
+`PROMPTLATCH_MAX_REQUEST_BODY_BYTES`. Existing configs retain their explicit limit.
+This limit is separate from the 256 KiB history capture per request and the 1 GiB
+SQLite storage cap.
 
 ## Local monitoring
 
@@ -529,8 +535,12 @@ and `type`, `code`, and `param` at 256 bytes each, with all error fields under
 `max_body_bytes: 0`. Error fields are stored with request details, evicted with
 them, and excluded from long-lived aggregates. Full upstream response bodies and
 raw headers are never retained.
-Transport failures retain the exception type and a safe reason, excluding raw
-exception text and URLs. Recognized LLM streams that end without a completion
+Transport failures retain the exception type, safe reason, first failed transport
+phase and its elapsed milliseconds, socket cause and errno when available, request
+body size, and observed response byte count. Selected provider request IDs and
+Cloudflare ray IDs are bounded, validated, and fully redacted before storage.
+Raw exception text, URLs, and trace payloads are never retained or included in
+proxy-generated 502 responses. Recognized LLM streams that end without a completion
 event show `stream_incomplete` when no more specific
 provider or transport error is available. Older records cannot recover these details.
 
@@ -962,7 +972,7 @@ PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
 docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.5
+  ghcr.io/bvolpato/promptlatch:0.2.6
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz
@@ -1012,8 +1022,8 @@ helm uninstall promptlatch
 Release asset:
 
 ```bash
-helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.5/promptlatch-0.2.5.tgz
-helm install promptlatch ./promptlatch-0.2.5.tgz \
+helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.6/promptlatch-0.2.6.tgz
+helm install promptlatch ./promptlatch-0.2.6.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 ```

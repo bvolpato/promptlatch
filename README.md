@@ -546,9 +546,10 @@ provider or transport error is available. Older records cannot recover these det
 
 Native Responses requests preserve recognized encrypted reasoning and compaction
 envelopes unchanged. Typed image parts also preserve canonical PNG, JPEG, GIF,
-and WebP data URLs with matching binary signatures. Regular URLs remain scanned.
-Readable summaries, prompts, tool output text, and other fields still pass through
-redaction. The stored troubleshooting copy can apply
+and WebP data URLs with matching binary signatures. Typed canonical Fernet
+encrypted content parts in `agent_message.content` and tool outputs are preserved
+unchanged on forwarding. Readable text parts, summaries, prompts, and other fields
+still pass through redaction. The stored troubleshooting copy can apply
 additional credential masking; it is never reused as the forwarded request.
 An `invalid_encrypted_content` error identifies rejected encrypted conversation
 state, rather than a connection timeout. Existing corrupted history cannot be
@@ -972,7 +973,7 @@ PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
 docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.7
+  ghcr.io/bvolpato/promptlatch:0.2.8
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz
@@ -1022,8 +1023,8 @@ helm uninstall promptlatch
 Release asset:
 
 ```bash
-helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.7/promptlatch-0.2.7.tgz
-helm install promptlatch ./promptlatch-0.2.7.tgz \
+helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.8/promptlatch-0.2.8.tgz
+helm install promptlatch ./promptlatch-0.2.8.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 ```

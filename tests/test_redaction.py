@@ -342,6 +342,128 @@ def test_responses_opaque_capture_preserves_padded_envelope() -> None:
     assert result.stats.redactions == 0
 
 
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+def test_responses_agent_message_preserves_typed_encrypted_content_only(
+    engine: Literal["basic", "detect-secrets"],
+) -> None:
+    ciphertext = _opaque_response_fixture()
+    redactor = SecretRedactor(RedactionConfig(engine=engine))
+    payload = {
+        "input": [
+            {
+                "type": "agent_message",
+                "id": "amsg_fixture",
+                "author": "assistant",
+                "recipient": "all",
+                "content": [
+                    {"type": "input_text", "text": f"API_KEY={OPENAI_FAKE}"},
+                    {"type": "encrypted_content", "encrypted_content": ciphertext},
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "encrypted_content": ciphertext,
+                },
+            }
+        ]
+    }
+
+    result = redactor.redact_payload(payload, protocol="openai-responses")
+    message = result.value["input"][0]
+
+    assert message["content"][0]["text"] == "API_KEY=[REDACTED_SECRET]"
+    assert message["content"][1]["encrypted_content"] == ciphertext
+    assert message["internal_chat_message_metadata_passthrough"]["encrypted_content"] != ciphertext
+    assert result.stats.redactions >= 2
+
+
+@pytest.mark.parametrize("item_type", ["function_call_output", "custom_tool_call_output"])
+def test_responses_tool_output_preserves_typed_encrypted_content_part(item_type: str) -> None:
+    ciphertext = _opaque_response_fixture("OpaqueToolOutputRule0000")
+    redactor = SecretRedactor(
+        RedactionConfig(
+            engine="basic",
+            rules=[RuleConfig(type="exact", value="OpaqueToolOutputRule0000")],
+        )
+    )
+    image_url = _tiny_png_url()
+    payload = {
+        "input": [
+            {
+                "type": item_type,
+                "call_id": "call_fixture",
+                "output": [
+                    {"type": "input_text", "text": f"API_KEY={OPENAI_FAKE}"},
+                    {"type": "encrypted_content", "encrypted_content": ciphertext},
+                    {"type": "input_image", "image_url": image_url},
+                ],
+            }
+        ]
+    }
+
+    result = redactor.redact_payload(payload, protocol="openai-responses")
+    output = result.value["input"][0]["output"]
+
+    assert output[0]["text"] == "API_KEY=[REDACTED_SECRET]"
+    assert output[1]["encrypted_content"] == ciphertext
+    assert output[2]["image_url"] == image_url
+    assert result.stats.redactions >= 1
+
+
+def test_responses_encrypted_content_parts_stay_redacted_outside_known_contexts() -> None:
+    ciphertext = _opaque_response_fixture("OpaqueUnsafeContentRule0000")
+    malformed = ciphertext + "!"
+    redactor = SecretRedactor(
+        RedactionConfig(
+            engine="basic",
+            rules=[RuleConfig(type="exact", value="OpaqueUnsafeContentRule0000")],
+        )
+    )
+    payload = {
+        "input": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "encrypted_content", "encrypted_content": ciphertext}],
+            },
+            {
+                "type": "agent_message",
+                "content": [{"type": "unknown", "encrypted_content": ciphertext}],
+                "metadata": {
+                    "content": [{"type": "encrypted_content", "encrypted_content": ciphertext}]
+                },
+            },
+            {
+                "type": "agent_message",
+                "content": [
+                    {"type": "encrypted_content", "encrypted_content": ciphertext},
+                    {"type": "input_text", "text": ciphertext},
+                ],
+                "metadata": {
+                    "content": [{"type": "encrypted_content", "encrypted_content": ciphertext}]
+                },
+            },
+            {
+                "type": "agent_message",
+                "content": [{"type": "encrypted_content", "encrypted_content": malformed}],
+            },
+        ]
+    }
+
+    result = redactor.redact_payload(payload, protocol="openai-responses")
+    items = result.value["input"]
+
+    assert items[0]["content"][0]["encrypted_content"] != ciphertext
+    assert items[1]["content"][0]["encrypted_content"] != ciphertext
+    assert items[1]["metadata"]["content"][0]["encrypted_content"] != ciphertext
+    assert items[2]["content"][0]["encrypted_content"] == ciphertext
+    assert items[2]["content"][1]["text"] != ciphertext
+    assert items[2]["metadata"]["content"][0]["encrypted_content"] != ciphertext
+    assert items[3]["content"][0]["encrypted_content"] != malformed
+
+    generic = redactor.redact_payload(payload)
+    assert generic.value["input"][0]["content"][0]["encrypted_content"] != ciphertext
+    assert generic.value["input"][2]["content"][0]["encrypted_content"] != ciphertext
+
+
 def test_redacts_nested_openai_key() -> None:
     redactor = SecretRedactor(RedactionConfig(engine="basic"))
     payload = {

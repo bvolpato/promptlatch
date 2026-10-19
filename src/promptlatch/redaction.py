@@ -89,8 +89,12 @@ _PayloadContext = Literal[
     "responses-input-item",
     "responses-opaque-item",
     "responses-message",
+    "responses-agent-message",
+    "responses-agent-message-content",
     "responses-tool-output",
+    "responses-tool-output-content",
     "responses-image-part",
+    "responses-encrypted-content-part",
 ]
 _IMAGE_MIME_SIGNATURES = {
     "data:image/png;base64": (b"\x89PNG\r\n\x1a\n",),
@@ -141,15 +145,23 @@ def _is_response_image_data(value: Any) -> bool:
 
 
 def _response_object_context(value: Any, context: _PayloadContext | None) -> _PayloadContext | None:
-    if context not in ("responses-input-item", "responses-image-part"):
-        return context
     item_type = value.get("type") if isinstance(value, Mapping) else getattr(value, "type", None)
     if context == "responses-image-part":
         return context if item_type == "input_image" else None
+    if context in ("responses-agent-message-content", "responses-tool-output-content"):
+        if item_type == "encrypted_content":
+            return "responses-encrypted-content-part"
+        if context == "responses-tool-output-content" and item_type == "input_image":
+            return "responses-image-part"
+        return None
+    if context != "responses-input-item":
+        return context
     if item_type in ("reasoning", "compaction"):
         return "responses-opaque-item"
     if item_type in ("function_call_output", "custom_tool_call_output"):
         return "responses-tool-output"
+    if item_type == "agent_message":
+        return "responses-agent-message"
     role = value.get("role") if isinstance(value, Mapping) else getattr(value, "role", None)
     if item_type in (None, "message") and role in ("user", "assistant", "system", "developer"):
         return "responses-message"
@@ -863,7 +875,7 @@ class SecretRedactor:
         context: _PayloadContext | None = None,
     ) -> Any:
         if (
-            context == "responses-opaque-item"
+            context in ("responses-opaque-item", "responses-encrypted-content-part")
             and key == "encrypted_content"
             and _is_opaque_response_content(value)
         ):
@@ -879,10 +891,16 @@ class SecretRedactor:
         child_context: _PayloadContext | None = None
         if context == "responses-request" and key == "input":
             child_context = "responses-input-item"
+        elif context == "responses-agent-message" and key == "content":
+            child_context = "responses-agent-message-content"
         elif (context == "responses-message" and key == "content") or (
             context == "responses-tool-output" and key == "output"
         ):
-            child_context = "responses-image-part"
+            child_context = (
+                "responses-image-part"
+                if context == "responses-message"
+                else "responses-tool-output-content"
+            )
         if child_context is not None and isinstance(value, (list, tuple)):
             items = [self._walk(item, stats, context=child_context) for item in value]
             return tuple(items) if isinstance(value, tuple) else items

@@ -115,6 +115,81 @@ async def test_other_endpoints_do_not_exempt_named_encrypted_fields():
 
 @pytest.mark.asyncio
 @respx.mock
+@pytest.mark.parametrize(
+    "item_type", ["agent_message", "function_call_output", "custom_tool_call_output"]
+)
+async def test_native_codex_preserves_encrypted_content_parts(tmp_path, item_type):
+    cipher = Fernet(Fernet.generate_key())
+    plaintext = b"Synthetic encrypted agent or tool message."
+    encrypted = cipher.encrypt(plaintext).decode()
+    fragment = encrypted[40:72]
+    content = [
+        {"type": "input_text", "text": OPENAI_FAKE},
+        {"type": "encrypted_content", "encrypted_content": encrypted},
+    ]
+    if item_type == "agent_message":
+        item = {"type": item_type, "author": "agent", "recipient": "parent", "content": content}
+        content_key = "content"
+    else:
+        item = {"type": item_type, "call_id": "call_fixture", "output": content}
+        content_key = "output"
+    database = tmp_path / "history.sqlite3"
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic", rules=[RuleConfig(type="exact", value=fragment)]),
+        observability=ObservabilityConfig(database_path=database, pricing_enabled=False),
+    )
+    completed = (
+        b"event: response.completed\n"
+        b'data: {"type":"response.completed","response":{"status":"completed",'
+        b'"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}\n\n'
+    )
+    path = "/backend-api/codex/responses"
+    route = respx.post("https://upstream.example" + path).mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=completed
+        )
+    )
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        response = await client.post(
+            path,
+            json={
+                "model": "test",
+                "stream": True,
+                "input": [item, {"role": "user", "content": OPENAI_FAKE}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.content == completed
+    forwarded = json.loads(route.calls.last.request.content)
+    retained = forwarded["input"][0][content_key]
+    assert retained[1]["encrypted_content"] == encrypted
+    assert cipher.decrypt(retained[1]["encrypted_content"].encode()) == plaintext
+    assert retained[0]["text"] == "[REDACTED_SECRET]"
+    assert forwarded["input"][1]["content"] == "[REDACTED_SECRET]"
+
+    reader = HistoryReader(database)
+    stored = reader.request(reader.requests()["items"][0]["request_id"])
+    assert stored is not None
+    assert OPENAI_FAKE not in stored["request_body"]
+    assert fragment not in stored["request_body"]
+    assert stored["outcome"] == "success"
+    assert stored["input_tokens"] == 10
+    assert stored["output_tokens"] == 2
+    assert stored["redactions"] == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_native_tool_image_data_remains_usable_while_text_is_redacted():
     encoded = (
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lE"

@@ -177,14 +177,15 @@ def create_dashboard_app(
 
     @app.get("/assets/{name}", include_in_schema=False)
     async def asset(name: str) -> FileResponse:
-        media_type = {
-            "app.js": "text/javascript",
-            "style.css": "text/css",
-            "favicon.svg": "image/svg+xml",
+        resource = {
+            "app.js": (_ASSETS / "app.js", "text/javascript"),
+            "style.css": (_ASSETS / "style.css", "text/css"),
+            "favicon.svg": (_ASSETS / "favicon.svg", "image/svg+xml"),
         }.get(name)
-        if media_type is None:
+        if resource is None:
             raise HTTPException(status_code=404, detail="Not found")
-        return FileResponse(_ASSETS / name, media_type=media_type)
+        path, media_type = resource
+        return FileResponse(path, media_type=media_type)
 
     protected = [Depends(authorize)]
 

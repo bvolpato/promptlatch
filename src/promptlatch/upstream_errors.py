@@ -15,6 +15,8 @@ ERROR_FIELD_BYTES = {
     "transport_phase_ms": 32,
     "transport_cause": 64,
     "transport_errno": 16,
+    "connection_origin": 8,
+    "tls_reason": 64,
     "request_body_bytes": 32,
     "response_bytes_observed": 32,
     "upstream_status": 3,

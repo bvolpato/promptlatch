@@ -488,6 +488,106 @@ def test_terminal_failures_override_http_success(payload: dict[str, Any], expect
 
 
 @pytest.mark.parametrize(
+    "payload,reason",
+    [
+        (
+            {
+                "type": "response.incomplete",
+                "response": {"incomplete_details": {"reason": "max_output_tokens"}},
+            },
+            "max_output_tokens",
+        ),
+        (
+            {
+                "type": "response.incomplete",
+                "response": {"incomplete_details": {"reason": "max_messages"}},
+            },
+            "max_messages",
+        ),
+        (
+            {
+                "type": "response.incomplete",
+                "response": {"incomplete_details": {"reason": "steered"}},
+            },
+            "steered",
+        ),
+        (
+            {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}},
+            "content_filter",
+        ),
+        ({"choices": [{"finish_reason": "length"}]}, "max_output_tokens"),
+        ({"choices": [{"finish_reason": "content_filter"}]}, "content_filter"),
+        ({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}, "max_output_tokens"),
+        (
+            {"type": "message_delta", "delta": {"stop_reason": "model_context_window_exceeded"}},
+            "model_context_window_exceeded",
+        ),
+        (
+            {"status": "incomplete", "incomplete_details": {"reason": "PRIVATE_REASON_SENTINEL"}},
+            None,
+        ),
+    ],
+)
+@pytest.mark.parametrize("buffered", [False, True])
+def test_incomplete_diagnostics_preserve_usage_without_reflecting_unknown_reasons(
+    payload, reason, buffered
+):
+    envelope = payload.get("response", payload)
+    envelope["usage"] = {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}
+    metrics = ResponseMetrics(1)
+    if buffered:
+        metrics.observe_body(json.dumps(payload).encode())
+    else:
+        metrics.feed(event(payload))
+        metrics.feed(
+            event({"type": "message_stop"})
+            if payload.get("type") == "message_delta"
+            else b"data: [DONE]\n\n"
+        )
+        metrics.finish_stream()
+    snapshot = metrics.snapshot()
+    assert snapshot["outcome_override"] == "incomplete"
+    assert snapshot["total_tokens"] == 13
+    details = metrics.take_error_details()
+    assert details["type"] == "incomplete_response"
+    assert details["code"] == "upstream_incomplete" + ("_" + reason if reason else "")
+    assert "PRIVATE_REASON_SENTINEL" not in json.dumps(details)
+    assert metrics.take_error_details() == {}
+
+
+@pytest.mark.parametrize("failure", ["provider", "transport"])
+def test_actual_errors_take_precedence_over_incomplete_diagnostics(failure):
+    metrics = ResponseMetrics(1)
+    metrics.feed(
+        event(
+            {
+                "type": "response.incomplete",
+                "response": {"incomplete_details": {"reason": "max_output_tokens"}},
+            }
+        )
+    )
+    if failure == "provider":
+        metrics.feed(
+            event({"type": "response.failed", "response": {"error": {"code": "server_error"}}})
+        )
+    else:
+        metrics.transport_error("ReadError")
+    metrics.finish_stream(complete=False)
+    assert metrics.take_error_details()["code"] == (
+        "server_error" if failure == "provider" else "upstream_transport_error"
+    )
+
+
+def test_missing_anthropic_terminal_event_takes_precedence_over_reported_stop_reason():
+    metrics = ResponseMetrics(1)
+    metrics.feed(event({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}))
+    metrics.finish_stream()
+
+    assert metrics.snapshot()["metrics_incomplete"] is True
+    assert metrics.take_error_details()["code"] == "stream_incomplete"
+
+
+@pytest.mark.parametrize(
     "payload,expected",
     [
         (
@@ -649,6 +749,41 @@ def test_provider_error_details_take_precedence_over_transport_fallback(buffered
             "TooManyRedirects",
             "TooManyRedirects",
             "The upstream response exceeded the redirect limit.",
+        ),
+        (
+            "SSLError",
+            "SSLError",
+            "Upstream TLS communication failed.",
+        ),
+        (
+            "SSLCertVerificationError",
+            "SSLCertVerificationError",
+            "Upstream TLS certificate verification failed.",
+        ),
+        (
+            "SSLEOFError",
+            "SSLEOFError",
+            "Upstream TLS connection ended unexpectedly.",
+        ),
+        (
+            "SSLZeroReturnError",
+            "SSLZeroReturnError",
+            "Upstream TLS connection closed before completion.",
+        ),
+        (
+            "SSLWantReadError",
+            "SSLWantReadError",
+            "Upstream TLS operation failed while reading data.",
+        ),
+        (
+            "SSLWantWriteError",
+            "SSLWantWriteError",
+            "Upstream TLS operation failed while writing data.",
+        ),
+        (
+            "SSLSyscallError",
+            "SSLSyscallError",
+            "Upstream TLS socket operation failed.",
         ),
         ("OpaquePrivateSubclass", "RequestError", "Upstream request failed."),
     ],

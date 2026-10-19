@@ -905,7 +905,7 @@
 
   function upstreamErrorNotice(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    const fields = ["event", "type", "code", "message", "param", "transport_phase", "transport_phase_ms", "transport_cause", "transport_errno", "request_body_bytes", "response_bytes_observed", "upstream_status", "upstream_request_id", "upstream_cf_ray"]
+    const fields = ["event", "type", "code", "message", "param", "transport_phase", "transport_phase_ms", "transport_cause", "transport_errno", "connection_origin", "tls_reason", "request_body_bytes", "response_bytes_observed", "upstream_status", "upstream_request_id", "upstream_cf_ray"]
       .filter((name) => typeof value[name] === "string" && value[name].trim())
       .map((name) => [name, value[name]]);
     if (!fields.length) return null;
@@ -914,7 +914,7 @@
     notice.tabIndex = 0;
     notice.setAttribute("role", "group");
     notice.setAttribute("aria-label", "Upstream error details");
-    const title = value.code === "stream_incomplete" ? "Stream ended early" : value.event === "transport" ? "Upstream connection failed" : "Upstream error";
+    const title = value.type === "incomplete_response" ? "Generation incomplete" : value.code === "stream_incomplete" ? "Stream ended early" : value.event === "transport" ? "Upstream connection failed" : "Upstream error";
     notice.append(element("strong", "upstream-error-title", title));
     const list = element("dl", "upstream-error-fields");
     for (const [name, fieldValue] of fields) {

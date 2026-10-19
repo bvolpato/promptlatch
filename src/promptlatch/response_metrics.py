@@ -82,11 +82,26 @@ _TRANSPORT_REASONS = {
     "UnsupportedProtocol": "The upstream URL protocol is unsupported.",
     "DecodingError": "The upstream response could not be decoded.",
     "TooManyRedirects": "The upstream response exceeded the redirect limit.",
+    "SSLError": "Upstream TLS communication failed.",
+    "SSLCertVerificationError": "Upstream TLS certificate verification failed.",
+    "SSLEOFError": "Upstream TLS connection ended unexpectedly.",
+    "SSLZeroReturnError": "Upstream TLS connection closed before completion.",
+    "SSLWantReadError": "Upstream TLS operation failed while reading data.",
+    "SSLWantWriteError": "Upstream TLS operation failed while writing data.",
+    "SSLSyscallError": "Upstream TLS socket operation failed.",
     "TimeoutException": "The upstream request timed out.",
     "NetworkError": "The upstream network connection failed.",
     "ProtocolError": "The upstream connection failed HTTP protocol validation.",
     "TransportError": "Upstream transport failed.",
     "RequestError": "Upstream request failed.",
+}
+_INCOMPLETE_REASONS = {
+    "max_output_tokens": "The provider stopped generation at the output-token limit.",
+    "max_messages": "The provider stopped generation at the message limit.",
+    "content_filter": "The provider stopped generation because of content filtering.",
+    "steered": "The provider stopped generation after a steering request.",
+    "model_context_window_exceeded": "The provider stopped generation at the context-window limit.",
+    "cancelled": "The provider reported that generation was cancelled.",
 }
 _ANTHROPIC_STREAM_EVENTS = {
     "message_start",
@@ -154,6 +169,7 @@ class ResponseMetrics:
         self._http_error = False
         self._error_details: dict[str, str] = {}
         self._transport_error_details: dict[str, str] = {}
+        self._incomplete_details: dict[str, str] = {}
 
     def response_headers(self, headers: Mapping[str, str], status_code: int) -> None:
         self._http_error = status_code >= 400
@@ -272,10 +288,24 @@ class ResponseMetrics:
 
     def take_error_details(self) -> dict[str, str]:
         """Consume bounded raw error fields; callers must redact before retaining them."""
-        details = self._error_details or self._transport_error_details
+        details = self._error_details or self._transport_error_details or self._incomplete_details
         self._error_details = {}
         self._transport_error_details = {}
+        self._incomplete_details = {}
         return details
+
+    def _capture_incomplete(self, event: str, reason: Any = None) -> None:
+        if self._incomplete_details and self._incomplete_details["code"] != "upstream_incomplete":
+            return
+        known = isinstance(reason, str) and reason in _INCOMPLETE_REASONS
+        self._incomplete_details = {
+            "event": event,
+            "type": "incomplete_response",
+            "code": "upstream_incomplete_" + reason if known else "upstream_incomplete",
+            "message": _INCOMPLETE_REASONS[reason]
+            if known
+            else "The provider reported an incomplete generation without a recognized stop reason.",
+        }
 
     def transport_error(self, error_type: str) -> None:
         """Retain an allowlisted class and static reason, never exception text."""
@@ -572,6 +602,11 @@ class ResponseMetrics:
             event_type == "response.incomplete" or status in {"incomplete", "cancelled"}
         ) and self._outcome != "stream_error":
             self._outcome = "incomplete"
+            incomplete = envelope.get("incomplete_details")
+            reason = incomplete.get("reason") if isinstance(incomplete, dict) else None
+            self._capture_incomplete(
+                "response.incomplete", "cancelled" if status == "cancelled" else reason
+            )
         if (
             error is not None
             or failed
@@ -609,6 +644,9 @@ class ResponseMetrics:
                 and self._outcome != "stream_error"
             ):
                 self._outcome = "incomplete"
+                self._capture_incomplete(
+                    "message_delta", "max_output_tokens" if stop == "max_tokens" else stop
+                )
         if streaming and meaningful:
             self._saw_output = True
 
@@ -648,6 +686,9 @@ class ResponseMetrics:
                     self._terminal = True
                     if finish in {"length", "content_filter"} and self._outcome != "stream_error":
                         self._outcome = "incomplete"
+                        self._capture_incomplete(
+                            "chat.completion", "max_output_tokens" if finish == "length" else finish
+                        )
                 delta = choice.get("delta")
                 if isinstance(delta, dict):
                     if delta.get("audio"):

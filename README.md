@@ -535,14 +535,21 @@ and `type`, `code`, and `param` at 256 bytes each, with all error fields under
 `max_body_bytes: 0`. Error fields are stored with request details, evicted with
 them, and excluded from long-lived aggregates. Full upstream response bodies and
 raw headers are never retained.
-Transport failures retain the exception type, safe reason, first failed transport
-phase and its elapsed milliseconds, socket cause and errno when available, request
-body size, and observed response byte count. Selected provider request IDs and
+Transport failures, including TLS and socket errors, retain the exception type,
+safe reason, first failed transport phase and elapsed milliseconds, socket cause
+and errno when available, request body size, and observed response byte count.
+Diagnostics identify connection setup as `new`. For HTTP/1, they infer `reused`
+when request headers start without a connect phase. Known TLS reason constants
+are retained; arbitrary exception text is excluded. These fields help investigate
+connection failures; they do not establish the cause or eliminate resets.
+Selected provider request IDs and
 Cloudflare ray IDs are bounded, validated, and fully redacted before storage.
 Raw exception text, URLs, and trace payloads are never retained or included in
 proxy-generated 502 responses. Recognized LLM streams that end without a completion
 event show `stream_incomplete` when no more specific
-provider or transport error is available. Older records cannot recover these details.
+provider or transport error is available. Provider-declared incomplete generations
+retain known stop reasons, including output limits and content filtering, without
+being classified as connection failures. Older records cannot recover these details.
 
 Native Responses requests preserve recognized encrypted reasoning and compaction
 envelopes unchanged. Typed image parts also preserve canonical PNG, JPEG, GIF,
@@ -973,7 +980,7 @@ PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
 docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.8
+  ghcr.io/bvolpato/promptlatch:0.2.9
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz
@@ -1023,8 +1030,8 @@ helm uninstall promptlatch
 Release asset:
 
 ```bash
-helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.8/promptlatch-0.2.8.tgz
-helm install promptlatch ./promptlatch-0.2.8.tgz \
+helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.9/promptlatch-0.2.9.tgz
+helm install promptlatch ./promptlatch-0.2.9.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 ```

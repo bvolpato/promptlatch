@@ -20,7 +20,6 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import uuid4
 
-import httpx
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -532,7 +531,7 @@ class RequestObservation:
         except Exception:
             self.observer_failed = True
 
-    def transport_error(self, error: httpx.RequestError) -> None:
+    def transport_error(self, error: Exception) -> None:
         if self.observer_failed:
             return
         try:

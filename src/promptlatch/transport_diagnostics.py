@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import ssl
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -45,6 +46,9 @@ _CAUSES = frozenset(
         "SSLEOFError",
         "SSLZeroReturnError",
         "SSLCertVerificationError",
+        "SSLWantReadError",
+        "SSLWantWriteError",
+        "SSLSyscallError",
         "ConnectError",
         "ReadError",
         "WriteError",
@@ -66,6 +70,16 @@ _CAUSES = frozenset(
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_-]+", flags=re.ASCII)
 _MAX_NUMBER = 2**63 - 1
 _MAX_CHAIN = 16
+_TLS_REASONS = frozenset(
+    {
+        "SSLV3_ALERT_BAD_RECORD_MAC",
+        "DECRYPTION_FAILED_OR_BAD_RECORD_MAC",
+        "CERTIFICATE_VERIFY_FAILED",
+        "UNEXPECTED_EOF_WHILE_READING",
+        "WRONG_VERSION_NUMBER",
+        "APPLICATION_DATA_AFTER_CLOSE_NOTIFY",
+    }
+)
 
 
 class UpstreamDiagnostics:
@@ -90,6 +104,14 @@ class UpstreamDiagnostics:
         if self._failed or not separator or phase not in _PHASES:
             return
         if event == "started":
+            if phase in (
+                "connection.connect_tcp",
+                "connection.connect_unix_socket",
+                "socks.connect_tcp",
+            ):
+                self._values["connection_origin"] = "new"
+            elif phase == "http11.send_request_headers":
+                self._values.setdefault("connection_origin", "reused")
             self._phase = phase
             self._phase_started = self._clock()
             self._phase_ms = 0.0
@@ -146,6 +168,10 @@ class UpstreamDiagnostics:
                 number = OSError.__dict__["errno"].__get__(current)
                 if type(number) is int and 1 <= number <= 65535:
                     error_number = number
+            if isinstance(current, ssl.SSLError):
+                reason = getattr(current, "reason", None)
+                if type(reason) is str and reason in _TLS_REASONS:
+                    self._values.setdefault("tls_reason", reason)
             chained = BaseException.__getattribute__(current, "__cause__")
             current = (
                 chained

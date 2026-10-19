@@ -1,5 +1,6 @@
 import errno
 import json
+import ssl
 
 import httpcore
 import httpx
@@ -93,6 +94,22 @@ def test_known_socket_cause_and_context_are_recorded() -> None:
     assert diagnostics.details()["transport_errno"] == str(errno.ECONNRESET)
 
 
+@pytest.mark.parametrize("reason", ["SSLV3_ALERT_BAD_RECORD_MAC", "private-secret", None])
+def test_tls_reason_retains_only_known_protocol_constants(reason):
+    error = ssl.SSLError("private TLS message")
+    error.reason = reason
+    outer = httpx.ReadError("private wrapper")
+    outer.__cause__ = error
+    diagnostics = UpstreamDiagnostics(1)
+    diagnostics.transport_error(outer)
+
+    if reason == "SSLV3_ALERT_BAD_RECORD_MAC":
+        assert diagnostics.details()["tls_reason"] == reason
+    else:
+        assert "tls_reason" not in diagnostics.details()
+    assert "private" not in json.dumps(diagnostics.details())
+
+
 def test_unknown_wrapper_context_does_not_replace_known_socket_cause() -> None:
     root = ConnectionResetError(errno.ECONNRESET, "private socket detail")
     root.__context__ = RuntimeError("private wrapper detail")
@@ -143,6 +160,41 @@ async def test_unknown_trace_data_is_not_retained() -> None:
 
     assert diagnostics.details()["transport_phase"] == "send_request"
     assert "private-secret" not in json.dumps(diagnostics.details())
+
+
+@pytest.mark.parametrize(
+    "connect_phase",
+    ["connection.connect_tcp", "connection.connect_unix_socket", "socks.connect_tcp"],
+)
+async def test_new_connection_is_identified_without_retaining_trace_addresses(connect_phase):
+    diagnostics = UpstreamDiagnostics(1)
+    await diagnostics.trace(connect_phase + ".started", {"host": "private-host", "port": 443})
+    await diagnostics.trace("http11.send_request_headers.started", {"request": "private-request"})
+    diagnostics.transport_error(httpx.ReadError("private-error"))
+
+    assert diagnostics.details()["connection_origin"] == "new"
+    assert "private" not in json.dumps(diagnostics.details())
+
+
+async def test_http11_reuse_is_identified_by_request_headers_without_a_connect_span():
+    diagnostics = UpstreamDiagnostics(1)
+    await diagnostics.trace("http11.send_request_headers.started", {})
+    await diagnostics.trace("http11.receive_response_headers.started", {})
+    await diagnostics.trace(
+        "http11.receive_response_headers.failed",
+        {"exception": ConnectionResetError(104, "private")},
+    )
+    await diagnostics.trace("connection.connect_tcp.started", {"host": "private"})
+
+    assert diagnostics.details()["connection_origin"] == "reused"
+
+
+async def test_http2_without_connect_span_does_not_assume_a_reused_connection():
+    diagnostics = UpstreamDiagnostics(1)
+    await diagnostics.trace("http2.send_request_headers.started", {})
+    diagnostics.transport_error(httpx.ReadError("private"))
+
+    assert "connection_origin" not in diagnostics.details()
 
 
 @pytest.mark.parametrize("request_id", ["req_123-abc", "a" * 128])

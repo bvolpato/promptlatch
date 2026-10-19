@@ -246,11 +246,17 @@ async def forward_request(request: Request, path: str) -> Response:
         if observation is not None:
             observation.upstream_request(len(content))
             upstream_request.extensions["trace"] = observation.trace
+    except BaseException:
+        if close_client:
+            await _close_upstream(None, close_client, client)
+        raise
+
+    try:
         upstream = await client.send(upstream_request, stream=True)
     except BaseException as exc:
         if close_client:
             await _close_upstream(None, close_client, client)
-        if isinstance(exc, httpx.RequestError):
+        if isinstance(exc, (httpx.RequestError, OSError)):
             if observation is not None:
                 observation.transport_error(exc)
             raise HTTPException(status_code=502, detail="upstream request failed") from None
@@ -293,7 +299,7 @@ async def forward_request(request: Request, path: str) -> Response:
             if transform_response
             else await _read_raw_upstream(upstream, observation=observation)
         )
-    except httpx.RequestError as exc:
+    except (httpx.RequestError, OSError) as exc:
         if observation is not None:
             observation.transport_error(exc)
         raise HTTPException(status_code=502, detail="upstream response failed") from None
@@ -757,7 +763,7 @@ async def _stream_upstream(
             if observation is not None:
                 observation.observe(chunk, streaming=True, decoded=decoded)
             yield chunk
-    except httpx.RequestError as exc:
+    except (httpx.RequestError, OSError) as exc:
         if observation is not None:
             observation.transport_error(exc)
         raise

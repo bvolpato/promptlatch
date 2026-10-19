@@ -47,6 +47,48 @@ def records(path: Path) -> list[dict]:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_provider_incomplete_reason_is_retained_without_changing_wire_or_outcome(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    wire = (
+        b"data: "
+        + json.dumps(
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13},
+                    "output": "PRIVATE_RESPONSE_SENTINEL",
+                },
+            }
+        ).encode()
+        + b"\n\n"
+    )
+    respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=wire
+        )
+    )
+    app = create_app(settings_for(path))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        response = await client.post("/v1/responses", json={"model": "fixture", "input": "hello"})
+        assert response.status_code == 200
+        assert response.content == wire
+    saved = records(path)[0]
+    assert saved["outcome"] == "interrupted"
+    assert saved["total_tokens"] == 13
+    assert saved["upstream_error"]["type"] == "incomplete_response"
+    assert saved["upstream_error"]["code"] == "upstream_incomplete_max_output_tokens"
+    assert "PRIVATE_RESPONSE_SENTINEL" not in json.dumps(saved)
+
+
+@pytest.mark.asyncio
+@respx.mock
 @pytest.mark.parametrize("kind", ["responses", "anthropic", "named", "http_json", "gzip"])
 async def test_upstream_error_details_are_redacted_persisted_and_do_not_change_wire(tmp_path, kind):
     path = tmp_path / "history.sqlite3"
@@ -442,6 +484,7 @@ async def test_real_transport_disconnect_records_phase_without_payloads(tmp_path
     details = records(path)[0]["upstream_error"]
     phase = "receive_response_headers" if stage == "headers" else "receive_response_body"
     assert details["transport_phase"] == f"http11.{phase}"
+    assert details["connection_origin"] == "new"
     assert float(details["transport_phase_ms"]) >= 0
     assert details["transport_cause"] == "RemoteProtocolError"
     assert int(details["request_body_bytes"]) == len(received[0])

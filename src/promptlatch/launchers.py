@@ -197,6 +197,8 @@ def _proxy_address(value: str) -> ProxyAddress:
             raise LauncherError(
                 "PROMPTLATCH_PROXY_URL must use localhost or a loopback IP"
             ) from None
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
         if not address.is_loopback:
             raise LauncherError("PROMPTLATCH_PROXY_URL must use localhost or a loopback IP")
 

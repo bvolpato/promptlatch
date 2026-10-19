@@ -84,6 +84,8 @@ def _codex_effective_config(arguments: list[str]) -> dict[str, Any]:
     [
         "https://api.openai.com",
         "http://192.168.1.8:8000",
+        "http://[::ffff:192.168.1.8]:8000",
+        "http://[::ffff:8.8.8.8]:8000",
         "http://evil.localhost:8000",
         "http://localhost.evil:8000",
         "http://user:pass@localhost:8000",

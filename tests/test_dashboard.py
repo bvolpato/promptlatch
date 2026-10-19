@@ -107,6 +107,7 @@ async def test_dashboard_auth_and_static_shell(tmp_path: Path) -> None:
         {"Host": "localhost.attacker.example"},
         {"Host": "127.0.0.1.attacker.example"},
         {"Host": "192.168.1.1"},
+        {"Host": "[::ffff:192.168.1.1]"},
         {"Host": "localhost:65536"},
         {"Host": "localhost:0"},
         {"Origin": "https://attacker.example"},
@@ -129,7 +130,9 @@ async def test_dashboard_rejects_foreign_browser_origins(tmp_path: Path, headers
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "127.0.0.2", "[::1]"])
+@pytest.mark.parametrize(
+    "host", ["localhost", "127.0.0.1", "127.0.0.2", "[::1]", "[::ffff:127.0.0.1]"]
+)
 async def test_dashboard_accepts_local_same_origin(tmp_path: Path, host: str) -> None:
     app = create_dashboard_app(tmp_path / "missing.sqlite3", "dashboard-test-token")
     origin = f"http://{host}:8001"

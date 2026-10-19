@@ -57,7 +57,7 @@ def _valid_host(host: str, loopback_only: bool) -> bool:
     if address.startswith("["):
         with suppress(ValueError):
             parsed = ipaddress.IPv6Address(address[1:-1])
-            return not loopback_only or parsed.is_loopback
+            return not loopback_only or (parsed.ipv4_mapped or parsed).is_loopback
         return False
     if len(address) > 253 or any(not _DNS_LABEL.fullmatch(label) for label in address.split(".")):
         return False

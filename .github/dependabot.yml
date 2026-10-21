@@ -10,7 +10,7 @@ updates:
       default-days: 7
       semver-major-days: 30
       semver-minor-days: 7
-      semver-patch-days: 3
+      semver-patch-days: 7
     groups:
       python-dependencies:
         patterns: ["*"]
@@ -23,7 +23,7 @@ updates:
       default-days: 7
       semver-major-days: 30
       semver-minor-days: 7
-      semver-patch-days: 3
+      semver-patch-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -36,7 +36,7 @@ updates:
       default-days: 7
       semver-major-days: 30
       semver-minor-days: 7
-      semver-patch-days: 3
+      semver-patch-days: 7
     ignore:
       - dependency-name: python
         update-types:

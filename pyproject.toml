@@ -77,5 +77,3 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-[tool.uv]
-exclude-newer = "7 days"

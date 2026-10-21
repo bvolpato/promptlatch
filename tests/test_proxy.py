@@ -706,10 +706,11 @@ async def test_request_body_size_is_limited_while_streaming() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize("size", [1024, 1025])
+@pytest.mark.parametrize("limit", [0, 1024])
 @respx.mock
-async def test_request_body_size_boundary(chunked: bool, size: int) -> None:
+async def test_request_body_size_boundary(chunked: bool, size: int, limit: int) -> None:
     settings = Settings(
-        server=ServerConfig(max_request_body_bytes=1024),
+        server=ServerConfig(max_request_body_bytes=limit),
         target=TargetConfig(
             default_base_url="https://upstream.example/v1", block_private_targets=False
         ),
@@ -734,8 +735,9 @@ async def test_request_body_size_boundary(chunked: bool, size: int) -> None:
             content=body_chunks() if chunked else body,
         )
 
-    assert response.status_code == (200 if size == 1024 else 413)
-    assert route.called is (size == 1024)
+    accepted = not limit or size <= limit
+    assert response.status_code == (200 if accepted else 413)
+    assert route.called is accepted
     if route.called:
         assert route.calls.last.request.content == body
     else:
@@ -753,6 +755,25 @@ async def test_oversized_content_length_is_rejected_without_reading_body() -> No
 
     assert error.value.status_code == 413
     assert "limit: 1024 bytes" in error.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1024])
+@pytest.mark.parametrize("content_length", [b"-1", b"invalid"])
+async def test_invalid_content_length_is_rejected_with_or_without_size_limit(
+    limit: int, content_length: bytes
+) -> None:
+    async def receive():
+        pytest.fail("invalid Content-Length must be rejected before reading the body")
+
+    request = Request(
+        {"type": "http", "headers": [(b"content-length", content_length)]}, receive=receive
+    )
+    with pytest.raises(HTTPException) as error:
+        await _read_request_body(request, limit)
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "invalid Content-Length header"
 
 
 @pytest.mark.asyncio

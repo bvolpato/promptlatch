@@ -413,7 +413,7 @@ async def _read_request_body(request: Request, limit: int) -> bytes:
             parsed_length = int(content_length)
             if parsed_length < 0:
                 raise ValueError
-            if parsed_length > limit:
+            if limit and parsed_length > limit:
                 raise HTTPException(status_code=413, detail=limit_detail)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid Content-Length header") from None
@@ -422,7 +422,7 @@ async def _read_request_body(request: Request, limit: int) -> bytes:
     size = 0
     async for chunk in request.stream():
         size += len(chunk)
-        if size > limit:
+        if limit and size > limit:
             raise HTTPException(status_code=413, detail=limit_detail)
         chunks.append(chunk)
     return b"".join(chunks)

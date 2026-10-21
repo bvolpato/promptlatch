@@ -19,16 +19,25 @@ def test_default_and_generated_request_limits_allow_image_heavy_sessions() -> No
         yaml.safe_load(config_template("https://upstream.example/v1", "UPSTREAM_API_KEY"))
     )
 
-    assert Settings().server.max_request_body_bytes == 128 * 1024**2
-    assert generated.server.max_request_body_bytes == 128 * 1024**2
+    assert Settings().server.max_request_body_bytes == 0
+    assert generated.server.max_request_body_bytes == 0
 
 
-def test_request_limit_environment_overrides_existing_config(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("limit", [0, 256 * 1024**2])
+def test_request_limit_environment_overrides_existing_config(monkeypatch, tmp_path, limit) -> None:
     config = tmp_path / "config.yaml"
     config.write_text("server:\n  max_request_body_bytes: 33554432\n", encoding="utf-8")
-    monkeypatch.setenv("PROMPTLATCH_MAX_REQUEST_BODY_BYTES", str(256 * 1024**2))
+    monkeypatch.delenv("PROMPTLATCH_MAX_REQUEST_BODY_BYTES", raising=False)
+    assert load_settings(config).server.max_request_body_bytes == 32 * 1024**2
+    monkeypatch.setenv("PROMPTLATCH_MAX_REQUEST_BODY_BYTES", str(limit))
 
-    assert load_settings(config).server.max_request_body_bytes == 256 * 1024**2
+    assert load_settings(config).server.max_request_body_bytes == limit
+
+
+@pytest.mark.parametrize("limit", [-1, 1, 1023])
+def test_request_limits_reject_invalid_sizes(limit) -> None:
+    with pytest.raises(ValidationError):
+        ServerConfig(max_request_body_bytes=limit)
 
 
 def test_server_api_key_env(monkeypatch, tmp_path) -> None:

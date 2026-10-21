@@ -19,7 +19,7 @@ DEFAULT_KEY_PATH = CONFIG_DIR / "key"
 LEGACY_CONFIG_DIR = Path.home() / ".config" / "promptcloak"
 LEGACY_CONFIG_PATH = LEGACY_CONFIG_DIR / "config.yaml"
 LEGACY_KEY_PATH = LEGACY_CONFIG_DIR / "key"
-DEFAULT_MAX_REQUEST_BODY_BYTES = 128 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BODY_BYTES = 0
 
 
 class ServerConfig(BaseModel):
@@ -29,7 +29,14 @@ class ServerConfig(BaseModel):
     require_api_key: bool = False
     debug_requests: bool = False
     debug_max_body_chars: int = Field(default=20000, ge=0)
-    max_request_body_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BODY_BYTES, ge=1024)
+    max_request_body_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BODY_BYTES, ge=0)
+
+    @field_validator("max_request_body_bytes")
+    @classmethod
+    def validate_request_body_limit(cls, value: int) -> int:
+        if 0 < value < 1024:
+            raise ValueError("request body limit must be 0 (unlimited) or at least 1024 bytes")
+        return value
 
     @model_validator(mode="after")
     def validate_required_api_key(self) -> ServerConfig:

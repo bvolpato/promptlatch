@@ -407,7 +407,7 @@ server:
   host: 127.0.0.1
   port: 8000
   api_key: null
-  max_request_body_bytes: 134217728
+  max_request_body_bytes: 0
 
 target:
   default_base_url: https://api.openai.com/v1
@@ -446,11 +446,13 @@ observability:
 Store only key tails in exact rules. Full masking is default; partial masking is
 available through `redact_mode: partial`.
 
-The default request limit is 128 MiB, including inline base64 images and conversation
-history. Override it with `server.max_request_body_bytes` or
-`PROMPTLATCH_MAX_REQUEST_BODY_BYTES`. Existing configs retain their explicit limit.
-This limit is separate from the 256 KiB history capture per request and the 1 GiB
-SQLite storage cap.
+Request size is unlimited by default (`0`), including inline base64 images and
+conversation history. Set `server.max_request_body_bytes` or
+`PROMPTLATCH_MAX_REQUEST_BODY_BYTES` to a positive byte count to impose a limit.
+Existing configs retain their explicit limit; set it to `0` to remove it. Requests
+are buffered for redaction, so available memory and upstream provider limits still
+apply. History capture remains capped at 256 KiB per request and SQLite storage at
+1 GiB.
 
 ## Local monitoring
 
@@ -980,7 +982,7 @@ PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
 docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.9
+  ghcr.io/bvolpato/promptlatch:0.2.10
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz
@@ -1030,8 +1032,8 @@ helm uninstall promptlatch
 Release asset:
 
 ```bash
-helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.9/promptlatch-0.2.9.tgz
-helm install promptlatch ./promptlatch-0.2.9.tgz \
+helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.10/promptlatch-0.2.10.tgz
+helm install promptlatch ./promptlatch-0.2.10.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 ```

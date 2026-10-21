@@ -234,22 +234,27 @@ async def test_native_tool_image_data_remains_usable_while_text_is_redacted():
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_native_image_request_larger_than_old_limit_is_redacted_and_forwarded():
-    image = b"\x89PNG\r\n\x1a\n" + bytes(24 * 1024**2)
+async def test_native_image_request_larger_than_old_limit_is_redacted_and_forwarded(tmp_path):
+    image = b"\x89PNG\r\n\x1a\n" + bytes(97 * 1024**2)
     data_url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+    del image
+    database = tmp_path / "history.sqlite3"
     settings = Settings(
         target=TargetConfig(
             default_base_url="https://upstream.example", block_private_targets=False
         ),
-        redaction=RedactionConfig(engine="basic"),
-        observability=ObservabilityConfig(enabled=False),
+        observability=ObservabilityConfig(database_path=database, pricing_enabled=False),
     )
     route = respx.post("https://upstream.example/backend-api/codex/responses").mock(
         return_value=httpx.Response(200, json={"output": []})
     )
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(settings)), base_url="http://proxy"
-    ) as client:
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
         response = await client.post(
             "/backend-api/codex/responses",
             json={
@@ -265,7 +270,15 @@ async def test_native_image_request_larger_than_old_limit_is_redacted_and_forwar
             },
         )
     assert response.status_code == 200
-    assert len(route.calls.last.request.content) > 32 * 1024**2
+    assert len(route.calls.last.request.content) > 128 * 1024**2
     content = json.loads(route.calls.last.request.content)["input"][0]["content"]
     assert content[0]["text"] == "[REDACTED_SECRET]"
     assert content[1]["image_url"] == data_url
+
+    reader = HistoryReader(database)
+    stored = reader.request(reader.requests()["items"][0]["request_id"])
+    assert stored is not None
+    assert stored["redactions"] == 1
+    assert OPENAI_FAKE not in stored["request_body"]
+    assert len(stored["request_body"].encode()) <= settings.observability.max_body_bytes
+    assert stored["body_truncated"]

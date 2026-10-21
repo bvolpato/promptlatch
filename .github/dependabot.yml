@@ -20,10 +20,8 @@ updates:
     schedule:
       interval: weekly
     cooldown:
-      default-days: 7
-      semver-major-days: 30
-      semver-minor-days: 7
-      semver-patch-days: 7
+      # Uniform cooldown preserves the existing 30-day major-update floor.
+      default-days: 30
     groups:
       actions:
         patterns: ["*"]
@@ -33,10 +31,8 @@ updates:
     schedule:
       interval: weekly
     cooldown:
-      default-days: 7
-      semver-major-days: 30
-      semver-minor-days: 7
-      semver-patch-days: 7
+      # Uniform cooldown preserves the existing 30-day major-update floor.
+      default-days: 30
     ignore:
       - dependency-name: python
         update-types:

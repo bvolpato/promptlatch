@@ -3,9 +3,11 @@
 Run from repository root. Never use real credentials in tests or logs.
 
 CI and CodeQL use `ubuntu-22.04`. CI tests Python 3.12, 3.13, and 3.14.
+Packaging and audit tooling use Python 3.14. `pip-audit` dependencies do not yet
+support Python 3.15.
 
 ```bash
-uv sync --extra dev --group audit --locked
+uv sync --python 3.14 --extra dev --group audit --locked
 uv run scripts/check_release.py
 uv run scripts/audit_secrets.py
 uv run ruff check .

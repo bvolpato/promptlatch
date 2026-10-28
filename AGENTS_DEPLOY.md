@@ -5,7 +5,7 @@ PromptLatch ships through signed Git tag, GitHub Actions, Homebrew tap, GitHub P
 ## Release
 
 1. Keep same version in `pyproject.toml`, `src/promptlatch/version.py`, Helm chart metadata, Helm image tag, docs, site, and `uv.lock`.
-2. Run `AGENTS_TESTING.md` checks.
+2. Run `AGENTS_TESTING.md` checks. Packaging and release audit tooling use Python 3.14.
 3. Confirm GitHub repository is `bvolpato/promptlatch`; release workflow rejects any
    other namespace so image and asset URLs cannot diverge.
 4. Commit and push release metadata to `main`.

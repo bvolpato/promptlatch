@@ -2,6 +2,8 @@
 
 Run from repository root. Never use real credentials in tests or logs.
 
+CI and CodeQL use `ubuntu-22.04`. CI tests Python 3.12, 3.13, and 3.14.
+
 ```bash
 uv sync --extra dev --group audit --locked
 uv run scripts/check_release.py

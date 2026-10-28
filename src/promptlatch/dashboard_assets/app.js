@@ -27,7 +27,43 @@
   const tokenTotal = (item) => known(item.total_tokens) ? `${tokens(item.total_tokens)}${!known(item.known_token_requests) || item.known_token_requests < item.requests ? "+" : ""}` : "—";
   const apiEquivalent = (item) => ["litellm_api_equivalent", "custom_api_equivalent"].includes(item.cost_source);
   const duration = (value) => known(value) ? value >= 1000 ? `${decimal.format(value / 1000)}s` : `${number.format(value)}ms` : "—";
+  const compressionDuration = (value) => !known(value) || value < 0 ? "—" : value >= 1000 ? `${decimal.format(value / 1000)} s` : `${decimal.format(value)} ms`;
   const speed = (value) => known(value) ? decimal.format(value) : "—";
+  const requestCompressionValues = new Set(["identity", "gzip", "zstd", "other"]);
+  function formatBytes(value) {
+    if (!known(value) || value < 0) return null;
+    const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let amount = value, unit = 0;
+    while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit++; }
+    return `${unit ? decimal.format(amount) : number.format(amount)} ${units[unit]}`;
+  }
+  function uploadPresentation(item) {
+    if (!item || typeof item !== "object") return [];
+    const fields = [];
+    const before = formatBytes(item.request_uncompressed_bytes);
+    const sent = formatBytes(item.request_wire_bytes);
+    if (before !== null) fields.push(["Redacted before compression", before]);
+    if (sent !== null) fields.push(["Encoded body", sent]);
+    if (requestCompressionValues.has(item.request_compression)) {
+      fields.push(["Encoding", item.request_compression]);
+    }
+    if (known(item.request_compression_ms) && item.request_compression_ms >= 0) {
+      fields.push(["Compression time", compressionDuration(item.request_compression_ms)]);
+    }
+    return fields;
+  }
+  function uploadTotalsPresentation(totals) {
+    const requests = known(totals.requests) ? totals.requests : 0;
+    const coverage = (field) => `${count(totals[`${field}_known_requests`] || 0)}/${count(requests)} requests`;
+    const counts = totals.request_compression_counts || {};
+    const codecSummary = [...requestCompressionValues].map((codec) => `${codec} ${count(counts[codec] || 0)}`).join(" · ");
+    return [
+      ["Redacted bytes before compression", `${formatBytes(totals.request_uncompressed_bytes) || "—"} · ${coverage("request_uncompressed_bytes")}`],
+      ["Encoded request body bytes", `${formatBytes(totals.request_wire_bytes) || "—"} · ${coverage("request_wire_bytes")}`],
+      ["Average compression time", `${compressionDuration(totals.avg_request_compression_ms)} · ${coverage("request_compression_ms")}`],
+      ["Encoding counts", `${codecSummary} · ${count(totals.request_compression_unknown_requests || 0)} unknown`],
+    ];
+  }
   const text = (id, value) => { $(id).textContent = value; };
   const shortId = (id) => id ? id.length > 17 ? `${id.slice(0, 9)}…${id.slice(-5)}` : id : "Unknown";
   const date = (timestamp, full = false) => known(timestamp) ? new Date(timestamp * 1000).toLocaleString(undefined, full ? { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short" } : { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
@@ -188,7 +224,7 @@
 
   // Pure presentation helpers also run in Node's test runner without booting the dashboard.
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { jsonPresentation, renderJSON, fraction, tokenTotal, cost };
+    module.exports = { jsonPresentation, renderJSON, fraction, tokenTotal, cost, uploadPresentation, uploadTotalsPresentation };
     return;
   }
 
@@ -818,7 +854,8 @@
     text("payload-copy-status", "");
     $("copy-payload").disabled = true;
     $("payload-wrap").disabled = true;
-    for (const target of ["request-strip", "request-metric-notes", "conversation-content", "conversation-notices", "payload-notices", "request-metrics"]) $(target).replaceChildren();
+    for (const target of ["request-strip", "request-upload", "request-metric-notes", "conversation-content", "conversation-notices", "payload-notices", "request-metrics"]) $(target).replaceChildren();
+    $("request-upload").hidden = true;
     for (const tab of ["conversation", "payload", "metrics"]) $("panel-" + tab).scrollTop = 0;
     updateIterationNavigation();
     try {
@@ -941,6 +978,18 @@
     if (!record) text("request-ordinal", `Request ${shortId(item.request_id)}`);
     updateIterationNavigation();
     $("request-strip").replaceChildren();
+    const upload = $("request-upload");
+    const uploadFields = uploadPresentation(item);
+    upload.hidden = uploadFields.length === 0;
+    upload.replaceChildren();
+    if (uploadFields.length) {
+      upload.append(element("strong", "upload-heading", "Upstream upload"));
+      for (const [label, value] of uploadFields) {
+        const field = element("span", "upload-field");
+        field.append(element("span", "upload-label", label), element("strong", "", value));
+        upload.append(field);
+      }
+    }
     const tokenUsage = item.usage_applicable === false ? "Not applicable" : `${tokens(item.input_tokens)} in · ${tokens(item.output_tokens)} out`;
     const costLabel = apiEquivalent(item) ? "Est. API cost" : "Est. cost";
     const cached = fraction(item.cached_input_tokens, item.input_tokens);
@@ -1253,6 +1302,8 @@
       $("overview-metrics").append(cell);
     }
     $("overview-tokens").replaceChildren();
+    $("overview-upload").replaceChildren();
+    for (const [label, value] of uploadTotalsPresentation(totals)) field($("overview-upload"), label, value);
     for (const [label, value] of [["Input", totals.input_tokens], ["Output", totals.output_tokens], ["Reasoning (part of output)", totals.reasoning_tokens], ["Cached input", totals.cached_input_tokens], ["Cache writes", totals.cache_write_tokens]]) field($("overview-tokens"), label, count(value));
     for (const [label, fieldName] of [["Input usage coverage", "input_tokens_known_requests"], ["Output usage coverage", "output_tokens_known_requests"]]) field($("overview-tokens"), label, `${count(totals[fieldName])}/${count(applicableRequests)} ${coverageLabel}`);
     const unknownApplicability = totals.usage_applicability_unknown_requests;

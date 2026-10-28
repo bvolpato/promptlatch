@@ -5,6 +5,7 @@ from pydantic import ValidationError
 from promptlatch.config import (
     ObservabilityConfig,
     RedactionConfig,
+    RequestCompressionConfig,
     RuleConfig,
     ServerConfig,
     Settings,
@@ -38,6 +39,33 @@ def test_request_limit_environment_overrides_existing_config(monkeypatch, tmp_pa
 def test_request_limits_reject_invalid_sizes(limit) -> None:
     with pytest.raises(ValidationError):
         ServerConfig(max_request_body_bytes=limit)
+
+
+def test_request_compression_environment_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROMPTLATCH_REQUEST_COMPRESSION_ENABLED", "false")
+    monkeypatch.setenv("PROMPTLATCH_REQUEST_COMPRESSION_MIN_BYTES", "32768")
+    settings = load_settings(tmp_path / "missing.yaml")
+    assert settings.target.request_compression.enabled is False
+    assert settings.target.request_compression.min_bytes == 32768
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["https://user:password@upstream.example/responses", "https://upstream.example/responses?x=1"],
+)
+def test_request_compression_endpoint_overrides_reject_userinfo_and_query(endpoint):
+    with pytest.raises(ValidationError):
+        RequestCompressionConfig(endpoints={endpoint: "gzip"})
+
+
+def test_request_compression_endpoint_overrides_reject_normalized_duplicates():
+    with pytest.raises(ValidationError, match="duplicate request compression endpoint"):
+        RequestCompressionConfig(
+            endpoints={
+                "https://upstream.example/responses": "gzip",
+                "https://UPSTREAM.EXAMPLE:443/responses": "zstd",
+            }
+        )
 
 
 def test_server_api_key_env(monkeypatch, tmp_path) -> None:

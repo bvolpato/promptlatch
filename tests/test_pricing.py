@@ -1,10 +1,10 @@
+import gzip
 import hashlib
 import json
 import stat
 import subprocess
 import sys
-from importlib import metadata
-from pathlib import Path
+from importlib.resources import files
 
 import httpx
 import pytest
@@ -72,12 +72,18 @@ def test_chatgpt_uses_exact_openai_rates_with_api_equivalent_provenance(tmp_path
     )
 
 
-def test_bundled_litellm_catalog_prices_codex_offline_without_sdk_import(tmp_path):
+def test_bundled_litellm_catalog_prices_codex_offline_without_sdk_installation(tmp_path):
     script = """
 import builtins, json, socket, sys
+from importlib import metadata
 from pathlib import Path
 
 original_import = builtins.__import__
+original_distribution = metadata.distribution
+def no_litellm_distribution(name):
+    if name == "litellm":
+        raise metadata.PackageNotFoundError(name)
+    return original_distribution(name)
 def guarded_import(name, *args, **kwargs):
     if name == "litellm" or name.startswith("litellm."):
         raise AssertionError("LiteLLM SDK must not be imported")
@@ -88,6 +94,7 @@ class NoNetworkSocket(socket.socket):
     connect = no_network
     connect_ex = no_network
 builtins.__import__ = guarded_import
+metadata.distribution = no_litellm_distribution
 socket.socket = NoNetworkSocket
 from promptlatch.pricing import PricingCatalog
 catalog = PricingCatalog(Path(sys.argv[1]))
@@ -106,10 +113,8 @@ print(json.dumps(result))
         capture_output=True,
     )
     result = json.loads(completed.stdout)
-    distribution = metadata.distribution("litellm")
-    payload = Path(
-        str(distribution.locate_file("litellm/model_prices_and_context_window_backup.json"))
-    ).read_bytes()
+    snapshot = files("promptlatch").joinpath("pricing_assets", "litellm-1.105.0.json.gz")
+    payload = gzip.decompress(snapshot.read_bytes())
     rate = json.loads(payload)["gpt-6.1-sol"]
     expected = (
         50 * rate["input_cost_per_token"]
@@ -121,8 +126,8 @@ print(json.dumps(result))
     assert result["cost_source"] == "litellm_api_equivalent"
     assert result["pricing_model"] == "gpt-6.1-sol"
     assert result["pricing_as_of"] is None  # Package has no price publication timestamp.
-    assert result["pricing_rates"]["source"] == "litellm_package"
-    assert result["pricing_rates"]["package_version"] == distribution.version
+    assert result["pricing_rates"]["source"] == "litellm_snapshot"
+    assert result["pricing_rates"]["package_version"] == "1.105.0"
     assert result["pricing_rates"]["catalog_sha256"] == hashlib.sha256(payload).hexdigest()
 
 

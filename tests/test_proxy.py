@@ -759,7 +759,9 @@ async def test_oversized_content_length_is_rejected_without_reading_body() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [0, 1024])
-@pytest.mark.parametrize("content_length", [b"-1", b"invalid"])
+@pytest.mark.parametrize(
+    "content_length", [b"-1", b"invalid", b"", b"+10", b"1_0", b" \t", b"1 0", b"\xb2"]
+)
 async def test_invalid_content_length_is_rejected_with_or_without_size_limit(
     limit: int, content_length: bytes
 ) -> None:
@@ -774,6 +776,17 @@ async def test_invalid_content_length_is_rejected_with_or_without_size_limit(
 
     assert error.value.status_code == 400
     assert error.value.detail == "invalid Content-Length header"
+
+
+@pytest.mark.asyncio
+async def test_content_length_allows_surrounding_http_whitespace() -> None:
+    async def receive():
+        return {"type": "http.request", "body": b"hello", "more_body": False}
+
+    request = Request(
+        {"type": "http", "headers": [(b"content-length", b" \t005\t ")]}, receive=receive
+    )
+    assert await _read_request_body(request, 5) == b"hello"
 
 
 @pytest.mark.asyncio

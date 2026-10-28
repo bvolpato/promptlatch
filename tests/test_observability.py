@@ -20,6 +20,7 @@ from promptlatch.history import HistoryReader, HistoryStore
 from promptlatch.observability import Observability
 from promptlatch.pricing import CATALOG_URL, PricingCatalog
 from promptlatch.proxy import _stream_upstream, create_app
+from promptlatch.redaction import RedactionStats, SecretRedactor
 from promptlatch.response_metrics import ResponseMetrics, zstd
 from promptlatch.upstream_errors import ERROR_FIELD_BYTES
 from tests.fixtures import OPENAI_FAKE
@@ -43,6 +44,58 @@ def records(path: Path) -> list[dict]:
         assert record is not None
         result.append(record)
     return result
+
+
+def test_observation_persists_compression_metadata_after_request_start(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    owner = Observability(settings_for(path))
+    body = b'{"model":"fixture-model","input":"hello"}'
+    payload = json.loads(body)
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/responses",
+            "raw_path": b"/v1/responses",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "server": ("127.0.0.1", 8000),
+            "client": ("127.0.0.1", 1),
+        }
+    )
+    owner.start()
+    try:
+        compressed = owner.begin(request)
+        compressed.prepare(
+            request, body, payload, RedactionStats(), SecretRedactor(owner.settings.redaction)
+        )
+        compressed_id = compressed.record["request_id"]
+        compressed.upstream_request(
+            40, uncompressed_bytes=100, compression="gzip", compression_ms=1.25
+        )
+        compressed.finish(200, "success")
+
+        legacy = owner.begin(request)
+        legacy_id = legacy.record["request_id"]
+        legacy.upstream_request(17)
+        legacy.finish(200, "success")
+    finally:
+        owner.close()
+
+    reader = HistoryReader(path)
+    saved = reader.request(compressed_id)
+    assert saved is not None
+    assert saved["request_uncompressed_bytes"] == 100
+    assert saved["request_wire_bytes"] == 40
+    assert saved["request_compression"] == "gzip"
+    assert saved["request_compression_ms"] == 1.25
+    saved_legacy = reader.request(legacy_id)
+    assert saved_legacy is not None
+    assert saved_legacy["request_uncompressed_bytes"] is None
+    assert saved_legacy["request_wire_bytes"] == 17
+    assert saved_legacy["request_compression"] == "identity"
 
 
 @pytest.mark.asyncio
@@ -271,6 +324,30 @@ async def test_error_details_redact_before_utf8_truncation_and_fail_closed(tmp_p
     assert "failure detail" not in json.dumps(saved)
 
 
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "outcome,expected", [("http_error", "transport_error"), ("cancelled", "cancelled")]
+)
+def test_transport_classification_does_not_depend_on_error_capture_or_override_cancellation(
+    tmp_path, capture, outcome, expected
+):
+    path = tmp_path / "history.sqlite3"
+    owner = Observability(settings_for(path, store_request_bodies=capture))
+    owner.start()
+    try:
+        observation = owner.begin(
+            Request({"type": "http", "method": "POST", "path": "/v1/responses", "headers": []})
+        )
+        observation.transport_error(httpx.ReadError("PRIVATE_TRANSPORT_SENTINEL"))
+        observation.finish(502, outcome)
+    finally:
+        owner.close()
+    saved = records(path)[0]
+    assert saved["outcome"] == expected
+    assert bool(saved["upstream_error"]) is capture
+    assert "PRIVATE_TRANSPORT_SENTINEL" not in json.dumps(saved)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["send", "body", "stream"])
 async def test_transport_error_details_are_redacted_and_preserve_failures(tmp_path, stage):
@@ -346,7 +423,7 @@ async def test_transport_error_details_are_redacted_and_preserve_failures(tmp_pa
             )
             assert "TRANSPORT_DETAIL_SENTINEL" not in response.text
     saved = records(path)[0]
-    assert saved["outcome"] == ("transport_error" if stage == "stream" else "http_error")
+    assert saved["outcome"] == "transport_error"
     details = saved["upstream_error"]
     assert {key: details[key] for key in ("event", "type", "code", "message")} == {
         "event": "transport",
@@ -998,7 +1075,7 @@ async def test_chatgpt_api_equivalent_cost_is_persisted_without_replacing_report
         )
         assert saved["cost_usd"] == expected["cost_usd"]
         assert saved["cost_source"] == "litellm_api_equivalent"
-        assert saved["pricing_rates"]["source"] == "litellm_package"
+        assert saved["pricing_rates"]["source"] == "litellm_snapshot"
     totals = HistoryReader(path).summary()["totals"]
     assert totals["cost_usd"] == saved["cost_usd"]
     assert totals["cost_usd_known_requests"] == 1
@@ -1203,7 +1280,10 @@ async def test_transport_and_rejected_requests_finalize_without_raw_body(tmp_pat
         ).status_code == 400
     saved = records(path)
     assert sorted(item["status_code"] for item in saved) == [400, 502]
-    assert all(item["outcome"] == "http_error" for item in saved)
+    assert {item["status_code"]: item["outcome"] for item in saved} == {
+        400: "http_error",
+        502: "transport_error",
+    }
     assert "invalid JSON secret" not in json.dumps(saved)
 
 

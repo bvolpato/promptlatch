@@ -1,2 +1,4 @@
 required-version = ">=0.13.4"
 exclude-newer = "7 days"
+# Security exception for Brotli 1.2.1; remove after 2026-10-29T14:00:13Z.
+exclude-newer-package = { brotli = "2026-10-22T14:00:13Z" }

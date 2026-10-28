@@ -417,6 +417,10 @@ target:
   timeout_seconds: 180
   allowed_base_urls: []
   block_private_targets: true
+  request_compression:
+    enabled: true
+    min_bytes: 16384
+    endpoints: {}
 
 redaction:
   enabled: true
@@ -453,6 +457,46 @@ Existing configs retain their explicit limit; set it to `0` to remove it. Reques
 are buffered for redaction, so available memory and upstream provider limits still
 apply. History capture remains capped at 256 KiB per request and SQLite storage at
 1 GiB.
+
+### Upload compression
+
+Large JSON POST requests use fast zstd compression for these exact upstream endpoints:
+
+- `https://api.openai.com/v1/responses`
+- `https://chatgpt.com/backend-api/codex/responses`
+
+Compression runs after redaction and any Responses-to-Chat conversion. Unknown
+endpoints receive uncompressed requests. Small requests and compression results
+that would increase the upload size also remain uncompressed. Request compression
+does not change response compression negotiation or native SSE streaming.
+
+Configure gzip or zstd for another endpoint only after verifying provider support.
+Use `identity` to disable compression for one endpoint:
+
+```yaml
+target:
+  request_compression:
+    enabled: true
+    min_bytes: 16384
+    endpoints:
+      https://provider.example/v1/responses: gzip
+      https://api.openai.com/v1/responses: identity
+```
+
+Endpoint overrides match the exact scheme, host, port, and path. Set
+`PROMPTLATCH_REQUEST_COMPRESSION_ENABLED=false` to disable upload compression, or
+`PROMPTLATCH_REQUEST_COMPRESSION_MIN_BYTES` to change the size threshold.
+
+Request history records the redacted body size before compression, encoded body
+size, codec, and compression time. Byte counts describe the prepared HTTP body.
+Compression failures fall back to uncompressed bytes
+before sending; failed upstream POSTs are never replayed automatically. Incoming
+compressed client requests still require redaction to be disabled; leave Codex's
+client request compression disabled when using PromptLatch.
+
+Provider token and decompressed-body limits still apply. For the public OpenAI
+Responses endpoint, PromptLatch skips zstd when it would exceed the documented
+100:1 expansion ratio. See [OpenAI's request compression limits](https://developers.openai.com/api/docs/guides/production-best-practices#compress-request-bodies).
 
 ## Local monitoring
 
@@ -580,8 +624,10 @@ inactivity, not the total generation time.
   input, and cache-write tokens appear when supplied. Response parsing recognizes
   JSON and SSE even when the content type is missing or incorrect. Requests show
   why metrics are unavailable; old captures cannot recover unrecorded usage.
-- **Cost:** estimates from the installed [LiteLLM package](https://docs.litellm.ai/docs/completion/token_usage) and its public pricing map for supported exact model
-  matches. Unknown models, usage, or unsupported pricing remain unknown. Estimates
+- **Cost:** estimates from a bundled [LiteLLM pricing catalog](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)
+  snapshot and its public pricing map for supported exact model matches. The
+  LiteLLM SDK is not required. Catalog version and checksum identify offline rates.
+  Unknown models, usage, or unsupported pricing remain unknown. Estimates
   are not invoices. The map refreshes in the background daily; no prompts, keys,
   model selections, or usage are sent to the pricing source.
   ChatGPT subscription calls use equivalent OpenAI API token rates, labelled
@@ -982,7 +1028,7 @@ PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
 docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.10
+  ghcr.io/bvolpato/promptlatch:0.2.11
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz
@@ -1032,8 +1078,8 @@ helm uninstall promptlatch
 Release asset:
 
 ```bash
-helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.10/promptlatch-0.2.10.tgz
-helm install promptlatch ./promptlatch-0.2.10.tgz \
+helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.11/promptlatch-0.2.11.tgz
+helm install promptlatch ./promptlatch-0.2.11.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 ```

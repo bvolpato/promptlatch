@@ -35,6 +35,7 @@ from promptlatch.observability import (
 )
 from promptlatch.patterns import SENSITIVE_FIELD_RE
 from promptlatch.redaction import RedactionKeyCollisionError, RedactionStats, SecretRedactor
+from promptlatch.request_compression import compress_request_body, request_compression_codec
 from promptlatch.version import __version__
 
 logger = logging.getLogger("promptlatch")
@@ -231,8 +232,29 @@ async def forward_request(request: Request, path: str) -> Response:
         content = json.dumps(chat_payload, separators=(",", ":")).encode("utf-8")
 
     _debug_request(request, path, target_url, body, content, stats, settings)
+    del body
+    if not compat_responses_to_chat:
+        json_payload = None
 
     headers = _forward_headers(request, settings)
+    original_encoding = headers.get("content-encoding", "identity").strip().lower()
+    uncompressed_bytes = len(content) if original_encoding == "identity" else None
+    request_encoding = (
+        original_encoding if original_encoding in {"identity", "gzip", "zstd"} else "other"
+    )
+    compression_ms = 0.0
+    codec = request_compression_codec(
+        request.method, target_url, headers, len(content), settings.target.request_compression
+    )
+    if codec is not None:
+        compressed = await run_in_threadpool(compress_request_body, content, codec, target_url)
+        content = compressed.body
+        request_encoding = compressed.encoding
+        compression_ms = compressed.compression_ms
+        if request_encoding != "identity":
+            headers["content-encoding"] = request_encoding
+            for name in ("content-md5", "content-digest", "repr-digest", "digest"):
+                headers.pop(name, None)
     client, close_client = _client_for_request(request, settings)
 
     try:
@@ -244,7 +266,12 @@ async def forward_request(request: Request, path: str) -> Response:
             params=httpx.QueryParams(tuple(query_params)),
         )
         if observation is not None:
-            observation.upstream_request(len(content))
+            observation.upstream_request(
+                len(content),
+                uncompressed_bytes=uncompressed_bytes,
+                compression=request_encoding,
+                compression_ms=compression_ms,
+            )
             upstream_request.extensions["trace"] = observation.trace
     except BaseException:
         if close_client:
@@ -408,11 +435,12 @@ async def _read_request_body(request: Request, limit: int) -> bytes:
         "server.max_request_body_bytes or PROMPTLATCH_MAX_REQUEST_BODY_BYTES)"
     )
     content_length = request.headers.get("content-length")
-    if content_length:
+    if content_length is not None:
+        content_length = content_length.strip(" \t")
+        if not content_length.isascii() or not content_length.isdecimal():
+            raise HTTPException(status_code=400, detail="invalid Content-Length header")
         try:
             parsed_length = int(content_length)
-            if parsed_length < 0:
-                raise ValueError
             if limit and parsed_length > limit:
                 raise HTTPException(status_code=413, detail=limit_detail)
         except ValueError:

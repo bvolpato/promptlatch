@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import math
@@ -10,7 +11,7 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from importlib import metadata
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, TypeGuard
 
@@ -22,6 +23,7 @@ CATALOG_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 )
 MAX_CATALOG_BYTES = 16 * 1024 * 1024
+_BUNDLED_CATALOG_VERSION = "1.105.0"
 _BASE_RATES = frozenset(
     {
         "input_cost_per_token",
@@ -130,19 +132,15 @@ def _read_bounded(path: Path, limit: int) -> bytes:
 
 def _packaged_catalog() -> _Catalog | None:
     try:
-        distribution = metadata.distribution("litellm")
-        path = Path(
-            str(distribution.locate_file("litellm/model_prices_and_context_window_backup.json"))
+        snapshot = files("promptlatch").joinpath(
+            "pricing_assets", f"litellm-{_BUNDLED_CATALOG_VERSION}.json.gz"
         )
-        payload = _read_bounded(path, MAX_CATALOG_BYTES)
-        return _parse_catalog(payload, None, package_version=distribution.version)
-    except (
-        metadata.PackageNotFoundError,
-        OSError,
-        ValueError,
-        TypeError,
-        RecursionError,
-    ):
+        with snapshot.open("rb") as compressed, gzip.GzipFile(fileobj=compressed) as handle:
+            payload = handle.read(MAX_CATALOG_BYTES + 1)
+        if len(payload) > MAX_CATALOG_BYTES:
+            raise ValueError("pricing catalog exceeds size limit")
+        return _parse_catalog(payload, None, package_version=_BUNDLED_CATALOG_VERSION)
+    except (OSError, EOFError, ValueError, TypeError, RecursionError):
         return None
 
 
@@ -372,7 +370,7 @@ class PricingCatalog:
                 "source": (
                     "custom"
                     if catalog is self._custom
-                    else "litellm_package"
+                    else "litellm_snapshot"
                     if catalog.package_version is not None
                     else CATALOG_URL
                 ),

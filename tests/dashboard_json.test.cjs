@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { jsonPresentation, renderJSON, fraction, tokenTotal, cost } = require("../src/promptlatch/dashboard_assets/app.js");
+const { jsonPresentation, renderJSON, fraction, tokenTotal, cost, uploadPresentation, uploadTotalsPresentation } = require("../src/promptlatch/dashboard_assets/app.js");
 
 test("usage summaries preserve unknown values and mark partial totals", () => {
   assert.equal(fraction(3, 4), 0.75);
@@ -18,6 +18,54 @@ test("usage summaries preserve unknown values and mark partial totals", () => {
   assert.notEqual(cost(0), "—");
   assert.notEqual(cost(0.0000001), cost(0));
   assert.notEqual(cost(0.00001), cost(0));
+});
+
+test("upload details show bounded compression metadata and omit unavailable history", () => {
+  assert.deepEqual(uploadPresentation({}), []);
+  assert.deepEqual(uploadPresentation({ request_uncompressed_bytes: null, request_compression: "unexpected" }), []);
+  assert.deepEqual(uploadPresentation({
+    request_uncompressed_bytes: 128 * 1024 * 1024,
+    request_wire_bytes: 12 * 1024 * 1024,
+    request_compression: "gzip",
+    request_compression_ms: 1.25,
+  }), [
+    ["Redacted before compression", "128 MiB"],
+    ["Encoded body", "12 MiB"],
+    ["Encoding", "gzip"],
+    ["Compression time", "1.3 ms"],
+  ]);
+  assert.deepEqual(uploadPresentation({ request_wire_bytes: 42 }), [["Encoded body", "42 B"]]);
+});
+
+test("upload totals show sample coverage and keep historical unknowns explicit", () => {
+  assert.deepEqual(uploadTotalsPresentation({
+    requests: 2,
+    request_uncompressed_bytes: null,
+    request_uncompressed_bytes_known_requests: 0,
+    request_wire_bytes: 128 * 1024,
+    request_wire_bytes_known_requests: 1,
+    avg_request_compression_ms: null,
+    request_compression_ms_known_requests: 0,
+    request_compression_counts: { identity: 1, gzip: 0, zstd: 0, other: 0 },
+    request_compression_unknown_requests: 1,
+  }), [
+    ["Redacted bytes before compression", "— · 0/2 requests"],
+    ["Encoded request body bytes", "128 KiB · 1/2 requests"],
+    ["Average compression time", "— · 0/2 requests"],
+    ["Encoding counts", "identity 1 · gzip 0 · zstd 0 · other 0 · 1 unknown"],
+  ]);
+  const totals = uploadTotalsPresentation({
+    requests: 2,
+    avg_request_compression_ms: 2.5,
+    request_compression_ms_known_requests: 1,
+  });
+  assert.equal(totals[2][1], "2.5 ms · 1/2 requests");
+  assert.equal(uploadPresentation({ request_compression_ms: 2.5 })[0][1], "2.5 ms");
+  assert.equal(uploadTotalsPresentation({
+    requests: 1,
+    avg_request_compression_ms: 1500,
+    request_compression_ms_known_requests: 1,
+  })[2][1], "1.5 s · 1/1 requests");
 });
 
 function presented(value, truncated = false) {

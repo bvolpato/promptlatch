@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -82,6 +83,16 @@ _AUTH_HEADERS = (
 )
 _BUILTIN_RULES = {name for name, _ in BUILTIN_PATTERNS} | {"sensitive_field"}
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:+-]{0,255}\Z")
+_REQUEST_COMPRESSION_VALUES = ("identity", "gzip", "zstd", "other")
+_MAX_REQUEST_BYTES = 2**63 - 1
+_MAX_REQUEST_COMPRESSION_MS = float(2**63 - 1)
+
+
+def _finite_number(value: int | float) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 def _json(value: Any) -> str:
@@ -326,6 +337,7 @@ class RequestObservation:
         self.submitted = False
         self.finished = False
         self.observer_failed = False
+        self.upstream_transport_failed = False
         path = request.scope["path"].rstrip("/")
         method = (
             request.method
@@ -510,8 +522,41 @@ class RequestObservation:
                 ),
             )
 
-    def upstream_request(self, body_bytes: int) -> None:
-        self.upstream_diagnostics = UpstreamDiagnostics(body_bytes)
+    def upstream_request(
+        self,
+        body_bytes: int,
+        *,
+        uncompressed_bytes: int | None = None,
+        compression: str = "identity",
+        compression_ms: float = 0.0,
+    ) -> None:
+        wire_bytes = (
+            min(body_bytes, _MAX_REQUEST_BYTES)
+            if type(body_bytes) is int and body_bytes >= 0
+            else 0
+        )
+        if type(uncompressed_bytes) is int and uncompressed_bytes >= 0:
+            uncompressed_bytes = min(uncompressed_bytes, _MAX_REQUEST_BYTES)
+        else:
+            uncompressed_bytes = None
+        if not isinstance(compression, str) or compression not in _REQUEST_COMPRESSION_VALUES:
+            compression = "other"
+        if (
+            isinstance(compression_ms, bool)
+            or not isinstance(compression_ms, (int, float))
+            or not _finite_number(compression_ms)
+            or compression_ms < 0
+        ):
+            compression_ms = 0.0
+        else:
+            compression_ms = min(float(compression_ms), _MAX_REQUEST_COMPRESSION_MS)
+        self.upstream_diagnostics = UpstreamDiagnostics(wire_bytes)
+        self.record.update(
+            request_wire_bytes=wire_bytes,
+            request_uncompressed_bytes=uncompressed_bytes,
+            request_compression=compression,
+            request_compression_ms=compression_ms,
+        )
 
     async def trace(self, name: str, info: dict[str, Any]) -> None:
         if self.observer_failed or self.upstream_diagnostics is None:
@@ -532,6 +577,7 @@ class RequestObservation:
             self.observer_failed = True
 
     def transport_error(self, error: Exception) -> None:
+        self.upstream_transport_failed = True
         if self.observer_failed:
             return
         try:
@@ -562,6 +608,8 @@ class RequestObservation:
         if not self.submitted:
             self._discard_preview_memory()
             return
+        if self.upstream_transport_failed and outcome in {"success", "http_error"}:
+            outcome = "transport_error"
         self.metrics.finish_response(complete=outcome in {"success", "http_error"})
         fields = self.metrics.snapshot()
         fields["upstream_error"] = self._upstream_error()
@@ -628,6 +676,18 @@ class RequestObservation:
             stream=self.record["stream"],
             completed_at=time.time(),
             duration_ms=(time.perf_counter() - self.started) * 1000,
+        )
+        fields.update(
+            {
+                key: self.record[key]
+                for key in (
+                    "request_uncompressed_bytes",
+                    "request_wire_bytes",
+                    "request_compression",
+                    "request_compression_ms",
+                )
+                if key in self.record
+            }
         )
         self.owner.store.submit_finish(self.record["request_id"], fields)
         self._discard_preview_memory()

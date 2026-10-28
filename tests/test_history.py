@@ -139,6 +139,82 @@ def test_private_storage_roundtrip_and_aggregate_unknown_values(tmp_path):
     assert store.submit_start(start_record("closed")) is False
 
 
+def test_upload_compression_metrics_persist_with_unknown_coverage(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    store = HistoryStore(path)
+    store.start()
+    assert store.submit_start(
+        start_record(
+            "gzip",
+            request_uncompressed_bytes=100,
+            request_wire_bytes=40,
+            request_compression="gzip",
+            request_compression_ms=1.25,
+        )
+    )
+    assert store.submit_finish("gzip", finish_record())
+    assert store.submit_start(
+        start_record(
+            "encoded",
+            request_uncompressed_bytes=None,
+            request_wire_bytes=55,
+            request_compression="identity",
+            request_compression_ms=0.25,
+        )
+    )
+    assert store.submit_finish("encoded", finish_record())
+    assert store.submit_start(start_record("old-format"))
+    assert store.submit_finish("old-format", finish_record())
+    assert store.submit_start(
+        start_record(
+            "invalid-metadata",
+            request_wire_bytes=True,
+            request_compression=["NOT_A_METRIC"],
+            request_compression_ms=float("nan"),
+        )
+    )
+    assert store.submit_finish("invalid-metadata", finish_record())
+    store.close()
+
+    reader = HistoryReader(path)
+    compressed = reader.request("gzip")
+    assert compressed is not None
+    assert compressed["request_uncompressed_bytes"] == 100
+    assert compressed["request_wire_bytes"] == 40
+    assert compressed["request_compression"] == "gzip"
+    assert compressed["request_compression_ms"] == 1.25
+    encoded = reader.request("encoded")
+    assert encoded is not None
+    assert encoded["request_uncompressed_bytes"] is None
+    assert encoded["request_wire_bytes"] == 55
+    invalid = reader.request("invalid-metadata")
+    assert invalid is not None
+    assert "request_wire_bytes" not in invalid
+    assert "request_compression" not in invalid
+    assert "request_compression_ms" not in invalid
+
+    totals = reader.summary()["lifetime_totals"]
+    assert totals["requests"] == 4
+    assert totals["request_uncompressed_bytes"] == 100
+    assert totals["request_uncompressed_bytes_known_requests"] == 1
+    assert totals["request_uncompressed_bytes_unknown_requests"] == 3
+    assert totals["request_wire_bytes"] == 95
+    assert totals["request_wire_bytes_known_requests"] == 2
+    assert totals["request_wire_bytes_unknown_requests"] == 2
+    assert totals["request_compression_ms"] == 1.5
+    assert totals["request_compression_ms_known_requests"] == 2
+    assert totals["request_compression_ms_unknown_requests"] == 2
+    assert totals["avg_request_compression_ms"] == 0.75
+    assert totals["request_compression_counts"] == {
+        "identity": 1,
+        "gzip": 1,
+        "zstd": 0,
+        "other": 0,
+    }
+    assert totals["request_compression_unknown_requests"] == 2
+    assert b"NOT_A_METRIC" not in path.read_bytes()
+
+
 def test_duplicate_finishes_and_restarts_count_once(tmp_path):
     path = tmp_path / "history.sqlite3"
     store = HistoryStore(path)
@@ -291,6 +367,20 @@ def test_existing_aggregate_history_initializes_lifetime_without_double_counting
         legacy = json.loads(encoded)
         legacy.pop("usage_applicable_requests")
         legacy.pop("usage_applicability_unknown_requests")
+        for key in (
+            "request_uncompressed_bytes",
+            "request_uncompressed_bytes_samples",
+            "request_wire_bytes",
+            "request_wire_bytes_samples",
+            "request_compression_ms",
+            "request_compression_ms_samples",
+            "request_compression_counts",
+            "request_uncompressed_bytes_unknown_requests",
+            "request_wire_bytes_unknown_requests",
+            "request_compression_ms_unknown_requests",
+            "request_compression_unknown_requests",
+        ):
+            legacy.pop(key, None)
         connection.execute("UPDATE aggregates SET metrics=?", (json.dumps(legacy),))
     migrated = HistoryStore(path)
     migrated.start()
@@ -304,6 +394,9 @@ def test_existing_aggregate_history_initializes_lifetime_without_double_counting
     assert summary["lifetime_totals"]["rule_hits"] == {}
     assert summary["lifetime_totals"]["usage_applicable_requests"] == 2
     assert summary["lifetime_totals"]["usage_applicability_unknown_requests"] == 2
+    assert summary["lifetime_totals"]["request_uncompressed_bytes_unknown_requests"] == 2
+    assert summary["lifetime_totals"]["request_wire_bytes_unknown_requests"] == 2
+    assert summary["lifetime_totals"]["request_compression_unknown_requests"] == 2
 
 
 def test_non_generation_requests_do_not_count_as_missing_usage(tmp_path):

@@ -76,8 +76,15 @@ _FIELDS = frozenset(
         "cost_unavailable_reason",
         "unsupported_costs",
         "upstream_error",
+        "request_uncompressed_bytes",
+        "request_wire_bytes",
+        "request_compression",
+        "request_compression_ms",
     ]
 )
+_REQUEST_COMPRESSION_VALUES = ("identity", "gzip", "zstd", "other")
+_REQUEST_BYTE_FIELDS = ("request_uncompressed_bytes", "request_wire_bytes")
+_REQUEST_UPLOAD_FIELDS = (*_REQUEST_BYTE_FIELDS, "request_compression_ms")
 _TOKEN_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -99,8 +106,12 @@ _SUM_FIELDS = (
     "unknown_cost_requests",
     "usage_applicable_requests",
     "usage_applicability_unknown_requests",
+    "request_uncompressed_bytes_unknown_requests",
+    "request_wire_bytes_unknown_requests",
+    "request_compression_ms_unknown_requests",
+    "request_compression_unknown_requests",
 )
-_AVERAGE_FIELDS = ("duration_ms", "ttft_ms", "tps")
+_AVERAGE_FIELDS = ("duration_ms", "ttft_ms", "tps", "request_compression_ms")
 _FINAL_OUTCOMES = frozenset(
     ("success", "http_error", "transport_error", "stream_error", "cancelled", "interrupted")
 )
@@ -185,18 +196,29 @@ def _encode(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
+def _finite_number(value: int | float) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
 def _empty_metrics() -> dict[str, Any]:
     metrics: dict[str, Any] = dict.fromkeys(_SUM_FIELDS, 0)
     for field in (*_TOKEN_FIELDS, "cost_usd", *_AVERAGE_FIELDS):
         metrics[field] = 0
         metrics[field + "_samples"] = 0
+    for field in _REQUEST_UPLOAD_FIELDS:
+        metrics[field] = 0
+        metrics[field + "_samples"] = 0
     metrics["rule_hits"] = {}
+    metrics["request_compression_counts"] = dict.fromkeys(_REQUEST_COMPRESSION_VALUES, 0)
     return metrics
 
 
 def _merge_metrics(target: dict[str, Any], source: dict[str, Any]) -> None:
     for key, value in source.items():
-        if key == "rule_hits":
+        if key in {"rule_hits", "request_compression_counts"}:
             for rule, count in value.items():
                 target[key][rule] = target[key].get(rule, 0) + count
         else:
@@ -207,6 +229,12 @@ def _load_metrics(encoded: str) -> dict[str, Any]:
     recorded = json.loads(encoded)
     recorded.setdefault("usage_applicable_requests", recorded.get("requests", 0))
     recorded.setdefault("usage_applicability_unknown_requests", recorded.get("requests", 0))
+    for field in _REQUEST_UPLOAD_FIELDS:
+        recorded.setdefault(field, 0)
+        recorded.setdefault(field + "_samples", 0)
+        recorded.setdefault(field + "_unknown_requests", recorded.get("requests", 0))
+    recorded.setdefault("request_compression_counts", {})
+    recorded.setdefault("request_compression_unknown_requests", recorded.get("requests", 0))
     metrics = _empty_metrics()
     _merge_metrics(metrics, recorded)
     return metrics
@@ -222,6 +250,11 @@ def _public_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         samples = metrics[field + "_samples"]
         result["avg_" + field] = metrics[field] / samples if samples else None
     result["rule_hits"] = metrics["rule_hits"]
+    result["request_compression_counts"] = metrics["request_compression_counts"]
+    for field in _REQUEST_UPLOAD_FIELDS:
+        samples = metrics[field + "_samples"]
+        result[field] = metrics[field] if samples else None
+        result[field + "_known_requests"] = samples
     return result
 
 
@@ -255,6 +288,26 @@ def _record_metrics(record: dict[str, Any]) -> dict[str, Any]:
         if record.get(field) is not None:
             result[field] = record[field]
             result[field + "_samples"] = 1
+    for field in _REQUEST_UPLOAD_FIELDS:
+        value = record.get(field)
+        valid = (
+            type(value) is int and value >= 0
+            if field in _REQUEST_BYTE_FIELDS
+            else isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and _finite_number(value)
+            and value >= 0
+        )
+        if valid:
+            result[field] = value
+            result[field + "_samples"] = 1
+        else:
+            result[field + "_unknown_requests"] = 1
+    compression = record.get("request_compression")
+    if isinstance(compression, str) and compression in _REQUEST_COMPRESSION_VALUES:
+        result["request_compression_counts"][compression] = 1
+    else:
+        result["request_compression_unknown_requests"] = 1
     return result
 
 
@@ -368,6 +421,29 @@ class HistoryStore:
 
     def _prepare_record(self, record: dict[str, Any]) -> tuple[dict[str, Any], int]:
         result = {key: value for key, value in record.items() if key in _FIELDS}
+        for key in _REQUEST_BYTE_FIELDS:
+            value = result.get(key)
+            if value is not None:
+                if type(value) is not int or value < 0:
+                    result.pop(key)
+                else:
+                    result[key] = min(value, 2**63 - 1)
+        compression = result.get("request_compression")
+        if compression is not None and (
+            not isinstance(compression, str) or compression not in _REQUEST_COMPRESSION_VALUES
+        ):
+            result.pop("request_compression")
+        compression_ms = result.get("request_compression_ms")
+        if compression_ms is not None:
+            if (
+                isinstance(compression_ms, bool)
+                or not isinstance(compression_ms, (int, float))
+                or not _finite_number(compression_ms)
+                or compression_ms < 0
+            ):
+                result.pop("request_compression_ms")
+            else:
+                result["request_compression_ms"] = min(float(compression_ms), 2**63 - 1)
         for key in ("rule_hits", "pricing_rates"):
             if isinstance(result.get(key), dict):
                 result[key] = dict(result[key])

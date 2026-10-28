@@ -76,7 +76,7 @@ async def test_raw_tls_failures_are_safe_and_diagnosed(tmp_path, stage: str) -> 
     assert len(listing) == 1
     saved = HistoryReader(database).request(listing[0]["request_id"])
     assert saved is not None
-    assert saved["outcome"] == ("transport_error" if stage == "stream" else "http_error")
+    assert saved["outcome"] == "transport_error"
     error = saved["upstream_error"]
     assert error["event"] == "transport"
     assert error["type"] == "SSLError"

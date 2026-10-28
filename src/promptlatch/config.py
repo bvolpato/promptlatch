@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+import httpx
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -45,6 +46,24 @@ class ServerConfig(BaseModel):
         return self
 
 
+class RequestCompressionConfig(BaseModel):
+    enabled: bool = True
+    min_bytes: int = Field(default=16 * 1024, ge=0)
+    endpoints: dict[str, Literal["identity", "gzip", "zstd"]] = Field(default_factory=dict)
+
+    @field_validator("endpoints")
+    @classmethod
+    def validate_endpoints(cls, values: dict[str, str]) -> dict[str, str]:
+        result = {}
+        for endpoint, encoding in values.items():
+            _validated_base_url(endpoint)
+            normalized = str(httpx.URL(endpoint))
+            if normalized in result:
+                raise ValueError("duplicate request compression endpoint")
+            result[normalized] = encoding
+        return result
+
+
 class TargetConfig(BaseModel):
     default_base_url: str = "https://api.openai.com/v1"
     api_key: str | None = None
@@ -53,6 +72,7 @@ class TargetConfig(BaseModel):
     timeout_seconds: float = Field(default=180.0, gt=0)
     allowed_base_urls: list[str] = Field(default_factory=list)
     block_private_targets: bool = True
+    request_compression: RequestCompressionConfig = Field(default_factory=RequestCompressionConfig)
 
     @field_validator("default_base_url")
     @classmethod
@@ -207,6 +227,8 @@ def _env_overrides() -> dict[str, Any]:
             "forward_client_authorization",
         ),
         "PROMPTLATCH_TARGET_TIMEOUT_SECONDS": ("target", "timeout_seconds"),
+        "PROMPTLATCH_REQUEST_COMPRESSION_ENABLED": ("target", "request_compression", "enabled"),
+        "PROMPTLATCH_REQUEST_COMPRESSION_MIN_BYTES": ("target", "request_compression", "min_bytes"),
         "PROMPTLATCH_REDACTION_ENABLED": ("redaction", "enabled"),
         "PROMPTLATCH_REDACTION_ENGINE": ("redaction", "engine"),
         "PROMPTLATCH_REDACTION_MODE": ("redaction", "redact_mode"),
@@ -359,6 +381,7 @@ def config_template(target_base_url: str, target_api_key_env: str) -> str:
                 "timeout_seconds": 180,
                 "allowed_base_urls": [],
                 "block_private_targets": True,
+                "request_compression": {"enabled": True, "min_bytes": 16384, "endpoints": {}},
             },
             "redaction": {
                 "enabled": True,

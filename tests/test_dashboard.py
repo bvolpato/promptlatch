@@ -45,6 +45,10 @@ def database(tmp_path: Path) -> Path:
                 "assistant_preview": f"prior answer {index}",
                 "redactions": 1,
                 "rule_hits": {"assigned_secret": 1},
+                "request_uncompressed_bytes": 128 * 1024 * 1024,
+                "request_wire_bytes": 12 * 1024 * 1024,
+                "request_compression": "gzip",
+                "request_compression_ms": 1.25,
             }
         )
         assert store.submit_finish(
@@ -201,6 +205,10 @@ async def test_dashboard_history_routes_and_pagination(database: Path) -> None:
         assert detail.headers["x-content-type-options"] == "nosniff"
         assert detail.json()["request_body"].startswith('{"content":"<img')
         assert detail.json()["redactions"] == 1
+        assert detail.json()["request_uncompressed_bytes"] == 128 * 1024 * 1024
+        assert detail.json()["request_wire_bytes"] == 12 * 1024 * 1024
+        assert detail.json()["request_compression"] == "gzip"
+        assert detail.json()["request_compression_ms"] == 1.25
         for query in ("limit=0", "limit=101", "offset=-1"):
             assert (await client.get(f"/api/requests?{query}")).status_code == 422
         assert (await client.get("/api/summary?days=0")).status_code == 422

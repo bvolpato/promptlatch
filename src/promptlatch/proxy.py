@@ -175,10 +175,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse({"detail": "Dashboard is disabled"}, status_code=404)
 
     @app.get("/healthz")
+    @app.get("/v1/health")
     async def healthz() -> dict[str, Any]:
         monitoring = app.state.observability
         return {
             "ok": True,
+            "service": "promptlatch",
             "redaction": expanded.redaction.enabled,
             "engine": expanded.redaction.engine,
             "telemetry": False,

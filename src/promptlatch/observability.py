@@ -35,7 +35,14 @@ from promptlatch.transport_diagnostics import UpstreamDiagnostics
 from promptlatch.upstream_errors import bound_error_details
 
 logger = logging.getLogger("promptlatch")
-_LOCAL_ROUTES = {"/healthz", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}
+_LOCAL_ROUTES = {
+    "/healthz",
+    "/v1/health",
+    "/docs",
+    "/docs/oauth2-redirect",
+    "/redoc",
+    "/openapi.json",
+}
 _ENDPOINTS = {
     "/v1/chat/completions",
     "/v1/responses",

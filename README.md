@@ -147,6 +147,10 @@ export OPENAI_API_KEY="<openai-upstream-key>"
 promptlatch serve
 ```
 
+Health checks at `GET /healthz` and `GET /v1/health` return local status with
+`"service": "promptlatch"`. They do not contact an upstream provider or enter
+request history.
+
 Point clients at `http://127.0.0.1:8000/v1`. For example:
 
 ```bash

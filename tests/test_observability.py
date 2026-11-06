@@ -46,6 +46,32 @@ def records(path: Path) -> list[dict]:
     return result
 
 
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("endpoint", ["/healthz", "/v1/health"])
+async def test_health_endpoints_identify_service_without_proxying_or_recording(tmp_path, endpoint):
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.server.api_key = "fixture-local-key"
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        response = await client.get(endpoint)
+
+    assert response.status_code == 200
+    assert response.json()["service"] == "promptlatch"
+    assert response.json()["ok"] is True
+    assert response.json()["observability"] == {"enabled": True, "healthy": True}
+    assert not respx.calls
+    summary = HistoryReader(path).summary()
+    assert summary["totals"]["requests"] == 0
+    assert summary["storage"]["retained_requests"] == 0
+
+
 def test_observation_persists_compression_metadata_after_request_start(tmp_path):
     path = tmp_path / "history.sqlite3"
     owner = Observability(settings_for(path))

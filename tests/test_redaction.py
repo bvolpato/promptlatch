@@ -1385,3 +1385,61 @@ def test_detect_secrets_plugin_captures_preserve_full_pat_and_clean_delimiters()
     assert az2.startswith('AccountKey="[REDACTED:') and az2.endswith(']"')
     assert az_tag1 and az_tag2
     assert az_tag1.group(1) == az_tag2.group(1)
+
+
+def test_tagged_mode_derivation_cap_degrades_safely_without_poisoning_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("promptlatch.redaction._MAX_TAG_DERIVATIONS_PER_CALL", 2)
+    redactor = SecretRedactor(
+        RedactionConfig(engine="basic", redact_mode="tagged", placeholder="CUSTOM_MASK")
+    )
+    tok1 = "sk-" + ("A" * 24)
+    tok2 = "sk-" + ("B" * 24)
+    tok3 = "sk-" + ("C" * 24)
+    tok4 = "sk-" + ("D" * 24)
+    sig_q = "?si" + "g=[REDACTED_SECRET]"
+    result = redactor.redact_payload(
+        {
+            "api_key": "[REDACTED_SECRET]",
+            "items": [
+                f"a {tok1} {tok1}",
+                f"b {tok2}",
+                f"https://u:{tok3}@example.com/1 https://u:{tok4}@example.com/2",
+                f"https://storage.example/obj{sig_q}",
+            ],
+        }
+    )
+    assert result.value["api_key"] == "[REDACTED_SECRET]"
+    items = result.value["items"]
+    assert items[0].count("[REDACTED:openai_key#") == 2
+    assert items[1].startswith("b [REDACTED:openai_key#")
+    assert items[2] == (
+        "https://u:[REDACTED_SECRET]@example.com/1 https://u:[REDACTED_SECRET]@example.com/2"
+    )
+    assert items[3] == f"https://storage.example/obj{sig_q}"
+    rescan = SecretRedactor(RedactionConfig(engine="basic", redact_mode="tagged")).redact_payload(
+        result.value
+    )
+    assert rescan.value == result.value
+    assert rescan.stats.redactions == 0
+    # Because items[2] hit the per-call cap, it was not cached and derives a tag on a fresh call.
+    fresh = redactor.redact_text(f"c {tok3}")
+    assert fresh.value.startswith("c [REDACTED:openai_key#")
+
+    cfg = RedactionConfig(engine="basic", redact_mode="tagged", tag_key="first-tag-key-0123456789")
+    mutable = SecretRedactor(cfg)
+    first_out = mutable.redact_text(OPENAI_FAKE).value
+    cfg.tag_key = "second-tag-key-9876543210"
+    second_out = mutable.redact_text(OPENAI_FAKE).value
+    assert first_out != second_out
+
+    full_with_key = SecretRedactor(
+        RedactionConfig(engine="basic", redact_mode="full", tag_key="unused-tag-key-0123456789")
+    )
+    assert full_with_key._derived_tag_pair is None
+
+    partial = SecretRedactor(RedactionConfig(engine="basic", redact_mode="partial"))
+    assert partial.redact_payload({"password": "my-long-secret-password"}).value == {
+        "password": "[REDACTED_SECRET]"
+    }

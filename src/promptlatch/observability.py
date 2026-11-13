@@ -392,7 +392,8 @@ class RequestObservation:
                         "redact_mode": "full",
                         "placeholder": MASK,
                     }
-                )
+                ),
+                _cache_from=self.owner._metadata_redactor,
             )
         config = self.owner.settings.observability
         target = (

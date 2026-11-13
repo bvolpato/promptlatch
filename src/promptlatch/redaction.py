@@ -24,12 +24,27 @@ from promptlatch.patterns import BUILTIN_PATTERNS, SENSITIVE_FIELD_RE, STRICT_SE
 
 MASK = "[REDACTED_SECRET]"
 _TAGGED_PLACEHOLDER_RE = re.compile(r"\[REDACTED:([A-Za-z0-9_.-]{1,64})#([0-9a-f]{8})\]")
+_TAGGED_OR_MASK_RE = re.compile(
+    r"\[REDACTED_SECRET\]|\[REDACTED:([A-Za-z0-9_.-]{1,64})#([0-9a-f]{8})\]"
+)
 _SIGNED_URL_TAGGED_RE = re.compile(
     r"(?i)([?&](?:x-amz-signature|x-amz-credential|x-amz-security-token|"
     r"x-goog-signature|x-goog-credential|googleaccessid|signature|sig)=)"
     r"((?:\[REDACTED:[A-Za-z0-9_.-]{1,64}#[0-9a-f]{8}\]|[^&#\s])+)"
 )
 _MAX_DYNAMIC_TAG_LABELS = 4096
+_TAG_KEY_PBKDF2_ITERATIONS = 600_000
+_TAG_VALUE_PBKDF2_ITERATIONS = 100_000
+_MAX_TAG_DERIVATIONS_PER_CALL = 64
+
+
+class _TagCallState:
+    __slots__ = ("capped_count", "derivations", "memo")
+
+    def __init__(self) -> None:
+        self.memo: dict[str, str] = {}
+        self.derivations = 0
+        self.capped_count = 0
 
 
 # detect-secrets keeps plugin settings in process-wide state.
@@ -798,11 +813,21 @@ class SecretRedactor:
         self.config = config
         self.placeholder = config.placeholder or MASK
         self._custom_patterns = self._compile_custom_patterns(config.rules)
+        self._tag_local = threading.local()
         self._default_tag_secret = (
             _cache_from._default_tag_secret if _cache_from is not None else os.urandom(32)
         )
-        # Validate any configured or environment-expanded tag_key eagerly.
-        self._active_tag_secret()
+        self._default_tag_id = (
+            _cache_from._default_tag_id if _cache_from is not None else os.urandom(4).hex()
+        )
+        self._derived_tag_pair: tuple[str, bytes, str] | None = (
+            _cache_from._derived_tag_pair if _cache_from is not None else None
+        )
+        # Validate any configured or environment-expanded tag_key eagerly; only run
+        # PBKDF2 eagerly when tagged mode is active.
+        self._resolve_tag_key()
+        if self.config.redact_mode == "tagged":
+            self._active_tag_pair()
         self._static_tag_labels = (
             frozenset(
                 {
@@ -837,7 +862,7 @@ class SecretRedactor:
             json.dumps(
                 [
                     self.placeholder,
-                    hmac.digest(self._default_tag_secret, b"tag-ns", "sha256")[:8].hex(),
+                    self._default_tag_id,
                     [
                         (name, pattern.pattern, pattern.flags)
                         for name, pattern in self._custom_patterns
@@ -847,10 +872,10 @@ class SecretRedactor:
         )
         self._context_keys: dict[tuple[str, str, str], bytes] = {}
 
-    def _active_tag_secret(self) -> bytes:
+    def _resolve_tag_key(self) -> str | None:
         tag_key = self.config.tag_key
         if tag_key is None:
-            return self._default_tag_secret
+            return None
         env_match = _ENV_REF_RE.fullmatch(tag_key)
         if env_match is not None and tag_key not in {
             os.environ.get("PROMPTLATCH_REDACTION_TAG_KEY"),
@@ -863,13 +888,31 @@ class SecretRedactor:
             tag_key = resolved
         if len(tag_key) < 16:
             raise ValueError("redaction tag_key must be at least 16 characters")
-        return hmac.digest(b"promptlatch-redaction-tag-v1", tag_key.encode("utf-8"), "sha256")
+        return tag_key
+
+    def _active_tag_pair(self) -> tuple[bytes, str]:
+        resolved_key = self._resolve_tag_key()
+        if resolved_key is None:
+            return self._default_tag_secret, self._default_tag_id
+        cached = self._derived_tag_pair
+        if cached is not None and cached[0] == resolved_key:
+            return cached[1], cached[2]
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            resolved_key.encode("utf-8"),
+            b"promptlatch-redaction-tag-v1",
+            _TAG_KEY_PBKDF2_ITERATIONS,
+            dklen=36,
+        )
+        secret, tag_id = derived[:32], derived[32:36].hex()
+        self._derived_tag_pair = (resolved_key, secret, tag_id)
+        return secret, tag_id
 
     def _tag_context_id(self) -> str:
         if self.config.redact_mode != "tagged":
             return ""
-        digest = hmac.digest(self._active_tag_secret(), b"tag-ctx", "sha256")[:8].hex()
-        return f"{digest}:{self._dynamic_tag_labels.version}"
+        _, tag_id = self._active_tag_pair()
+        return f"{tag_id}:{self._dynamic_tag_labels.version}"
 
     def _safe_tag_label(self, rule_name: str) -> str:
         label = _normalize_tag_label(rule_name)
@@ -883,32 +926,40 @@ class SecretRedactor:
         return label in self._static_tag_labels or self._dynamic_tag_labels.contains(label)
 
     def _is_tagged_placeholder(self, candidate: str) -> bool:
+        if candidate == MASK:
+            return True
         match = _TAGGED_PLACEHOLDER_RE.fullmatch(candidate)
         return match is not None and self._is_valid_tag_label(match.group(1))
 
     def _protected_tag_spans(self, value: str) -> list[tuple[int, int]]:
-        if "[REDACTED:" not in value:
+        if "[REDACTED" not in value:
             return []
         return [
             (match.start(), match.end())
-            for match in _TAGGED_PLACEHOLDER_RE.finditer(value)
-            if self._is_valid_tag_label(match.group(1))
+            for match in _TAGGED_OR_MASK_RE.finditer(value)
+            if match.group(1) is None or self._is_valid_tag_label(match.group(1))
         ]
 
-    def _format_secret(self, secret: str, rule_name: str) -> str:
-        mode = self.config.redact_mode
-        if mode == "tagged":
-            label = self._safe_tag_label(rule_name)
-            tag = hmac.digest(
-                self._active_tag_secret(),
-                b"tag-val\x00" + secret.encode("utf-8", "surrogatepass"),
+    def _format_tagged(self, secret: str, rule_name: str) -> str:
+        label = self._safe_tag_label(rule_name)
+        state: _TagCallState | None = getattr(self._tag_local, "state", None)
+        tag = state.memo.get(secret) if state is not None else None
+        if tag is None:
+            if state is not None and state.derivations >= _MAX_TAG_DERIVATIONS_PER_CALL:
+                state.capped_count += 1
+                return MASK
+            tag_secret, _ = self._active_tag_pair()
+            tag = hashlib.pbkdf2_hmac(
                 "sha256",
-            )[:4].hex()
-            return f"[REDACTED:{label}#{tag}]"
-        if mode == "full" or len(secret) <= 12:
-            return self.placeholder
-        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8]
-        return f"{secret[:4]}...{secret[-4:]}:{digest}"
+                secret.encode("utf-8", "surrogatepass"),
+                b"tag-val\x00" + tag_secret,
+                _TAG_VALUE_PBKDF2_ITERATIONS,
+                dklen=4,
+            ).hex()
+            if state is not None:
+                state.derivations += 1
+                state.memo[secret] = tag
+        return f"[REDACTED:{label}#{tag}]"
 
     def _sub_tagged_safe(
         self,
@@ -925,7 +976,7 @@ class SecretRedactor:
             def replace_fast(match: re.Match[str]) -> str:
                 nonlocal count
                 count += 1
-                return self._format_secret(match.group(0), rule_name)
+                return self._format_tagged(match.group(0), rule_name)
 
             return pattern.sub(replace_fast, value), count
 
@@ -954,7 +1005,7 @@ class SecretRedactor:
         cursor = 0
         for start, end in spans_to_replace:
             chunks.append(value[cursor:start])
-            chunks.append(self._format_secret(value[start:end], rule_name))
+            chunks.append(self._format_tagged(value[start:end], rule_name))
             cursor = end
         chunks.append(value[cursor:])
         return "".join(chunks), len(spans_to_replace)
@@ -975,13 +1026,35 @@ class SecretRedactor:
         if not self.config.enabled:
             return RedactionResult(payload, stats)
         context = "responses-request" if protocol == "openai-responses" else None
-        return RedactionResult(self._walk(payload, stats, context=context), stats)
+        if (
+            self.config.redact_mode != "tagged"
+            or getattr(self._tag_local, "state", None) is not None
+        ):
+            return RedactionResult(self._walk(payload, stats, context=context), stats)
+        state = _TagCallState()
+        self._tag_local.state = state
+        try:
+            return RedactionResult(self._walk(payload, stats, context=context), stats)
+        finally:
+            state.memo.clear()
+            self._tag_local.state = None
 
     def redact_text(self, text: str) -> RedactionResult:
         stats = RedactionStats()
         if not self.config.enabled:
             return RedactionResult(text, stats)
-        return RedactionResult(self._redact_string(text, stats), stats)
+        if (
+            self.config.redact_mode != "tagged"
+            or getattr(self._tag_local, "state", None) is not None
+        ):
+            return RedactionResult(self._redact_string(text, stats), stats)
+        state = _TagCallState()
+        self._tag_local.state = state
+        try:
+            return RedactionResult(self._redact_string(text, stats), stats)
+        finally:
+            state.memo.clear()
+            self._tag_local.state = None
 
     def _compile_custom_patterns(
         self, rules: list[RuleConfig]
@@ -1146,7 +1219,7 @@ class SecretRedactor:
                 if self._is_tagged_placeholder(stripped):
                     return value
                 stats.add("sensitive_field", 1)
-                return self._format_secret(value, "sensitive_field")
+                return self._format_tagged(value, "sensitive_field")
             stats.add("sensitive_field", 1)
             return self.placeholder
         model_fields = self._model_fields(value)
@@ -1173,7 +1246,7 @@ class SecretRedactor:
         if strict and value is not None and not isinstance(value, bool):
             stats.add("sensitive_field", 1)
             if self.config.redact_mode == "tagged":
-                return self._format_secret(str(value), "sensitive_field")
+                return self._format_tagged(str(value), "sensitive_field")
             return self.placeholder
         return value
 
@@ -1192,13 +1265,17 @@ class SecretRedactor:
             for name, count in hits:
                 stats.add(name, count)
             return value if redacted is None else redacted
+        state: _TagCallState | None = getattr(self._tag_local, "state", None)
+        capped_before = state.capped_count if state is not None else 0
         found = RedactionStats()
         redacted = self._scan_string(value, found)
-        self._cache.put(
-            key,
-            None if redacted == value else redacted,
-            tuple(found.rule_hits.items()),
-        )
+        capped_after = state.capped_count if state is not None else 0
+        if capped_after == capped_before:
+            self._cache.put(
+                key,
+                None if redacted == value else redacted,
+                tuple(found.rule_hits.items()),
+            )
         stats.merge(found)
         return redacted
 
@@ -1415,7 +1492,7 @@ class SecretRedactor:
             if keyword and _is_code_reference(match.string, start, end):
                 return match.group(0)
             total += 1
-            return self._format_secret(match.group(0), rule_name)
+            return self._replacement(match)
 
         if "," not in secret_value:
             value = re.sub(re.escape(secret_value), replace, value)
@@ -1446,7 +1523,7 @@ class SecretRedactor:
                     if self._is_tagged_placeholder(match.group(2)):
                         return match.group(0)
                     count += 1
-                    return f"{match.group(1)}{self._format_secret(match.group(2), name)}"
+                    return f"{match.group(1)}{self._format_tagged(match.group(2), name)}"
 
                 return _SIGNED_URL_TAGGED_RE.sub(replace_signed, value), count
             return pattern.subn(lambda match: f"{match.group(1)}{self.placeholder}", value)
@@ -1460,7 +1537,7 @@ class SecretRedactor:
                         return match.group(0)
                     count += 1
                     return (
-                        f"{match.group(1)}{self._format_secret(match.group(2), name)}"
+                        f"{match.group(1)}{self._format_tagged(match.group(2), name)}"
                         f"{match.group(3)}"
                     )
 
@@ -1533,7 +1610,7 @@ class SecretRedactor:
                 ):
                     continue
                 replacement = (
-                    self._format_secret(match.group("secret"), rule_name)
+                    self._format_tagged(match.group("secret"), rule_name)
                     if self.config.redact_mode == "tagged"
                     else self.placeholder
                 )
@@ -1549,7 +1626,11 @@ class SecretRedactor:
         return "".join(chunks), count
 
     def _replacement(self, match: re.Match[str]) -> str:
-        return self._format_secret(match.group(0), "secret")
+        secret = match.group(0)
+        if self.config.redact_mode == "full" or len(secret) <= 12:
+            return self.placeholder
+        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8]
+        return f"{secret[:4]}...{secret[-4:]}:{digest}"
 
 
 class _PromptText(io.StringIO, NamedIO):

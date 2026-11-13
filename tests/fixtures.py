@@ -10,7 +10,7 @@ def fake_secret(prefix: str, body: str = "FixtureToken000000000000000000000") ->
 
 
 PROVIDER_FIXTURES = {
-    "github_classic_pat": fake_secret("gh" + "p_"),
+    "github_classic_pat": "gh" + "p_" + ("FixtureToken" + ("0" * 24)),
     "github_fine_grained_pat": fake_secret("github" + "_pat_11AAABBBB0"),
     "atlassian_api_token": fake_secret("ATATT" + "3xFfGF0"),
     "openai_key": fake_secret("sk-" + "proj-"),

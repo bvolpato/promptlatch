@@ -63,7 +63,7 @@ uv add promptlatch
 - Require `server.api_key` before binding beyond loopback.
 - Keep `block_private_targets: true` unless a trusted local upstream is required.
 - Leave `debug_requests: false` and do not add telemetry.
-- Use full redaction. Add custom tail-only rules for unknown internal formats.
+- Use full (`full`) or HMAC-tagged (`tagged`) redaction. Add custom tail-only rules for unknown internal formats.
 - Detection must remain deterministic; do not add entropy-only matching.
 - Provider authentication belongs outside request content. PromptLatch forwards
   configured upstream credentials and masks sensitive headers in debug output.

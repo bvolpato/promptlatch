@@ -392,7 +392,8 @@ class RequestObservation:
                         "redact_mode": "full",
                         "placeholder": MASK,
                     }
-                )
+                ),
+                _cache_from=self.owner._metadata_redactor,
             )
         config = self.owner.settings.observability
         target = (
@@ -453,11 +454,11 @@ class RequestObservation:
             reason = "disabled"
         elif not redactor.config.enabled:
             reason = "redaction_disabled"
-        elif redactor.config.redact_mode != "full":
+        elif redactor.config.redact_mode not in {"full", "tagged"}:
             reason = "partial_redaction"
         elif encoded:
             reason = "encoded_body"
-        elif redactor.config.placeholder != MASK:
+        elif redactor.config.redact_mode == "full" and redactor.config.placeholder != MASK:
             reason = "custom_placeholder"
         else:
             try:

@@ -564,6 +564,16 @@ def test_scan_cache_tracks_mutable_redaction_mode() -> None:
     assert full.value == f"token {redactor.placeholder}"
     assert full.stats.rule_hits == partial.stats.rule_hits
 
+    config.redact_mode = "tagged"
+    tagged_one = redactor.redact_text(text)
+    assert re.fullmatch(r"token \[REDACTED:openai_key#[0-9a-f]{8}\]", tagged_one.value)
+    assert tagged_one.stats.rule_hits == full.stats.rule_hits
+
+    config.tag_key = "custom-tag-key-0123456789"
+    tagged_two = redactor.redact_text(text)
+    assert re.fullmatch(r"token \[REDACTED:openai_key#[0-9a-f]{8}\]", tagged_two.value)
+    assert tagged_two.value != tagged_one.value
+
 
 def test_scan_cache_tracks_mutable_engine() -> None:
     config = RedactionConfig(engine="basic")

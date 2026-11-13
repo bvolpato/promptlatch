@@ -202,7 +202,8 @@ curl http://127.0.0.1:8000/v1/responses \
 /v1/responses
 /v1/completions
 /v1/models
-/v1/messages</code></pre>
+/v1/messages
+/v1beta/models/:generateContent</code></pre>
           </article>
         </div>
       </section>
@@ -376,6 +377,14 @@ export ANTHROPIC_AUTH_TOKEN="$PROMPTLATCH_SERVER_API_KEY"
 export DISABLE_TELEMETRY=1
 claude</code></pre>
           </article>
+          <article>
+            <h3>Gemini CLI</h3>
+            <pre><code>promptlatch serve \
+  --config examples/promptlatch-agents.config.yaml
+
+# Uses saved Google OAuth or GEMINI_API_KEY
+gemini-latch</code></pre>
+          </article>
         </div>
       </section>
 
@@ -391,7 +400,7 @@ claude</code></pre>
         <ul>
           <li>Provider auth is added from config or dedicated target headers after client header filtering.</li>
           <li>Unknown private token formats need a custom exact-tail or regex rule.</li>
-          <li>Multipart uploads and compressed request bodies are rejected while redaction is enabled.</li>
+          <li>Single <code>gzip</code> and <code>zstd</code> request bodies are decompressed with bounded expansion limits; multipart uploads and unsupported or stacked encodings are rejected while redaction is enabled.</li>
           <li>Provider responses pass through without scanning or redaction.</li>
           <li><code>--debug-requests</code> can print raw local request bodies. Use fixture data only.</li>
         </ul>
@@ -411,7 +420,7 @@ claude</code></pre>
             <pre><code>docker run -d --name promptlatch --rm \
   -p 127.0.0.1:8000:8000 \
   --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.10
+  ghcr.io/bvolpato/promptlatch:0.2.11
 
 curl --retry 10 --retry-connrefused --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz</code></pre>
@@ -422,7 +431,7 @@ curl --retry 10 --retry-connrefused --retry-delay 1 \
   --from-env-file="$HOME/.config/promptlatch/kubernetes.env"
 
 helm install promptlatch \
-  https://github.com/bvolpato/promptlatch/releases/download/v0.2.10/promptlatch-0.2.10.tgz \
+  https://github.com/bvolpato/promptlatch/releases/download/v0.2.11/promptlatch-0.2.11.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env
 

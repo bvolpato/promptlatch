@@ -10,8 +10,8 @@ machine or application process.
 3. Choose proxy mode or Python library mode based on where requests are created.
 
 Use proxy mode for coding agents, non-Python applications, or clients that accept
-a custom OpenAI or Anthropic base URL. Use library mode when Python code can
-redact request values immediately before an SDK call.
+a custom OpenAI, Anthropic, or Google Gemini base URL. Use library mode when Python
+code can redact request values immediately before an SDK call.
 
 ## Install
 
@@ -35,9 +35,9 @@ promptlatch version
 Docker:
 
 ```bash
-docker pull ghcr.io/bvolpato/promptlatch:0.2.10
+docker pull ghcr.io/bvolpato/promptlatch:0.2.11
 docker run --rm --entrypoint promptlatch \
-  ghcr.io/bvolpato/promptlatch:0.2.10 version
+  ghcr.io/bvolpato/promptlatch:0.2.11 version
 ```
 
 Source checkout:
@@ -63,7 +63,7 @@ uv add promptlatch
 - Require `server.api_key` before binding beyond loopback.
 - Keep `block_private_targets: true` unless a trusted local upstream is required.
 - Leave `debug_requests: false` and do not add telemetry.
-- Use full redaction. Add custom tail-only rules for unknown internal formats.
+- Use full (`full`) or HMAC-tagged (`tagged`) redaction. Add custom tail-only rules for unknown internal formats.
 - Detection must remain deterministic; do not add entropy-only matching.
 - Provider authentication belongs outside request content. PromptLatch forwards
   configured upstream credentials and masks sensitive headers in debug output.
@@ -95,15 +95,19 @@ redaction:
   redact_mode: full
 ```
 
-Use `api_key_header: x-api-key` for Anthropic-compatible upstreams. For
-per-request routing, add trusted public base URLs to the allowlist and send matching
-`X-Target-Base-URL` and `X-Target-API-Key` headers. Never forward the configured
-target key to a different host.
+Use `api_key_header: x-api-key` for Anthropic-compatible upstreams, or
+`api_key_header: x-goog-api-key` for Google Gemini upstreams (never pass API keys in
+`?key=` query parameters). For per-request routing, add trusted public base URLs to
+the allowlist and send matching `X-Target-Base-URL` and `X-Target-API-Key` headers.
+Never forward the configured target key to a different host.
 
-Point OpenAI-compatible clients at `http://127.0.0.1:8000/v1`. Set Claude Code
-`ANTHROPIC_BASE_URL` to `http://127.0.0.1:8000`. Some SDKs require a local API-key
-value even when PromptLatch has no `server.api_key`; use a non-secret placeholder.
-Do not invent a PromptLatch key unless local proxy auth is enabled.
+Point OpenAI-compatible clients at `http://127.0.0.1:8000/v1`, Claude Code
+`ANTHROPIC_BASE_URL` at `http://127.0.0.1:8000`, and Gemini CLI / Google GenAI
+`GOOGLE_GEMINI_BASE_URL` at `http://127.0.0.1:8000` (or run `codex-latch`,
+`claude-latch`, and `gemini-latch` against `examples/promptlatch-agents.config.yaml`).
+Some SDKs require a local API-key value even when PromptLatch has no
+`server.api_key`; use a non-secret placeholder. Do not invent a PromptLatch key
+unless local proxy auth is enabled.
 
 For Codex and OpenCode with OpenRouter, start from checked-in files under
 `examples/`. They use dedicated target headers, keep key in environment, and leave

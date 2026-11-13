@@ -62,6 +62,7 @@ audit = [
 promptlatch = "promptlatch.cli:app"
 codex-latch = "promptlatch.launchers:codex_main"
 claude-latch = "promptlatch.launchers:claude_main"
+gemini-latch = "promptlatch.launchers:gemini_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/promptlatch", "src/promptcloak"]

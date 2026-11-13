@@ -202,7 +202,8 @@ curl http://127.0.0.1:8000/v1/responses \
 /v1/responses
 /v1/completions
 /v1/models
-/v1/messages</code></pre>
+/v1/messages
+/v1beta/models/:generateContent</code></pre>
           </article>
         </div>
       </section>
@@ -375,6 +376,14 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
 export ANTHROPIC_AUTH_TOKEN="$PROMPTLATCH_SERVER_API_KEY"
 export DISABLE_TELEMETRY=1
 claude</code></pre>
+          </article>
+          <article>
+            <h3>Gemini CLI</h3>
+            <pre><code>promptlatch serve \
+  --config examples/promptlatch-agents.config.yaml
+
+# Uses saved Google OAuth or GEMINI_API_KEY
+gemini-latch</code></pre>
           </article>
         </div>
       </section>

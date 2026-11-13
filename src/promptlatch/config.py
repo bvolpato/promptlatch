@@ -72,7 +72,7 @@ class RequestCompressionConfig(BaseModel):
 class TargetConfig(BaseModel):
     default_base_url: str = "https://api.openai.com/v1"
     api_key: str | None = None
-    api_key_header: Literal["authorization", "x-api-key"] = "authorization"
+    api_key_header: Literal["authorization", "x-api-key", "x-goog-api-key"] = "authorization"
     forward_client_authorization: bool = False
     timeout_seconds: float = Field(default=180.0, gt=0)
     allowed_base_urls: list[str] = Field(default_factory=list)

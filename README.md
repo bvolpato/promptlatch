@@ -93,14 +93,14 @@ uv sync --extra dev --locked
 uv run promptlatch doctor
 ```
 
-Install this checkout and the `codex-latch` / `claude-latch` commands:
+Install this checkout and the `codex-latch` / `claude-latch` / `gemini-latch` commands:
 
 ```bash
 ./install.sh
 ```
 
 Requires `uv`. Installs into uv's tool bin directory without editing Codex, Claude
-Code, shell startup files, or proxy configuration. See [coding-agent shims](#coding-agent-shims)
+Code, Gemini CLI, shell startup files, or proxy configuration. See [coding-agent shims](#coding-agent-shims)
 for server setup.
 
 ASGI servers can load `promptlatch.asgi:app` directly. Importing CLI or proxy
@@ -611,8 +611,9 @@ retain known stop reasons, including output limits and content filtering, withou
 being classified as connection failures. Older records cannot recover these details.
 
 Native Responses requests preserve recognized encrypted reasoning and compaction
-envelopes unchanged. Typed image parts also preserve canonical PNG, JPEG, GIF,
-and WebP data URLs with matching binary signatures. Typed canonical Fernet
+envelopes unchanged. Typed image parts in OpenAI Responses and canonical `inlineData`
+image blobs in Google Gemini `generateContent` requests also preserve canonical PNG,
+JPEG, GIF, and WebP payloads with matching binary signatures. Typed canonical Fernet
 encrypted content parts in `agent_message.content` and tool outputs are preserved
 unchanged on forwarding. Readable text parts, summaries, prompts, and other fields
 still pass through redaction. The stored troubleshooting copy can apply
@@ -701,8 +702,9 @@ PromptLatch forwards any path, with first-class tests for:
 - `/v1/chat/completions`
 - `/v1/responses`
 - `/v1/completions`
-- `/v1/models`
+- `/v1/models` and `/v1beta/models`
 - `/v1/messages` for Claude-compatible gateways
+- `/v1beta/models/{model}:generateContent` and `:streamGenerateContent` for Google Gemini
 
 Tests cover streaming responses, tool payloads, and vision payloads. PromptLatch
 redacts recursively without reshaping JSON request schemas.
@@ -719,7 +721,9 @@ curl http://127.0.0.1:8000/v1/responses \
   -d '{"model":"gpt-6-sol","input":"scan this <api-key-like-value>"}'
 ```
 
-Set `X-Target-API-Key-Header: x-api-key` for Anthropic-style upstream authentication.
+Set `X-Target-API-Key-Header: x-api-key` for Anthropic-style upstream authentication,
+or `X-Target-API-Key-Header: x-goog-api-key` for Google Gemini API keys (do not pass
+API keys in `?key=` query parameters, as PromptLatch redacts query-string secrets).
 
 Configured target keys are bound to `target.default_base_url`. A dynamic target that
 requires authentication must receive its key through `X-Target-API-Key` or
@@ -738,6 +742,7 @@ PromptLatch forwards routes without reshaping provider payloads.
 | OpenAI | `https://api.openai.com/v1` | `authorization` | Native Chat Completions, Responses API, models, tools, streaming. |
 | OpenRouter | `https://openrouter.ai/api/v1` | `authorization` | Native Chat Completions and Responses. Use provider-prefixed model names. |
 | Anthropic / Claude-compatible | `https://api.anthropic.com` | `x-api-key` | Forward `/v1/messages`; PromptLatch does not translate OpenAI JSON into Anthropic JSON. |
+| Google Gemini | `https://generativelanguage.googleapis.com` | `x-goog-api-key` | Forward `/v1beta/models/{model}:generateContent` and `:streamGenerateContent` (`?alt=sse`). |
 | Local Ollama or vLLM | `http://127.0.0.1:11434/v1` or another local `/v1` endpoint | provider-specific | Set `block_private_targets: false` only for local-only configs. |
 
 OpenRouter per request:
@@ -766,6 +771,17 @@ curl http://127.0.0.1:8000/v1/messages \
   -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-opus-4-8","max_tokens":256,"messages":[{"role":"user","content":"scan this <api-key-like-value>"}]}'
+```
+
+Google Gemini target:
+
+```bash
+curl http://127.0.0.1:8000/v1beta/models/gemini-2.5-pro:generateContent \
+  -H "X-Target-Base-URL: https://generativelanguage.googleapis.com" \
+  -H "X-Target-API-Key: $GEMINI_API_KEY" \
+  -H "X-Target-API-Key-Header: x-goog-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"scan this <api-key-like-value>"}]}]}'
 ```
 
 Local OpenAI-compatible target:
@@ -890,8 +906,8 @@ when PromptLatch owns one fixed upstream.
 
 ## Coding-agent shims
 
-Run Codex and Claude Code through one local PromptLatch server, using their own
-provider credentials and the official upstream endpoints:
+Run Codex, Claude Code, and Gemini CLI through one local PromptLatch server, using
+their own provider credentials and the official upstream endpoints:
 
 ```bash
 ./install.sh
@@ -900,14 +916,15 @@ promptlatch serve --config examples/promptlatch-agents.config.yaml
 # In another terminal:
 codex-latch
 claude-latch
+gemini-latch
 ```
 
-Install and sign in to the original CLIs first (`codex login`, `claude auth login`).
-Requires Codex 0.162.1+ and Claude Code 2.1.220+. These versions support the
-configuration checks and provider settings used to keep requests on the proxy.
-The shims preserve client credentials and configuration files. The example binds
-to loopback, enables client-auth forwarding, restricts targets to the three official
-endpoints below, and enables the inspector at `http://127.0.0.1:8000/`.
+Install and sign in to the original CLIs first (`codex login`, `claude auth login`,
+`gemini`). Requires Codex 0.162.1+, Claude Code 2.1.220+, and Gemini CLI 0.34.0+.
+These versions support the configuration checks and provider settings used to keep
+requests on the proxy. The shims preserve client credentials and configuration files.
+The example binds to loopback, enables client-auth forwarding, restricts targets to
+the official endpoints below, and enables the inspector at `http://127.0.0.1:8000/`.
 Use your existing server instead if it has equivalent authentication and native
 Responses settings. Do not start a second server on an occupied port.
 
@@ -916,19 +933,26 @@ Responses settings. Do not start a second server on an occupied port.
 | `codex-latch`, saved ChatGPT login | `https://chatgpt.com/backend-api/codex` |
 | `codex-latch`, OpenAI API key | `https://api.openai.com/v1` |
 | `claude-latch`, Claude login or Anthropic API key | `https://api.anthropic.com` |
+| `gemini-latch`, Google OAuth login (`oauth-personal`) | `https://cloudcode-pa.googleapis.com` |
+| `gemini-latch`, Gemini API key (`GEMINI_API_KEY`) | `https://generativelanguage.googleapis.com` |
 
 Codex detects the saved login mode using `codex login status`; its output is never
 printed by the shim. Set `PROMPTLATCH_CODEX_AUTH=chatgpt` or `api-key` to select
 explicitly. API-key mode uses `OPENAI_API_KEY` when set, otherwise Codex's saved
 API-key login. Claude keeps its normal authentication precedence, including
-`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and its saved login.
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and its saved login. Gemini inspects
+`settings.json` (`security.auth.selectedType`), `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
+and saved Google OAuth credentials; set `PROMPTLATCH_GEMINI_AUTH=oauth` or `api-key`
+to require a specific mode.
 
 ```bash
 codex-latch exec "Review this repository"
 PROMPTLATCH_CODEX_AUTH=api-key codex-latch
 PROMPTLATCH_PROXY_URL=http://127.0.0.1:8001 claude-latch
+gemini-latch -p "Summarize recent changes"
 codex-latch --latch-help
 claude-latch --latch-help
+gemini-latch --latch-help
 ```
 
 The shims check proxy readiness and redaction before launching. They stop if the
@@ -936,13 +960,16 @@ proxy is unavailable, redaction is disabled, or native client authentication can
 be forwarded. This mode requires no `server.api_key` or `target.api_key`; keep the
 listener local. Normal keyed-proxy configuration remains available for other clients.
 `PROMPTLATCH_PROXY_URL` accepts loopback addresses only. Use
-`PROMPTLATCH_CODEX_BIN` or `PROMPTLATCH_CLAUDE_BIN` to select a CLI executable explicitly.
+`PROMPTLATCH_CODEX_BIN`, `PROMPTLATCH_CLAUDE_BIN`, or `PROMPTLATCH_GEMINI_BIN` to
+select a CLI executable explicitly.
 
 Codex's effective provider configuration is checked before launch. Conflicting
 provider settings, managed routing requirements, and Codex Cloud commands stop with
 an error. Profiles work unless they redefine the reserved `promptlatch-official`
 provider. Claude's host-managed provider setting prevents settings files from
-replacing the proxy route.
+replacing the proxy route. Gemini rejects Vertex AI, Compute ADC, external auth, and
+local Gemma router settings that would bypass the proxy, and disables Gemini CLI
+telemetry for the invocation.
 
 Codex uses a local process and HTTP Responses streaming. Both shims disable request
 compression so request bodies remain scannable. Claude's nonessential traffic is

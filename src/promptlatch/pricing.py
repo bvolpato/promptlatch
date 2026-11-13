@@ -41,6 +41,7 @@ _OPTIONAL_TOOL_RATES = frozenset(
         "computer_use_output_cost_per_1k_tokens",
         "file_search_cost_per_1k_calls",
         "file_search_cost_per_gb_per_day",
+        "google_maps_grounding_cost_per_query",
         "search_context_cost_per_query",
         "vector_store_cost_per_gb_per_day",
     }
@@ -153,6 +154,8 @@ def _has_unhandled_rates(
         if key == "input_cost_per_token_cache_hit" and value == entry.get(
             "cache_read_input_token_cost"
         ):
+            continue
+        if key == "output_cost_per_reasoning_token" and value == entry.get("output_cost_per_token"):
             continue
         for suffix in ("_batches", "_flex", "_priority", "_ultrafast"):
             if key.endswith(suffix):

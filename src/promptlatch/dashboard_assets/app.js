@@ -1065,13 +1065,24 @@
       if (typeof part === "string") { container.append(codeBlock(part, "message-text")); continue; }
       if (!part || typeof part !== "object") continue;
       const type = typeof part.type === "string" ? part.type : "content";
-      if (typeof part.text === "string") container.append(codeBlock(part.text, "message-text"));
+      const fnCall = part.functionCall ?? part.function_call;
+      const fnResp = part.functionResponse ?? part.function_response;
+      if (part.thought === true && typeof part.text === "string") container.append(structured("thought", part.text));
+      else if (typeof part.text === "string") container.append(codeBlock(part.text, "message-text"));
       else if (typeof part.text?.value === "string") container.append(codeBlock(part.text.value, "message-text"));
       else if (type === "tool_use" || type === "function_call") container.append(toolBlock(part.name, part.input ?? part.arguments, part.id ?? part.call_id));
+      else if (fnCall && typeof fnCall === "object") container.append(toolBlock(fnCall.name, fnCall.args ?? fnCall.arguments, fnCall.id));
       else if (type === "tool_result" || type === "function_call_output") {
         const block = element("div", "tool-block");
         block.append(element("div", "tool-heading", `Tool output${part.tool_use_id || part.call_id ? ` · ${part.tool_use_id || part.call_id}` : ""}`));
         const body = element("div", "message-body"); renderContent(body, part.content ?? part.output, depth + 1); block.append(body); container.append(block);
+      } else if (fnResp && typeof fnResp === "object") {
+        const block = element("div", "tool-block");
+        block.append(element("div", "tool-heading", `Tool output${fnResp.name || fnResp.id ? ` · ${fnResp.name || fnResp.id}` : ""}`));
+        const body = element("div", "message-body");
+        if (fnResp.response !== undefined) renderContent(body, fnResp.response, depth + 1);
+        if (Array.isArray(fnResp.parts)) renderContent(body, fnResp.parts, depth + 1);
+        block.append(body); container.append(block);
       } else if (typeof part.refusal === "string") container.append(codeBlock(part.refusal, "message-text"));
       else container.append(structured(`${type.replaceAll("_", " ")} · captured metadata only`, part));
     }
@@ -1159,13 +1170,21 @@
       container.append(element("p", "body-notice", "No conversation-shaped fields found. Open Payload to inspect this request."));
       return;
     }
+    const wrapped = payload.request ?? payload.generateContentRequest ?? payload.generate_content_request;
+    const inner = (!Array.isArray(payload.messages) && !Array.isArray(payload.input) && typeof payload.input !== "string" && !Array.isArray(payload.contents) && wrapped && typeof wrapped === "object" && !Array.isArray(wrapped)) ? wrapped : payload;
     const prefix = [];
     if (typeof payload.instructions === "string") prefix.push({ role: "system", content: payload.instructions, name: "Instructions" });
     if (typeof payload.system === "string" || Array.isArray(payload.system)) prefix.push({ role: "system", content: payload.system });
+    const sysInst = inner.systemInstruction ?? inner.system_instruction;
+    if (typeof sysInst === "string") prefix.push({ role: "system", content: sysInst, name: "System instruction" });
+    else if (sysInst && typeof sysInst === "object" && Array.isArray(sysInst.parts)) prefix.push({ role: "system", content: sysInst.parts, name: "System instruction" });
     let messages = [];
     if (Array.isArray(payload.messages)) messages = payload.messages;
     else if (Array.isArray(payload.input)) messages = payload.input;
     else if (typeof payload.input === "string") prefix.push({ role: "user", content: payload.input });
+    else if (Array.isArray(inner.contents)) {
+      messages = inner.contents.map((entry) => (entry && typeof entry === "object" && !Array.isArray(entry)) ? { ...entry, role: entry.role === "model" ? "assistant" : (entry.role || "user"), content: entry.content ?? entry.parts } : entry);
+    }
     function* capturedMessages(visibleOnly = true) {
       for (const source of [messages, prefix]) {
         for (let index = source.length - 1; index >= 0; index -= 1) {
@@ -1205,7 +1224,8 @@
       paging.hidden = total <= 50;
     }
     appendBatch();
-    if (Array.isArray(payload.tools) && payload.tools.length) container.append(structured(`${payload.tools.length} tool definitions in request`, payload.tools));
+    const tools = Array.isArray(payload.tools) ? payload.tools : (Array.isArray(inner.tools) ? inner.tools : []);
+    if (tools.length) container.append(structured(`${tools.length} tool definitions in request`, tools));
   }
 
   function field(grid, label, value, mono = false) {

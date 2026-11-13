@@ -932,6 +932,57 @@ async def test_unsafe_or_disabled_capture_omits_body(tmp_path, mode, reason):
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_tagged_redaction_mode_captures_body_and_preserves_tags_with_extra_rules(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.redaction.redact_mode = "tagged"
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"id": "resp_tagged"})
+    )
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        first = await client.post(
+            "/v1/responses",
+            json={"model": "gpt-6-sol", "input": f"debug {OPENAI_FAKE}"},
+        )
+        assert first.status_code == 200
+        forwarded_one = json.loads(route.calls.last.request.content)["input"]
+
+        second = await client.post(
+            "/v1/responses",
+            headers={
+                "X-Redact-Extra-Rules": json.dumps(
+                    [{"type": "exact", "value": "abcd1234", "name": "extra-tail"}]
+                )
+            },
+            json={
+                "model": "gpt-6-sol",
+                "input": f"debug {OPENAI_FAKE} and pl_live_99999999abcd1234",
+            },
+        )
+        assert second.status_code == 200
+        forwarded_two = json.loads(route.calls.last.request.content)["input"]
+
+    assert OPENAI_FAKE not in forwarded_one
+    assert OPENAI_FAKE not in forwarded_two
+    tag_one = forwarded_one.removeprefix("debug ")
+    assert forwarded_two.startswith(f"debug {tag_one} and [REDACTED:extra-tail#")
+
+    saved = sorted(records(path), key=lambda item: item["started_at"])
+    assert len(saved) == 2
+    assert saved[0]["body_omitted_reason"] is None
+    assert tag_one in saved[0]["request_body"]
+    assert saved[0]["user_preview"] == forwarded_one
+    assert OPENAI_FAKE not in json.dumps(saved)
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_capture_masks_duplicate_credentials_and_request_specific_regex_in_model(tmp_path):
     path = tmp_path / "history.sqlite3"
     settings = settings_for(path)

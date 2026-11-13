@@ -245,3 +245,20 @@ def test_observability_environment_overrides(monkeypatch, tmp_path) -> None:
 def test_observability_rejects_invalid_limits(field, value) -> None:
     with pytest.raises(ValidationError):
         ObservabilityConfig.model_validate({field: value})
+
+
+def test_tagged_redaction_env_overrides_preserve_digit_and_brace_keys(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("PROMPTLATCH_REDACTION_MODE", "tagged")
+    monkeypatch.setenv("PROMPTLATCH_REDACTION_TAG_KEY", "0123456789012345")
+
+    settings = load_settings(tmp_path / "missing.yaml")
+
+    assert settings.redaction.redact_mode == "tagged"
+    assert settings.redaction.tag_key == "0123456789012345"
+
+    # Literal env var values with ${...} syntax are not re-expanded as env var references.
+    monkeypatch.setenv("PROMPTLATCH_REDACTION_TAG_KEY", "${LITERAL_KEY_012345}")
+    literal_settings = load_settings(tmp_path / "missing.yaml")
+    assert literal_settings.redaction.tag_key == "${LITERAL_KEY_012345}"

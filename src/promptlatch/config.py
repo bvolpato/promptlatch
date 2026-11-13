@@ -21,6 +21,7 @@ LEGACY_CONFIG_DIR = Path.home() / ".config" / "promptcloak"
 LEGACY_CONFIG_PATH = LEGACY_CONFIG_DIR / "config.yaml"
 LEGACY_KEY_PATH = LEGACY_CONFIG_DIR / "key"
 DEFAULT_MAX_REQUEST_BODY_BYTES = 0
+_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class ServerConfig(BaseModel):
@@ -131,8 +132,9 @@ def _validated_base_url(value: str) -> str:
 class RedactionConfig(BaseModel):
     enabled: bool = True
     engine: Literal["detect-secrets", "basic"] = "detect-secrets"
-    redact_mode: Literal["partial", "full"] = "full"
+    redact_mode: Literal["partial", "full", "tagged"] = "full"
     placeholder: str = "[REDACTED_SECRET]"
+    tag_key: str | None = None
     rules: list[RuleConfig] = Field(default_factory=list)
     encrypted: bool = False
     encrypted_rules: str | None = None
@@ -140,6 +142,20 @@ class RedactionConfig(BaseModel):
     max_extra_rule_chars: int = Field(default=1024, ge=8, le=8192)
     max_extra_rules_header_bytes: int = Field(default=16384, ge=256, le=65536)
     allow_extra_regex_rules: bool = False
+
+    @field_validator("tag_key")
+    @classmethod
+    def validate_tag_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if _ENV_REF_RE.fullmatch(value) is not None and value not in {
+            os.environ.get("PROMPTLATCH_REDACTION_TAG_KEY"),
+            os.environ.get("PROMPTCLOAK_REDACTION_TAG_KEY"),
+        }:
+            return value
+        if len(value) < 16:
+            raise ValueError("redaction tag_key must be at least 16 characters")
+        return value
 
     @model_validator(mode="after")
     def validate_encrypted_rules(self) -> RedactionConfig:
@@ -232,6 +248,7 @@ def _env_overrides() -> dict[str, Any]:
         "PROMPTLATCH_REDACTION_ENABLED": ("redaction", "enabled"),
         "PROMPTLATCH_REDACTION_ENGINE": ("redaction", "engine"),
         "PROMPTLATCH_REDACTION_MODE": ("redaction", "redact_mode"),
+        "PROMPTLATCH_REDACTION_TAG_KEY": ("redaction", "tag_key"),
         "PROMPTLATCH_MAX_EXTRA_RULES": ("redaction", "max_extra_rules"),
         "PROMPTLATCH_MAX_EXTRA_RULE_CHARS": ("redaction", "max_extra_rule_chars"),
         "PROMPTLATCH_MAX_EXTRA_RULES_HEADER_BYTES": (
@@ -270,8 +287,10 @@ def _env_overrides() -> dict[str, Any]:
         for segment in path[:-1]:
             target = target.setdefault(segment, {})
         raw: str = os.environ[selected_name]
-        if raw.lower() in {"true", "false"}:
-            value: Any = raw.lower() == "true"
+        if path in {("server", "api_key"), ("target", "api_key"), ("redaction", "tag_key")}:
+            value: Any = raw
+        elif raw.lower() in {"true", "false"}:
+            value = raw.lower() == "true"
         elif raw.isdigit():
             value = int(raw)
         else:
@@ -411,7 +430,10 @@ def config_template(target_base_url: str, target_api_key_env: str) -> str:
 
 def expand_env_values(data: Any) -> Any:
     if isinstance(data, dict):
-        return {key: expand_env_values(value) for key, value in data.items()}
+        return {
+            key: value if key == "tag_key" else expand_env_values(value)
+            for key, value in data.items()
+        }
     if isinstance(data, list):
         return [expand_env_values(value) for value in data]
     if isinstance(data, str) and data.startswith("${") and data.endswith("}"):

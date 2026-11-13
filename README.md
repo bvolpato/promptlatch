@@ -451,7 +451,12 @@ observability:
   dashboard_enabled: false
 ```
 
-Store only key tails in exact rules. Full masking is default; partial masking is
+Store only key tails in exact rules. Full masking (`[REDACTED_SECRET]`) is default;
+`redact_mode: tagged` emits consistent HMAC-keyed placeholders
+(`[REDACTED:<rule>#<8-hex-hmac>]`) so multi-turn prompts and agent traces can
+distinguish identical vs distinct credentials without exposing secret characters
+(keyed per process by default, or deterministically via `redaction.tag_key` /
+`PROMPTLATCH_REDACTION_TAG_KEY` with at least 16 characters); partial masking is
 available through `redact_mode: partial`.
 
 Request size is unlimited by default (`0`), including inline base64 images and

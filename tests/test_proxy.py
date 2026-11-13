@@ -15,12 +15,15 @@ from promptlatch.config import (
     CompatConfig,
     ObservabilityConfig,
     RedactionConfig,
+    RequestCompressionConfig,
     ServerConfig,
     Settings,
     TargetConfig,
 )
+from promptlatch.history import HistoryReader
 from promptlatch.proxy import _read_request_body, create_app
 from promptlatch.redaction import SecretRedactor
+from promptlatch.request_compression import zstd
 from tests.fixtures import OPENAI_FAKE, PROVIDER_FIXTURES
 
 
@@ -255,23 +258,271 @@ async def test_proxy_redacts_text_without_corrupting_non_utf8_bytes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_proxy_rejects_encoded_request_bodies() -> None:
+@pytest.mark.parametrize(
+    ("header_encoding", "codec"),
+    [("gzip", "gzip"), ("x-gzip", "gzip"), ("zstd", "zstd")],
+)
+@respx.mock
+async def test_proxy_decompresses_redacts_and_strips_encoding_headers(
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+    header_encoding: str,
+    codec: str,
+) -> None:
+    db_path = tmp_path / "history.sqlite3"
+    settings = Settings(
+        server=ServerConfig(debug_requests=True),
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(enabled=True, database_path=db_path),
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"id": "resp_ok"})
+    )
+    form_route = respx.post("https://upstream.example/v1/form").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    raw_route = respx.post("https://upstream.example/v1/raw").mock(
+        return_value=httpx.Response(200, text="ok")
+    )
+    encode = gzip.compress if codec == "gzip" else zstd.compress
+    one_px_png = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4"
+        "2mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    json_payload = {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": f"hello {OPENAI_FAKE}"},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{one_px_png}"},
+                ],
+            }
+        ],
+    }
+    compressed_json = encode(json.dumps(json_payload).encode("utf-8"))
+    app = create_app(settings)
+
+    with caplog.at_level(logging.WARNING, logger="promptlatch"):
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client,
+        ):
+            response = await client.post(
+                "/v1/responses",
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Encoding": header_encoding,
+                    "Content-MD5": "stale-md5",
+                    "Content-Digest": "sha-256=:stale:",
+                    "Repr-Digest": "sha-256=:stale:",
+                    "Digest": "SHA-256=stale",
+                },
+                content=compressed_json,
+            )
+            form_resp = await client.post(
+                "/v1/form",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Encoding": header_encoding,
+                },
+                content=encode(f"api_key={OPENAI_FAKE}&note=ok".encode()),
+            )
+            raw_resp = await client.post(
+                "/v1/raw",
+                headers={"Content-Type": "text/plain", "Content-Encoding": header_encoding},
+                content=encode(f"token {OPENAI_FAKE}".encode()),
+            )
+
+    assert response.status_code == 200
+    assert form_resp.status_code == 200
+    assert raw_resp.status_code == 200
+
+    forwarded = route.calls.last.request
+    assert "content-encoding" not in forwarded.headers
+    for digest_header in ("content-md5", "content-digest", "repr-digest", "digest"):
+        assert digest_header not in forwarded.headers
+    forwarded_json = json.loads(forwarded.content)
+    assert OPENAI_FAKE not in forwarded.content.decode("utf-8")
+    assert forwarded_json["input"][0]["content"][0]["text"] == "hello [REDACTED_SECRET]"
+    assert (
+        forwarded_json["input"][0]["content"][1]["image_url"]
+        == f"data:image/png;base64,{one_px_png}"
+    )
+    assert parse_qsl(form_route.calls.last.request.content.decode("utf-8")) == [
+        ("api_key", "[REDACTED_SECRET]"),
+        ("note", "ok"),
+    ]
+    assert raw_route.calls.last.request.content == b"token [REDACTED_SECRET]"
+
+    debug_events = [
+        json.loads(record.message)
+        for record in caplog.records
+        if '"event": "debug_request"' in record.message
+    ]
+    assert OPENAI_FAKE in debug_events[0]["raw_body"]
+    assert OPENAI_FAKE not in debug_events[0]["redacted_body"]
+
+    items = HistoryReader(db_path).requests(limit=10)["items"]
+    responses_item = next(item for item in items if item["path"] == "/v1/responses")
+    detail = HistoryReader(db_path).request(responses_item["request_id"])
+    assert detail is not None
+    assert detail["model"] == "gpt-5.4"
+    assert detail["body_omitted_reason"] is None
+    assert detail["request_body"] is not None
+    assert OPENAI_FAKE not in detail["request_body"]
+    assert "[REDACTED_SECRET]" in detail["request_body"]
+    assert detail["request_compression"] == "identity"
+    assert detail["request_uncompressed_bytes"] == len(forwarded.content)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_proxy_recompresses_decoded_client_request_for_upstream_endpoint() -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://api.openai.com/v1",
+            block_private_targets=False,
+            request_compression=RequestCompressionConfig(enabled=True, min_bytes=1024),
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(enabled=False),
+    )
+    route = respx.post("https://api.openai.com/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    large_payload = {
+        "model": "gpt-5.4",
+        "input": ("context line with filler text\n" * 120) + f"secret={OPENAI_FAKE}",
+    }
+    compressed_in = gzip.compress(json.dumps(large_payload).encode("utf-8"))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(settings)), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
+            content=compressed_in,
+        )
+
+    assert response.status_code == 200
+    forwarded = route.calls.last.request
+    assert forwarded.headers["content-encoding"] == "zstd"
+    decompressed_out = zstd.decompress(forwarded.content).decode("utf-8")
+    assert OPENAI_FAKE not in decompressed_out
+    assert "[REDACTED_SECRET]" in decompressed_out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Content-Type": "application/json", "Content-Encoding": "br"},
+        {"Content-Type": "application/json", "Content-Encoding": "deflate"},
+        {"Content-Type": "application/json", "Content-Encoding": "gzip, zstd"},
+        httpx.Headers(
+            [
+                ("Content-Type", "application/json"),
+                ("Content-Encoding", "identity"),
+                ("Content-Encoding", "gzip"),
+            ]
+        ),
+    ],
+)
+@respx.mock
+async def test_proxy_rejects_unsupported_or_stacked_content_encodings(headers) -> None:
     settings = Settings(
         target=TargetConfig(
             default_base_url="https://upstream.example/v1", block_private_targets=False
         )
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
     )
     transport = httpx.ASGITransport(app=create_app(settings))
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
             "/v1/responses",
-            headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
+            headers=headers,
             content=gzip.compress(json.dumps({"input": OPENAI_FAKE}).encode()),
         )
 
     assert response.status_code == 415
-    assert response.json()["detail"] == "encoded request bodies are not supported"
+    assert response.json()["detail"] == "unsupported Content-Encoding"
+    assert not route.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("codec", ["gzip", "zstd"])
+@respx.mock
+async def test_proxy_rejects_corrupt_and_oversized_compressed_request_bodies(codec: str) -> None:
+    encode = gzip.compress if codec == "gzip" else zstd.compress
+    settings = Settings(
+        server=ServerConfig(max_decompressed_request_body_bytes=2048),
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(enabled=False),
+    )
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    app = create_app(settings)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        corrupt = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "application/json", "Content-Encoding": codec},
+            content=b"not-a-valid-compressed-stream",
+        )
+        trailing = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "application/json", "Content-Encoding": codec},
+            content=encode(b'{"input":"ok"}') + b"junk",
+        )
+        bomb = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "application/json", "Content-Encoding": codec},
+            content=encode(json.dumps({"input": "x" * 8192}).encode("utf-8")),
+        )
+
+    assert corrupt.status_code == 400
+    assert corrupt.json()["detail"] == "invalid compressed request body"
+    assert trailing.status_code == 400
+    assert trailing.json()["detail"] == "invalid compressed request body"
+    assert bomb.status_code == 413
+    assert "PROMPTLATCH_MAX_DECOMPRESSED_REQUEST_BODY_BYTES" in bomb.json()["detail"]
+    assert not route.called
+
+    tighter_wire = Settings(
+        server=ServerConfig(max_request_body_bytes=1024, max_decompressed_request_body_bytes=65536),
+        target=TargetConfig(
+            default_base_url="https://upstream.example/v1", block_private_targets=False
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(enabled=False),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(tighter_wire)), base_url="http://testserver"
+    ) as client:
+        wire_bomb = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "application/json", "Content-Encoding": codec},
+            content=encode(json.dumps({"input": "y" * 2048}).encode("utf-8")),
+        )
+    assert wire_bomb.status_code == 413
+    assert "PROMPTLATCH_MAX_REQUEST_BODY_BYTES" in wire_bomb.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -279,15 +530,20 @@ async def test_proxy_rejects_encoded_request_bodies() -> None:
 async def test_proxy_preserves_encoded_body_when_redaction_is_disabled() -> None:
     settings = Settings(
         target=TargetConfig(
-            default_base_url="https://upstream.example/v1", block_private_targets=False
+            default_base_url="https://api.openai.com/v1",
+            block_private_targets=False,
+            request_compression=RequestCompressionConfig(enabled=True, min_bytes=64),
         ),
         redaction=RedactionConfig(enabled=False),
     )
-    route = respx.post("https://upstream.example/v1/responses").mock(
+    route = respx.post("https://api.openai.com/v1/responses").mock(
         return_value=httpx.Response(200, json={"ok": True})
     )
     transport = httpx.ASGITransport(app=create_app(settings))
-    body = gzip.compress(json.dumps({"input": OPENAI_FAKE}).encode())
+    body = gzip.compress(
+        json.dumps({"input": f"{OPENAI_FAKE} " + ("ABCD1234" * 200)}).encode(),
+        compresslevel=0,
+    )
 
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
@@ -295,10 +551,24 @@ async def test_proxy_preserves_encoded_body_when_redaction_is_disabled() -> None
             headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
             content=body,
         )
+        stacked = await client.post(
+            "/v1/responses",
+            headers=httpx.Headers(
+                [
+                    ("Content-Type", "application/json"),
+                    ("Content-Encoding", "gzip"),
+                    ("Content-Encoding", "identity"),
+                ]
+            ),
+            content=body,
+        )
 
     assert response.status_code == 200
-    assert route.calls.last.request.content == body
-    assert route.calls.last.request.headers["content-encoding"] == "gzip"
+    assert route.calls[0].request.content == body
+    assert route.calls[0].request.headers["content-encoding"] == "gzip"
+    assert stacked.status_code == 200
+    assert route.calls[1].request.content == body
+    assert route.calls[1].request.headers["content-encoding"] == "gzip, identity"
 
 
 @pytest.mark.asyncio

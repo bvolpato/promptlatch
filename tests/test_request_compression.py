@@ -19,7 +19,12 @@ from promptlatch.config import (
 )
 from promptlatch.proxy import create_app
 from promptlatch.request_compression import (
+    DecompressedRequestTooLargeError,
+    InvalidCompressedRequestError,
+    UnsupportedRequestEncodingError,
     compress_request_body,
+    decompress_request_body,
+    parse_request_content_encoding,
     request_compression_codec,
     zstd,
 )
@@ -319,3 +324,83 @@ async def test_slow_compression_does_not_block_health_requests(monkeypatch):
         finally:
             finish.set()
         assert (await upload).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({}, "identity"),
+        ({"Content-Encoding": "identity"}, "identity"),
+        ({"Content-Encoding": "GZIP"}, "gzip"),
+        ({"Content-Encoding": "x-gzip"}, "gzip"),
+        ({"Content-Encoding": "ZSTD"}, "zstd"),
+    ],
+)
+def test_parse_request_content_encoding_accepts_supported_single_codings(headers, expected):
+    assert parse_request_content_encoding(headers) == expected
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Content-Encoding": ""},
+        {"Content-Encoding": "br"},
+        {"Content-Encoding": "deflate"},
+        {"Content-Encoding": "gzip, zstd"},
+        {"Content-Encoding": "identity, gzip"},
+        {"Content-Encoding": "gzip, "},
+        httpx.Headers([("Content-Encoding", "identity"), ("Content-Encoding", "gzip")]),
+        httpx.Headers([("Content-Encoding", "gzip"), ("Content-Encoding", "gzip")]),
+    ],
+)
+def test_parse_request_content_encoding_rejects_unsupported_or_stacked_codings(headers):
+    with pytest.raises(UnsupportedRequestEncodingError):
+        parse_request_content_encoding(headers)
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd"])
+def test_decompress_request_body_supports_concatenated_frames_and_empty_payloads(codec):
+    encode = gzip.compress if codec == "gzip" else zstd.compress
+    assert decompress_request_body(encode(b""), codec, max_bytes=1024) == b""
+    joined = encode(b'{"a":') + encode(b'1,"b":"ok"}')
+    assert decompress_request_body(joined, codec, max_bytes=1024) == b'{"a":1,"b":"ok"}'
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd"])
+def test_decompress_request_body_rejects_corrupt_truncated_empty_or_trailing_garbage(codec):
+    encode = gzip.compress if codec == "gzip" else zstd.compress
+    valid = encode(b'{"input":"hello"}')
+    boundary_payload = random.Random(7).randbytes(90_000)
+    boundary_frame = encode(boundary_payload)
+    assert decompress_request_body(boundary_frame, codec, max_bytes=256 * 1024) == boundary_payload
+    for bad in (
+        b"",
+        b"not-compressed-at-all",
+        valid[:-2],
+        valid + b"trailing-garbage",
+        boundary_frame + b"\x1f",
+    ):
+        with pytest.raises(InvalidCompressedRequestError):
+            decompress_request_body(bad, codec, max_bytes=256 * 1024)
+    for bad_limit in (-1, True, False):
+        with pytest.raises(ValueError, match="max_bytes"):
+            decompress_request_body(valid, codec, max_bytes=bad_limit)
+
+
+def test_decompress_request_body_rejects_oversized_zstd_window_log():
+    # Valid RFC 8878 zstd frame requesting a 128 MiB window (windowLog=27 > 25).
+    oversized_window_frame = b"\x28\xb5\x2f\xfd\x00\x88\x01\x00\x00"
+    with pytest.raises(InvalidCompressedRequestError):
+        decompress_request_body(oversized_window_frame, "zstd", max_bytes=1024)
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd"])
+def test_decompress_request_body_enforces_streaming_size_cap(codec):
+    encode = gzip.compress if codec == "gzip" else zstd.compress
+    bomb = encode(b"0" * (2 * 1024 * 1024))
+    assert len(bomb) < 8192
+    with pytest.raises(DecompressedRequestTooLargeError) as exc_info:
+        decompress_request_body(bomb, codec, max_bytes=2048)
+    assert exc_info.value.limit == 2048
+    exact = encode(b"x" * 2048)
+    assert decompress_request_body(exact, codec, max_bytes=2048) == b"x" * 2048

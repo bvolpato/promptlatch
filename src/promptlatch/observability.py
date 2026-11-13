@@ -29,6 +29,7 @@ from promptlatch.history import HistoryReader, HistoryStore
 from promptlatch.patterns import BUILTIN_PATTERNS
 from promptlatch.pricing import PricingCatalog
 from promptlatch.redaction import MASK, RedactionStats, SecretRedactor
+from promptlatch.request_compression import has_non_identity_content_encoding
 from promptlatch.request_previews import PREVIEW_FIELDS, extract_request_previews
 from promptlatch.response_metrics import ResponseMetrics
 from promptlatch.transport_diagnostics import UpstreamDiagnostics
@@ -411,7 +412,9 @@ class RequestObservation:
         )
         self.record["provider"] = _PROVIDERS.get(urlsplit(target).hostname or "", "custom")
         media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
-        encoded = request.headers.get("content-encoding", "identity").lower() != "identity"
+        encoded = not getattr(
+            request.state, "body_decoded", False
+        ) and has_non_identity_content_encoding(request.headers)
         if (
             payload is None
             and not encoded

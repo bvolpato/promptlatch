@@ -27,7 +27,13 @@ from promptlatch.compat import (
     chat_stream_to_responses,
     responses_to_chat_payload,
 )
-from promptlatch.config import RuleConfig, Settings, expand_env_values, get_settings
+from promptlatch.config import (
+    DEFAULT_MAX_DECOMPRESSED_REQUEST_BODY_BYTES,
+    RuleConfig,
+    Settings,
+    expand_env_values,
+    get_settings,
+)
 from promptlatch.observability import (
     Observability,
     ObservabilityMiddleware,
@@ -35,7 +41,17 @@ from promptlatch.observability import (
 )
 from promptlatch.patterns import SENSITIVE_FIELD_RE
 from promptlatch.redaction import RedactionKeyCollisionError, RedactionStats, SecretRedactor
-from promptlatch.request_compression import compress_request_body, request_compression_codec
+from promptlatch.request_compression import (
+    DecompressedRequestTooLargeError,
+    InvalidCompressedRequestError,
+    UnsupportedRequestEncodingError,
+    compress_request_body,
+    content_encoding_tokens,
+    decompress_request_body,
+    has_non_identity_content_encoding,
+    parse_request_content_encoding,
+    request_compression_codec,
+)
 from promptlatch.version import __version__
 
 logger = logging.getLogger("promptlatch")
@@ -212,9 +228,10 @@ async def forward_request(request: Request, path: str) -> Response:
 
     body = await _read_request_body(request, settings.server.max_request_body_bytes)
     compat_responses_to_chat = _should_bridge_responses_to_chat(request, path, settings)
-    query_params, content, stats, json_payload = await run_in_threadpool(
+    query_params, raw_body, content, stats, json_payload = await run_in_threadpool(
         _redact_request, request, path, body, settings, compat_responses_to_chat
     )
+    del body
 
     if compat_responses_to_chat:
         if not isinstance(json_payload, dict):
@@ -226,24 +243,37 @@ async def forward_request(request: Request, path: str) -> Response:
         try:
             chat_payload = responses_to_chat_payload(json_payload)
         except ResponsesInputError:
-            _debug_request(request, path, target_url, body, content, stats, settings)
+            _debug_request(request, path, target_url, raw_body, content, stats, settings)
             raise HTTPException(status_code=400, detail="invalid Responses input item") from None
         content = json.dumps(chat_payload, separators=(",", ":")).encode("utf-8")
 
-    _debug_request(request, path, target_url, body, content, stats, settings)
-    del body
+    _debug_request(request, path, target_url, raw_body, content, stats, settings)
+    del raw_body
     if not compat_responses_to_chat:
         json_payload = None
 
     headers = _forward_headers(request, settings)
-    original_encoding = headers.get("content-encoding", "identity").strip().lower()
+    if getattr(request.state, "body_decoded", False):
+        original_encoding = "identity"
+    else:
+        encoding_tokens = content_encoding_tokens(request.headers)
+        if not encoding_tokens or encoding_tokens == ["identity"]:
+            original_encoding = "identity"
+        elif encoding_tokens in (["gzip"], ["x-gzip"]):
+            original_encoding = "gzip"
+        elif encoding_tokens == ["zstd"]:
+            original_encoding = "zstd"
+        else:
+            original_encoding = "other"
     uncompressed_bytes = len(content) if original_encoding == "identity" else None
-    request_encoding = (
-        original_encoding if original_encoding in {"identity", "gzip", "zstd"} else "other"
-    )
+    request_encoding = original_encoding
     compression_ms = 0.0
-    codec = request_compression_codec(
-        request.method, target_url, headers, len(content), settings.target.request_compression
+    codec = (
+        request_compression_codec(
+            request.method, target_url, headers, len(content), settings.target.request_compression
+        )
+        if original_encoding == "identity"
+        else None
     )
     if codec is not None:
         compressed = await run_in_threadpool(compress_request_body, content, codec, target_url)
@@ -357,14 +387,34 @@ async def forward_request(request: Request, path: str) -> Response:
     )
 
 
+def _effective_decompressed_limit(settings: Settings) -> tuple[int, str]:
+    wire_limit = settings.server.max_request_body_bytes
+    decomp_limit = settings.server.max_decompressed_request_body_bytes
+    if wire_limit > 0 and (decomp_limit == 0 or wire_limit < decomp_limit):
+        return (
+            wire_limit,
+            f"decompressed request body too large (limit: {wire_limit} bytes; increase "
+            "server.max_request_body_bytes or PROMPTLATCH_MAX_REQUEST_BODY_BYTES)",
+        )
+    if decomp_limit > 0:
+        return (
+            decomp_limit,
+            f"decompressed request body too large (limit: {decomp_limit} bytes; increase "
+            "server.max_decompressed_request_body_bytes or "
+            "PROMPTLATCH_MAX_DECOMPRESSED_REQUEST_BODY_BYTES)",
+        )
+    return 0, ""
+
+
 def _redact_request(
     request: Request, path: str, body: bytes, settings: Settings, parse_json: bool
-) -> tuple[list[tuple[str, str]], bytes, RedactionStats, Any | None]:
+) -> tuple[list[tuple[str, str]], bytes, bytes, RedactionStats, Any | None]:
     redactor = _redactor_for_request(request, settings)
     audit: AuditLogger = request.app.state.audit
     query_params, query_stats = _redact_query_params(request, redactor)
     audit.redaction(f"query:{path}", query_stats)
-    content, body_stats, json_payload = _redact_request_body(
+    decompressed_limit, decompressed_limit_detail = _effective_decompressed_limit(settings)
+    raw_body, content, body_stats, json_payload = _redact_request_body(
         request,
         body,
         redactor,
@@ -382,6 +432,8 @@ def _redact_request(
                 "/backend-api/codex/responses/compact",
             }
         ),
+        max_decompressed_bytes=decompressed_limit,
+        decompressed_limit_detail=decompressed_limit_detail,
     )
     audit.redaction(path, body_stats)
     stats = query_stats
@@ -402,7 +454,7 @@ def _redact_request(
             )
             logger.warning("history request capture failed (%s)", type(exc).__name__)
 
-    return query_params, content, stats, json_payload
+    return query_params, raw_body, content, stats, json_payload
 
 
 def _redactor_for_request(request: Request, settings: Settings) -> SecretRedactor:
@@ -462,29 +514,47 @@ def _redact_request_body(
     *,
     parse_json: bool = False,
     preserve_responses: bool = False,
-) -> tuple[bytes, RedactionStats, Any | None]:
+    max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_REQUEST_BODY_BYTES,
+    decompressed_limit_detail: str = "",
+) -> tuple[bytes, bytes, RedactionStats, Any | None]:
     stats = RedactionStats()
     media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
     if redactor.config.enabled and media_type.startswith("multipart/"):
         raise HTTPException(
             status_code=415, detail="multipart request bodies are not supported with redaction"
         )
-    if not body:
-        return body, stats, None
-
-    encoded = request.headers.get("content-encoding", "identity").strip().lower() != "identity"
-    if encoded:
-        if redactor.config.enabled:
-            raise HTTPException(status_code=415, detail="encoded request bodies are not supported")
-        return body, stats, None
 
     if not redactor.config.enabled:
+        if not body or has_non_identity_content_encoding(request.headers):
+            return body, body, stats, None
         if parse_json and _is_json_request(request):
             try:
-                return body, stats, json.loads(body)
+                return body, body, stats, json.loads(body)
             except json.JSONDecodeError:
                 raise HTTPException(status_code=400, detail="invalid JSON request body") from None
-        return body, stats, None
+        return body, body, stats, None
+
+    try:
+        encoding = parse_request_content_encoding(request.headers)
+    except UnsupportedRequestEncodingError:
+        raise HTTPException(status_code=415, detail="unsupported Content-Encoding") from None
+
+    if encoding != "identity":
+        try:
+            body = decompress_request_body(body, encoding, max_bytes=max_decompressed_bytes)
+        except DecompressedRequestTooLargeError:
+            detail = decompressed_limit_detail or (
+                f"decompressed request body too large (limit: {max_decompressed_bytes} bytes; "
+                "increase server.max_decompressed_request_body_bytes or "
+                "PROMPTLATCH_MAX_DECOMPRESSED_REQUEST_BODY_BYTES)"
+            )
+            raise HTTPException(status_code=413, detail=detail) from None
+        except InvalidCompressedRequestError:
+            raise HTTPException(status_code=400, detail="invalid compressed request body") from None
+        request.state.body_decoded = True
+
+    if not body:
+        return body, body, stats, None
 
     if media_type == "application/x-www-form-urlencoded":
         try:
@@ -492,7 +562,7 @@ def _redact_request_body(
         except UnicodeError:
             raise HTTPException(status_code=400, detail="invalid form request encoding") from None
         cleaned, stats = _redact_parameter_pairs(fields, redactor)
-        return urlencode(cleaned).encode("utf-8"), stats, None
+        return body, urlencode(cleaned).encode("utf-8"), stats, None
 
     if _is_json_request(request):
         try:
@@ -511,13 +581,14 @@ def _redact_request_body(
                 detail="request contains colliding keys after redaction",
             ) from None
         return (
+            body,
             json.dumps(result.value, separators=(",", ":")).encode("utf-8"),
             result.stats,
             result.value,
         )
 
     result = redactor.redact_text(body.decode("utf-8", errors="surrogateescape"))
-    return result.value.encode("utf-8", errors="surrogateescape"), result.stats, None
+    return body, result.value.encode("utf-8", errors="surrogateescape"), result.stats, None
 
 
 def _redact_query_params(
@@ -662,6 +733,8 @@ def _forward_headers(request: Request, settings: Settings) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="invalid X-Target-API-Key-Header header")
     headers: dict[str, str] = {}
     dropped = DROP_REQUEST_HEADERS | _connection_header_names(request.headers)
+    if getattr(request.state, "body_decoded", False):
+        dropped |= {"content-encoding", "content-md5", "content-digest", "repr-digest", "digest"}
     for key, value in request.headers.items():
         lowered = key.lower()
         if lowered in dropped or lowered == "x-promptlatch-thread-id":
@@ -684,6 +757,13 @@ def _forward_headers(request: Request, settings: Settings) -> dict[str, str]:
         elif SENSITIVE_FIELD_RE.search(lowered):
             continue
         if lowered.startswith("x-redact-"):
+            continue
+        if lowered == "content-encoding":
+            headers["content-encoding"] = (
+                f"{headers['content-encoding']}, {value}"
+                if "content-encoding" in headers
+                else value
+            )
             continue
         headers[key] = value
     headers["accept-encoding"] = request.headers.get("accept-encoding", "identity")

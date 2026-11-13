@@ -29,6 +29,11 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("openai_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
     ("fireworks_key", re.compile(r"\bfw_[A-Za-z0-9_-]{20,}\b")),
     ("xai_key", re.compile(r"\bxai-[A-Za-z0-9_-]{20,}\b")),
+    ("groq_api_key", re.compile(r"\bgsk_[A-Za-z0-9]{48,}\b")),
+    ("perplexity_api_key", re.compile(r"\bpplx-[A-Za-z0-9]{40,}\b")),
+    ("cerebras_api_key", re.compile(r"\bcsk-[A-Za-z0-9]{40,}\b")),
+    ("replicate_api_token", re.compile(r"\br8_[A-Za-z0-9]{35,}\b")),
+    ("tavily_api_key", re.compile(r"\btvly-(?:dev-|prod-)?[A-Za-z0-9]{24,}\b")),
     ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b")),
     ("github_fine_grained_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{30,}\b")),
     ("atlassian_api_token", re.compile(r"\bATATT3xFfGF0[A-Za-z0-9_-]{20,}\b")),
@@ -61,6 +66,36 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("vault_token", re.compile(r"\bhv[bs]\.[A-Za-z0-9_-]{80,300}\b")),
     ("shopify_token", re.compile(r"\bshp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}\b")),
     ("sentry_token", re.compile(r"\bsntry[su]_[A-Za-z0-9]{40,}\b")),
+    (
+        "supabase_token",
+        re.compile(
+            r"\bsb(?:p_(?:v0_|oauth_)?[a-f0-9]{40}\b|_secret_[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-]))"
+        ),
+    ),
+    (
+        "tailscale_key",
+        re.compile(
+            r"\btskey-(?:auth|api|client|scim|webhook)-(?:[A-Za-z0-9]{1,32}-|-)?"
+            r"[A-Za-z0-9_]{16,}(?:--TL[A-Za-z0-9+/=_-]+)?(?![A-Za-z0-9+/=_-])"
+        ),
+    ),
+    (
+        "grafana_token",
+        re.compile(
+            r"\bgl(?:sa_[A-Za-z0-9]{32}_[a-fA-F0-9]{8}\b|"
+            r"c_eyJ[A-Za-z0-9+/_-]{32,}={0,3}(?![A-Za-z0-9+/=_-]))"
+        ),
+    ),
+    ("postman_api_key", re.compile(r"\bPMAK-[a-fA-F0-9]{24}-[a-fA-F0-9]{34}\b")),
+    (
+        "planetscale_token",
+        re.compile(
+            r"\bpscale_(?:tkn|pw|oauth)_[A-Za-z0-9_-][A-Za-z0-9_.-]{30,}"
+            r"[A-Za-z0-9_-]={0,2}(?![A-Za-z0-9_=-])"
+        ),
+    ),
+    ("neon_api_key", re.compile(r"\bnapi_[A-Za-z0-9]{50,}\b")),
+    ("vercel_access_token", re.compile(r"\bvcp_[A-Za-z0-9]{48,}\b")),
     (
         "private_key",
         re.compile(
@@ -110,7 +145,9 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "url_credentials",
         re.compile(
-            r"\b((?:https?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://"
+            r"\b((?i:https?|postgres(?:ql)?(?:\+[a-z0-9_]+)?|mysql(?:\+[a-z0-9_]+)?|"
+            r"mariadb(?:\+[a-z0-9_]+)?|mongodb(?:\+srv)?|rediss?|amqps?|"
+            r"clickhouse(?:s|db)?(?:\+[a-z0-9_]+)?)://"
             r"[^:\s/@]+:)([^@\s/]+)(@)"
         ),
     ),

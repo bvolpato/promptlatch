@@ -365,6 +365,8 @@ class HistoryStore:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._accepting = False
+        self._degraded = False
+        self._failure_seq = 0
         self._dropped_writes = 0
         self._write_errors = 0
         self._persisted_counts = (0, 0)
@@ -391,8 +393,15 @@ class HistoryStore:
     @property
     def status(self) -> dict[str, Any]:
         with self._lock:
+            thread = self._thread
             return {
                 "running": self._accepting,
+                "healthy": (
+                    self._accepting
+                    and not self._degraded
+                    and thread is not None
+                    and thread.is_alive()
+                ),
                 "dropped_writes": self._dropped_writes,
                 "write_errors": self._write_errors,
                 "last_error": self._last_error,
@@ -414,6 +423,7 @@ class HistoryStore:
                 self._release_writer_lock()
                 raise
             self._accepting = True
+            self._degraded = False
             self._thread = threading.Thread(
                 target=self._run, args=(connection,), name="promptlatch-history", daemon=True
             )
@@ -481,6 +491,8 @@ class HistoryStore:
         with self._lock:
             if not self._accepting:
                 self._dropped_writes += 1
+                self._failure_seq += 1
+                self._degraded = True
                 return False
             if body_bytes + self._queued_body_bytes > self._queue_body_limit:
                 record.update(
@@ -493,6 +505,8 @@ class HistoryStore:
                 self._queue.put_nowait((kind, record, body_bytes))
             except queue.Full:
                 self._dropped_writes += 1
+                self._failure_seq += 1
+                self._degraded = True
                 return False
             self._queued_body_bytes += body_bytes
             return True
@@ -782,6 +796,9 @@ class HistoryStore:
                         batch.append(item)
                 with self._lock:
                     self._queued_body_bytes -= sum(item[2] for item in batch)
+                    batch_failure_seq = self._failure_seq
+                batch_clean = bool(batch)
+                wrote_any = False
                 try:
                     self._reserve(connection, batch)
                     with connection:
@@ -790,19 +807,26 @@ class HistoryStore:
                             connection.execute("SAVEPOINT history_event")
                             try:
                                 if kind == "start":
-                                    self._start(connection, record)
+                                    wrote_any = self._start(connection, record) or wrote_any
                                 elif kind == "reprice":
-                                    self._reprice(connection, record)
+                                    wrote_any = self._reprice(connection, record) or wrote_any
                                 else:
-                                    self._finish(connection, record)
+                                    wrote_any = self._finish(connection, record) or wrote_any
                             except Exception as exc:
+                                batch_clean = False
                                 connection.execute("ROLLBACK TO history_event")
                                 self._record_error(exc)
                             connection.execute("RELEASE history_event")
                 except Exception as exc:
+                    batch_clean = False
                     self._record_error(exc, len(batch))
                 finally:
-                    self._persist_counters(connection)
+                    if not self._persist_counters(connection):
+                        batch_clean = False
+                    if batch_clean and wrote_any:
+                        with self._lock:
+                            if self._failure_seq == batch_failure_seq:
+                                self._degraded = False
                     for _ in range(len(batch) + int(stopping)):
                         self._queue.task_done()
                 if stopping:
@@ -815,12 +839,14 @@ class HistoryStore:
         with self._lock:
             self._write_errors += count
             self._last_error = type(exc).__name__
+            self._failure_seq += 1
+            self._degraded = True
 
-    def _persist_counters(self, connection: sqlite3.Connection) -> None:
+    def _persist_counters(self, connection: sqlite3.Connection) -> bool:
         with self._lock:
             counts = (self._dropped_writes, self._write_errors)
         if counts == self._persisted_counts:
-            return
+            return True
         now = time.monotonic()
         if counts != self._warned_counts and now - self._last_warning >= 30:
             logger.warning(
@@ -836,15 +862,17 @@ class HistoryStore:
                     ((counts[0], "dropped_writes"), (counts[1], "write_errors")),
                 )
             self._persisted_counts = counts
+            return True
         except sqlite3.Error as exc:
             self._record_error(exc)
+            return False
 
-    def _start(self, connection: sqlite3.Connection, record: dict[str, Any]) -> None:
+    def _start(self, connection: sqlite3.Connection, record: dict[str, Any]) -> bool:
         request_id = record["request_id"]
         if connection.execute(
             "SELECT 1 FROM history.requests WHERE request_id=?", (request_id,)
         ).fetchone():
-            return
+            return False
         record.setdefault("started_at", time.time())
         record.setdefault("thread_id", request_id)
         record.setdefault("thread_source", "request")
@@ -863,14 +891,16 @@ class HistoryStore:
         )
         if cursor.rowcount:
             self._write_detail(connection, record)
+            return True
+        return False
 
-    def _finish(self, connection: sqlite3.Connection, fields: dict[str, Any]) -> None:
+    def _finish(self, connection: sqlite3.Connection, fields: dict[str, Any]) -> bool:
         request_id = fields["request_id"]
         row = connection.execute(
             "SELECT record FROM pending WHERE request_id=?", (request_id,)
         ).fetchone()
         if row is None:
-            return
+            return False
         record = json.loads(row[0])
         detail = connection.execute(
             "SELECT record,request_body FROM history.requests WHERE request_id=?", (request_id,)
@@ -910,16 +940,17 @@ class HistoryStore:
         # Do not revive already-evicted old requests at the expense of newer traffic.
         if detail:
             self._write_detail(connection, record)
+        return True
 
-    def _reprice(self, connection: sqlite3.Connection, fields: dict[str, Any]) -> None:
+    def _reprice(self, connection: sqlite3.Connection, fields: dict[str, Any]) -> bool:
         row = connection.execute(
             "SELECT record FROM history.requests WHERE request_id=?", (fields["request_id"],)
         ).fetchone()
         if row is None:
-            return
+            return False
         record = json.loads(row[0])
         if not _subscription_pricing_eligible(record):
-            return
+            return False
         lifetime = _load_metrics(
             connection.execute("SELECT metrics FROM lifetime WHERE id=1").fetchone()[0]
         )
@@ -932,7 +963,7 @@ class HistoryStore:
         if lifetime["unknown_cost_requests"] < 1 or (
             aggregate is not None and aggregate["unknown_cost_requests"] < 1
         ):
-            return
+            return False
         for metrics in (lifetime, aggregate):
             if metrics is not None:
                 metrics["cost_usd"] += fields["cost_usd"]
@@ -949,6 +980,7 @@ class HistoryStore:
                 "UPDATE aggregates SET metrics=? WHERE day=? AND model=? AND provider=?",
                 (_encode(aggregate), *dimensions),
             )
+        return True
 
     @staticmethod
     def _used_pages(connection: sqlite3.Connection, schema: str) -> int:

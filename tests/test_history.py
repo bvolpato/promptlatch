@@ -287,16 +287,25 @@ def test_transaction_failure_cannot_partially_increment_totals(tmp_path, monkeyp
     assert reader.summary()["totals"]["requests"] == 0
     assert reader.summary()["storage"]["active_requests"] == 1
     assert store.status["last_error"] == "OSError"
+    assert store.status["healthy"] is False
+    store.submit_finish("missing", finish_record())
+    store._queue.join()
+    assert store.status["healthy"] is False
     monkeypatch.setattr(store, "_write_detail", original)
     store.submit_finish("one", finish_record())
+    store._queue.join()
+    assert store.status["healthy"] is True
     store.close()
+    assert store.status["healthy"] is False
     assert reader.summary()["totals"]["requests"] == 1
     assert reader.summary()["storage"]["write_errors"] == 1
     assert "do not log body or credentials" not in caplog.text
     assert "History capture incomplete" in caplog.text
     restarted = HistoryStore(path)
+    assert restarted.status["healthy"] is False
     restarted.start()
     assert restarted.status["write_errors"] == 1
+    assert restarted.status["healthy"] is True
     restarted.close()
 
 
@@ -658,7 +667,7 @@ def test_queue_pressure_is_nonblocking_and_bodies_are_byte_bounded(tmp_path, mon
     def blocked_start(connection, record):
         entered.set()
         assert release.wait(5)
-        original(connection, record)
+        return original(connection, record)
 
     monkeypatch.setattr(store, "_start", blocked_start)
     store.start()
@@ -668,6 +677,10 @@ def test_queue_pressure_is_nonblocking_and_bodies_are_byte_bounded(tmp_path, mon
         assert store.submit_start(start_record("two"))
         assert not store.submit_start(start_record("three"))
         assert store.dropped_writes == 1
+        assert store.status["healthy"] is False
+        release.set()
+        store._queue.join()
+        assert store.status["healthy"] is True
     finally:
         release.set()
         store.close()
@@ -679,6 +692,7 @@ def test_queue_pressure_is_nonblocking_and_bodies_are_byte_bounded(tmp_path, mon
     restarted = HistoryStore(path)
     restarted.start()
     assert restarted.dropped_writes == 1
+    assert restarted.status["healthy"] is True
     restarted.close()
 
 

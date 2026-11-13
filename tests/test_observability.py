@@ -72,6 +72,82 @@ async def test_health_endpoints_identify_service_without_proxying_or_recording(t
     assert summary["storage"]["retained_requests"] == 0
 
 
+@respx.mock
+@pytest.mark.parametrize("endpoint", ["/healthz", "/v1/health"])
+async def test_health_endpoints_recover_observability_after_historical_or_transient_errors(
+    tmp_path, monkeypatch, endpoint
+):
+    path = tmp_path / "history.sqlite3"
+    seed = HistoryStore(path)
+    seed.submit_start({"request_id": "dropped_before_start"})
+    assert seed.dropped_writes == 1
+    seed.start()
+    seed.submit_start({"request_id": "bad", "started_at": 1.0})
+    seed._queue.join()
+
+    original_finish = seed._finish
+
+    def fail_finish(connection, fields):
+        raise OSError("transient disk error")
+
+    monkeypatch.setattr(seed, "_finish", fail_finish)
+    seed.submit_finish("bad", {"outcome": "success"})
+    seed._queue.join()
+    assert seed.status["write_errors"] == 1
+    assert seed.status["healthy"] is False
+    monkeypatch.setattr(seed, "_finish", original_finish)
+    seed.close()
+
+    respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "resp_ok",
+                "model": "gpt-6-sol",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+            },
+        )
+    )
+
+    settings = settings_for(path)
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        monitoring = app.state.observability
+        assert monitoring.store.status["write_errors"] == 1
+        assert monitoring.store.status["dropped_writes"] == 1
+
+        # Persisted historical errors must not permanently wedge /healthz on restart.
+        initial = await client.get(endpoint)
+        assert initial.json()["observability"] == {"enabled": True, "healthy": True}
+
+        # Live write error flips health to False, and subsequent clean write heals it.
+        original_start = monitoring.store._start
+        monkeypatch.setattr(monitoring.store, "_start", fail_finish)
+        await client.post("/v1/responses", json={"model": "gpt-6-sol", "input": "ping"})
+        monitoring.store._queue.join()
+        degraded = await client.get(endpoint)
+        assert degraded.json()["observability"] == {"enabled": True, "healthy": False}
+
+        monkeypatch.setattr(monitoring.store, "_start", original_start)
+        await client.post("/v1/responses", json={"model": "gpt-6-sol", "input": "pong"})
+        monitoring.store._queue.join()
+        recovered = await client.get(endpoint)
+        assert recovered.json()["observability"] == {"enabled": True, "healthy": True}
+        assert monitoring.store.status["write_errors"] == 2
+        assert monitoring.store.status["dropped_writes"] == 1
+
+    storage = HistoryReader(path).summary()["storage"]
+    assert storage["write_errors"] == 2
+    assert storage["dropped_writes"] == 1
+
+
 def test_observation_persists_compression_metadata_after_request_start(tmp_path):
     path = tmp_path / "history.sqlite3"
     owner = Observability(settings_for(path))

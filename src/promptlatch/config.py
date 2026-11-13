@@ -229,7 +229,7 @@ def _deep_update(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, A
     return base
 
 
-def _env_overrides() -> dict[str, Any]:
+def _env_overrides(*, warning_stacklevel: int = 2) -> dict[str, Any]:
     mapping: dict[str, tuple[str, ...]] = {
         "PROMPTLATCH_HOST": ("server", "host"),
         "PROMPTLATCH_PORT": ("server", "port"),
@@ -289,7 +289,7 @@ def _env_overrides() -> dict[str, Any]:
             warnings.warn(
                 f"{legacy_name} is deprecated; use {env_name}",
                 FutureWarning,
-                stacklevel=2,
+                stacklevel=warning_stacklevel,
             )
         target = data
         for segment in path[:-1]:
@@ -338,18 +338,20 @@ def _resolved_path(
     legacy_env_name: str,
     default: Path,
     legacy_default: Path,
+    *,
+    warning_stacklevel: int = 2,
 ) -> Path:
     if explicit is not None:
         selected = explicit
     elif env_name in os.environ:
-        return Path(os.environ[env_name])
+        return Path(os.environ[env_name]).expanduser()
     elif legacy_env_name in os.environ:
         warnings.warn(
             f"{legacy_env_name} is deprecated; use {env_name}",
             FutureWarning,
-            stacklevel=2,
+            stacklevel=warning_stacklevel,
         )
-        return Path(os.environ[legacy_env_name])
+        return Path(os.environ[legacy_env_name]).expanduser()
     else:
         selected = default
 
@@ -357,10 +359,21 @@ def _resolved_path(
         warnings.warn(
             f"using legacy path {legacy_default}; move it to {default}",
             FutureWarning,
-            stacklevel=2,
+            stacklevel=warning_stacklevel,
         )
-        return legacy_default
-    return selected
+        return legacy_default.expanduser()
+    return selected.expanduser()
+
+
+def resolve_config_path(config_path: Path | None = None) -> Path:
+    return _resolved_path(
+        config_path,
+        "PROMPTLATCH_CONFIG",
+        "PROMPTCLOAK_CONFIG",
+        DEFAULT_CONFIG_PATH,
+        LEGACY_CONFIG_PATH,
+        warning_stacklevel=3,
+    )
 
 
 def load_settings(config_path: Path | None = None, key_path: Path | None = None) -> Settings:
@@ -370,6 +383,7 @@ def load_settings(config_path: Path | None = None, key_path: Path | None = None)
         "PROMPTCLOAK_CONFIG",
         DEFAULT_CONFIG_PATH,
         LEGACY_CONFIG_PATH,
+        warning_stacklevel=3,
     )
     key_file = _resolved_path(
         key_path,
@@ -377,8 +391,9 @@ def load_settings(config_path: Path | None = None, key_path: Path | None = None)
         "PROMPTCLOAK_KEY_FILE",
         DEFAULT_KEY_PATH,
         LEGACY_KEY_PATH,
+        warning_stacklevel=3,
     )
-    data = _deep_update(_load_yaml(path), _env_overrides())
+    data = _deep_update(_load_yaml(path), _env_overrides(warning_stacklevel=3))
     settings = Settings.model_validate(data)
     return _decrypt_rules_if_needed(settings, key_file)
 

@@ -189,8 +189,23 @@ Expected output:
 GEMINI_API_KEY=[REDACTED_SECRET]
 ```
 
-Audit logs omit matched values and include counts and rule names. Homebrew users
-can run PromptLatch as a background service after configuring its environment:
+Audit logs omit matched values and include counts and rule names. Test rules
+directly from the terminal or in pre-commit scripts without starting the proxy:
+
+```bash
+promptlatch scan --file .env.example --mode tagged
+git diff --cached | promptlatch scan --check --quiet
+promptlatch doctor --strict
+```
+
+`scan` accepts an inline string, `--file`, or piped stdin (`-`), supports
+`--mode full|partial|tagged`, and exits with code `1` under `--check` when a
+secret is matched. `doctor` inspects configuration, read-only SQLite storage,
+and any loopback proxy `/healthz` endpoint (including running-version drift);
+`--strict` exits `1` if redaction, storage, or the local proxy is unhealthy.
+
+Homebrew users can run PromptLatch as a background service after configuring its
+environment:
 
 ```bash
 brew services start bvolpato/tap/promptlatch
@@ -514,7 +529,20 @@ Responses endpoint, PromptLatch skips zstd when it would exceed the documented
 ## Local monitoring
 
 Server mode records request metrics automatically. Python library calls do not
-create monitoring databases. Enable the optional dashboard on the same server:
+create monitoring databases. Inspect usage, cost estimates, redaction counts, and
+live traffic from the terminal without opening a browser:
+
+```bash
+promptlatch stats --days 7
+promptlatch tail --limit 20 --traffic inference
+promptlatch tail --follow --errors
+```
+
+`stats` and `tail` open the history databases read-only, never create state
+files, and support `--json` (`tail --json` emits metadata-only JSON Lines
+without request bodies, upstream error text, or prompt previews).
+
+Enable the optional dashboard on the same server:
 
 ```bash
 promptlatch serve --dashboard --config ~/.config/promptlatch/config.yaml

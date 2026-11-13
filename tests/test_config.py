@@ -277,3 +277,16 @@ def test_tagged_redaction_env_overrides_preserve_digit_and_brace_keys(
     monkeypatch.setenv("PROMPTLATCH_REDACTION_TAG_KEY", "${LITERAL_KEY_012345}")
     literal_settings = load_settings(tmp_path / "missing.yaml")
     assert literal_settings.redaction.tag_key == "${LITERAL_KEY_012345}"
+
+
+def test_legacy_env_warnings_point_to_load_settings_caller(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("PROMPTLATCH_KEY_FILE", raising=False)
+    monkeypatch.delenv("PROMPTLATCH_HOST", raising=False)
+    monkeypatch.setenv("PROMPTCLOAK_KEY_FILE", str(tmp_path / "legacy-key"))
+    monkeypatch.setenv("PROMPTCLOAK_HOST", "127.0.0.1")
+
+    with pytest.warns(FutureWarning) as caught:
+        load_settings(tmp_path / "missing.yaml")
+
+    assert len(caught) == 2
+    assert all(record.filename == __file__ for record in caught)

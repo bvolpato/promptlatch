@@ -200,6 +200,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "ok": True,
             "service": "promptlatch",
+            "version": __version__,
             "redaction": expanded.redaction.enabled,
             "engine": expanded.redaction.engine,
             "telemetry": False,

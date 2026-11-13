@@ -216,17 +216,43 @@ def _empty_metrics() -> dict[str, Any]:
     return metrics
 
 
+_STORAGE_SETTING_NAMES = frozenset(
+    (
+        "max_database_bytes",
+        "max_body_bytes",
+        "dropped_writes",
+        "write_errors",
+        "pruned_requests",
+        "pruned_aggregate_rows",
+    )
+)
+
+
 def _merge_metrics(target: dict[str, Any], source: dict[str, Any]) -> None:
+    if not isinstance(source, dict):
+        raise ValueError("metrics entry must be a JSON object")
     for key, value in source.items():
         if key in {"rule_hits", "request_compression_counts"}:
+            if not isinstance(value, dict):
+                raise ValueError("metric breakdown must be a JSON object")
             for rule, count in value.items():
+                if (
+                    not isinstance(rule, str)
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                ):
+                    raise ValueError("metric breakdown entry is invalid")
                 target[key][rule] = target[key].get(rule, 0) + count
-        else:
+        elif key in target:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError("metric scalar must be numeric")
             target[key] += value
 
 
 def _load_metrics(encoded: str) -> dict[str, Any]:
     recorded = json.loads(encoded)
+    if not isinstance(recorded, dict):
+        raise ValueError("metrics row must be a JSON object")
     recorded.setdefault("usage_applicable_requests", recorded.get("requests", 0))
     recorded.setdefault("usage_applicability_unknown_requests", recorded.get("requests", 0))
     for field in _REQUEST_UPLOAD_FIELDS:
@@ -1169,19 +1195,27 @@ class HistoryReader:
     def __init__(self, database_path: Path) -> None:
         self.database_path = Path(database_path).expanduser()
 
-    def _connect(self, path: Path) -> sqlite3.Connection | None:
+    def _connect_with_identity(
+        self, path: Path
+    ) -> tuple[sqlite3.Connection, tuple[int, int]] | None:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             return None
         try:
             _validate_file(fd)
+            info = os.fstat(fd)
+            db_id = (int(info.st_dev), int(info.st_ino))
             _validate_directory(path.parent)
         finally:
             os.close(fd)
         connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
         connection.row_factory = sqlite3.Row
-        return connection
+        return connection, db_id
+
+    def _connect(self, path: Path) -> sqlite3.Connection | None:
+        opened = self._connect_with_identity(path)
+        return opened[0] if opened is not None else None
 
     @staticmethod
     def _pagination(limit: int, offset: int) -> tuple[int, int]:
@@ -1495,6 +1529,174 @@ class HistoryReader:
             connection.close()
 
     @staticmethod
+    def _tail_record(record: Any) -> dict[str, Any]:
+        if not isinstance(record, dict):
+            raise ValueError("request record must be a JSON object")
+        if (
+            not isinstance(record.get("usage_applicable"), bool)
+            and isinstance(record.get("method"), str)
+            and record["method"].upper() in _NON_INFERENCE_METHODS
+        ):
+            record["usage_applicable"] = False
+        record.pop("request_body", None)
+        record.pop("upstream_error", None)
+        for field in PREVIEW_FIELDS:
+            record.pop(field, None)
+        return record
+
+    @staticmethod
+    def _caught_up_anchors(connection: sqlite3.Connection) -> list[tuple[int, str]]:
+        recent = connection.execute(
+            "SELECT rowid,request_id FROM requests ORDER BY rowid DESC LIMIT 64"
+        ).fetchall()
+        latest_started = connection.execute(
+            "SELECT rowid,request_id FROM requests ORDER BY started_at DESC,request_id DESC LIMIT 1"
+        ).fetchone()
+        by_rowid: dict[int, str] = {int(row["rowid"]): str(row["request_id"]) for row in recent}
+        if latest_started is not None:
+            by_rowid.setdefault(int(latest_started["rowid"]), str(latest_started["request_id"]))
+        return sorted(by_rowid.items(), key=lambda pair: -pair[0])
+
+    @staticmethod
+    def _partial_anchors(
+        rows: list[sqlite3.Row], prior_anchors: list[tuple[int, str]]
+    ) -> list[tuple[int, str]]:
+        cutoff = int(rows[-1]["rowid"])
+        by_rowid: dict[int, str] = {int(row["rowid"]): str(row["request_id"]) for row in rows[-64:]}
+        for anchor_rowid, anchor_id in prior_anchors[:65]:
+            if anchor_rowid <= cutoff and len(by_rowid) < 66:
+                by_rowid.setdefault(anchor_rowid, anchor_id)
+        return sorted(by_rowid.items(), key=lambda pair: -pair[0])
+
+    def tail(
+        self,
+        limit: int = 20,
+        *,
+        after_rowid: int | None = None,
+        last_request_id: str | None = None,
+        anchors: list[tuple[int, str]] | None = None,
+        last_db_id: tuple[int, int] | None = None,
+        traffic: str = "all",
+        errors_only: bool = False,
+        exclude_active: bool = False,
+    ) -> dict[str, Any]:
+        condition = self._traffic_condition(traffic)
+        limit, _ = self._pagination(limit, 0)
+        result: dict[str, Any] = {
+            "items": [],
+            "last_rowid": 0,
+            "last_request_id": None,
+            "anchors": [],
+            "db_id": None,
+            "reset": False,
+            "has_more": False,
+        }
+        opened = self._connect_with_identity(self.database_path)
+        if opened is None:
+            if last_db_id is not None:
+                result["reset"] = True
+            return result
+        connection, db_id = opened
+        result["db_id"] = db_id
+        filters = [condition]
+        if errors_only:
+            filters.append(
+                "COALESCE(json_extract(record,'$.outcome'),'') NOT IN ('success','active')"
+            )
+        elif exclude_active:
+            filters.append("COALESCE(json_extract(record,'$.outcome'),'')!='active'")
+        try:
+            connection.execute("BEGIN")
+            tip = connection.execute(
+                "SELECT rowid,request_id FROM requests ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            if tip is None:
+                if last_db_id is not None and db_id != last_db_id:
+                    result["reset"] = True
+                return result
+            max_rowid = int(tip["rowid"])
+            max_request_id = str(tip["request_id"])
+            if after_rowid is None:
+                where = " WHERE " + " AND ".join(filters)
+                rows = connection.execute(
+                    "SELECT record FROM requests"
+                    + where
+                    + " ORDER BY started_at DESC,request_id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                result["items"] = [
+                    self._tail_record(json.loads(row["record"])) for row in reversed(rows)
+                ]
+                result["last_rowid"] = max_rowid
+                result["last_request_id"] = max_request_id
+                result["anchors"] = self._caught_up_anchors(connection)
+                return result
+
+            candidate_anchors: list[tuple[int, str]]
+            if anchors:
+                candidate_anchors = sorted(
+                    {(int(r), str(rid)) for r, rid in anchors if int(r) > 0},
+                    key=lambda pair: -pair[0],
+                )
+            elif after_rowid > 0 and last_request_id is not None:
+                candidate_anchors = [(int(after_rowid), str(last_request_id))]
+            else:
+                candidate_anchors = []
+
+            if last_db_id is not None and db_id != last_db_id:
+                cursor_rowid = 0
+                result["reset"] = True
+            elif candidate_anchors:
+                cursor_rowid = 0
+                matched = False
+                for anchor_rowid, anchor_id in candidate_anchors:
+                    row = connection.execute(
+                        "SELECT request_id FROM requests WHERE rowid=?", (anchor_rowid,)
+                    ).fetchone()
+                    if row is not None and str(row["request_id"]) == anchor_id:
+                        cursor_rowid = anchor_rowid
+                        matched = True
+                        break
+                if not matched:
+                    unique_ids = list({aid for _, aid in candidate_anchors})
+                    placeholders = ",".join("?" for _ in unique_ids)
+                    still_present = (
+                        connection.execute(
+                            f"SELECT 1 FROM requests WHERE request_id IN ({placeholders}) LIMIT 1",
+                            tuple(unique_ids),
+                        ).fetchone()
+                        is not None
+                    )
+                    if not still_present:
+                        result["reset"] = True
+            elif after_rowid > max_rowid:
+                cursor_rowid = 0
+            else:
+                cursor_rowid = max(0, int(after_rowid))
+
+            batch_limit = 200
+            where = " WHERE rowid>? AND " + " AND ".join(filters)
+            rows = connection.execute(
+                "SELECT rowid,request_id,record FROM requests"
+                + where
+                + " ORDER BY rowid ASC LIMIT ?",
+                (cursor_rowid, batch_limit),
+            ).fetchall()
+            result["items"] = [self._tail_record(json.loads(row["record"])) for row in rows]
+            if len(rows) == batch_limit and int(rows[-1]["rowid"]) < max_rowid:
+                result["last_rowid"] = int(rows[-1]["rowid"])
+                result["last_request_id"] = str(rows[-1]["request_id"])
+                result["anchors"] = self._partial_anchors(rows, candidate_anchors)
+                result["has_more"] = True
+            else:
+                result["last_rowid"] = max_rowid
+                result["last_request_id"] = max_request_id
+                result["anchors"] = self._caught_up_anchors(connection)
+            return result
+        finally:
+            connection.close()
+
+    @staticmethod
     def _record_with_legacy_previews(
         connection: sqlite3.Connection, record: dict[str, Any], body: str | None = None
     ) -> dict[str, Any]:
@@ -1568,7 +1770,11 @@ class HistoryReader:
             result["storage"]["active_requests"] = connection.execute(
                 "SELECT COUNT(*) FROM pending"
             ).fetchone()[0]
-            result["storage"].update(dict(connection.execute("SELECT key,value FROM settings")))
+            for setting_name, setting_val in connection.execute("SELECT key,value FROM settings"):
+                if setting_name in _STORAGE_SETTING_NAMES:
+                    if not isinstance(setting_val, int) or isinstance(setting_val, bool):
+                        raise ValueError("storage setting must be an integer")
+                    result["storage"][setting_name] = setting_val
             if connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lifetime'"
             ).fetchone():

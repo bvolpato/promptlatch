@@ -111,6 +111,29 @@ _ANTHROPIC_STREAM_EVENTS = {
     "content_block_delta",
     "content_block_stop",
 }
+_GEMINI_CONTENT_FILTER_REASONS = frozenset(
+    {
+        "SAFETY",
+        "RECITATION",
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "SPII",
+        "IMAGE_SAFETY",
+        "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_RECITATION",
+        "LANGUAGE",
+    }
+)
+
+
+def _is_gemini_envelope(payload: dict[str, Any]) -> bool:
+    response = payload.get("response")
+    envelope = response if isinstance(response, dict) else payload
+    return (
+        isinstance(envelope.get("candidates"), list)
+        or isinstance(envelope.get("usageMetadata"), dict)
+        or isinstance(envelope.get("promptFeedback"), dict)
+    )
 
 
 class _BrotliDecoder(Protocol):
@@ -163,6 +186,7 @@ class ResponseMetrics:
         self._skip_event = False
         self._protocol: str | None = None
         self._llm_stream = False
+        self._json_stream = False
         self._probe = bytearray()
         self._body = bytearray()
         self._unavailable_reason: str | None = None
@@ -275,12 +299,44 @@ class ResponseMetrics:
             self._body.extend(self._probe)
             self._probe.clear()
             if self._body:
-                payload = self._parse(bytes(self._body))
-                if payload is not None:
+                payload = self._parse_body(bytes(self._body))
+                if isinstance(payload, dict):
                     self._protocol = "json"
                     self._observe_payload(payload, streaming=False)
+                elif isinstance(payload, list):
+                    self._protocol = "json"
+                    saw_gemini_stream = False
+                    for item in payload:
+                        saw_gemini_stream |= _is_gemini_envelope(item)
+                        self._observe_payload(item, streaming=False)
+                    if saw_gemini_stream:
+                        self._json_stream = True
+                    if (
+                        saw_gemini_stream
+                        and not self._terminal
+                        and self._outcome != "stream_error"
+                        and not self._http_error
+                    ):
+                        self._outcome = "incomplete"
+                        self._incomplete = True
+                        if (
+                            complete
+                            and not self._unavailable_reason
+                            and not self._error_details
+                            and not self._transport_error_details
+                        ):
+                            self._error_details = {
+                                "event": "stream",
+                                "type": "stream_error",
+                                "code": "stream_incomplete",
+                                "message": "Upstream stream ended before a completion event.",
+                            }
         self._finished = True
         self._clear_buffers()
+
+    @property
+    def json_stream(self) -> bool:
+        return self._json_stream
 
     def observe_body(self, body: bytes, *, decoded: bool = False) -> None:
         self.feed_response(body, decoded=decoded)
@@ -536,27 +592,44 @@ class ResponseMetrics:
                 self._observe_payload(payload, streaming=True)
 
     def _parse(self, data: bytes) -> dict[str, Any] | None:
+        parsed = self._decode_json_value(data)
+        if not isinstance(parsed, dict):
+            self._incomplete = True
+            self._unavailable_reason = "malformed_response"
+            return None
+        return parsed
+
+    def _parse_body(self, data: bytes) -> dict[str, Any] | list[dict[str, Any]] | None:
+        parsed = self._decode_json_value(data)
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list) and parsed and all(isinstance(item, dict) for item in parsed):
+            return parsed
+        self._incomplete = True
+        self._unavailable_reason = "malformed_response"
+        return None
+
+    def _decode_json_value(self, data: bytes) -> Any:
         try:
             try:
-                payload = from_json(data, cache_strings=False)
+                return from_json(data, cache_strings=False)
             except ValueError:
-                payload = json.loads(data)
+                return json.loads(data)
         except (ValueError, UnicodeError, RecursionError):
-            self._incomplete = True
-            self._unavailable_reason = "malformed_response"
             return None
-        if not isinstance(payload, dict):
-            self._incomplete = True
-            self._unavailable_reason = "malformed_response"
-            return None
-        return payload
 
     def _observe_payload(self, payload: dict[str, Any], *, streaming: bool) -> None:
         if streaming and not self._llm_stream:
             event_type = payload.get("type")
-            self._llm_stream = isinstance(payload.get("choices"), list) or (
-                isinstance(event_type, str)
-                and (event_type.startswith("response.") or event_type in _ANTHROPIC_STREAM_EVENTS)
+            self._llm_stream = (
+                isinstance(payload.get("choices"), list)
+                or (
+                    isinstance(event_type, str)
+                    and (
+                        event_type.startswith("response.") or event_type in _ANTHROPIC_STREAM_EVENTS
+                    )
+                )
+                or _is_gemini_envelope(payload)
             )
         if streaming and payload.keys() <= _CHAT_EVENT_KEYS:
             if "model" in payload or "id" in payload or "service_tier" in payload:
@@ -577,7 +650,7 @@ class ResponseMetrics:
         anthropic = event_type in {"message", "message_start", "message_delta", "message_stop"}
         if event_type == "message_start" and isinstance(message, dict):
             envelope = message
-        self._metadata(envelope)
+        self._metadata(envelope, outer=payload if envelope is not payload else None)
         self._inspect_output_costs(envelope)
         if envelope is not payload:
             self._inspect_output_costs(payload)
@@ -587,6 +660,10 @@ class ResponseMetrics:
             self._merge_usage(envelope["usage"], anthropic=anthropic)
         if envelope is not payload and isinstance(payload.get("usage"), dict):
             self._merge_usage(payload["usage"], anthropic=anthropic)
+        if isinstance(envelope.get("usageMetadata"), dict):
+            self._merge_gemini_usage(envelope["usageMetadata"])
+        if envelope is not payload and isinstance(payload.get("usageMetadata"), dict):
+            self._merge_gemini_usage(payload["usageMetadata"])
         error = envelope.get("error")
         if error is None:
             error = payload.get("error")
@@ -623,6 +700,7 @@ class ResponseMetrics:
         }:
             self._terminal = True
         meaningful = self._observe_choices(payload.get("choices"))
+        meaningful |= self._observe_gemini(envelope)
         if isinstance(event_type, str) and event_type in _RESPONSE_DELTAS:
             meaningful |= _has_text(payload.get("delta"))
         if event_type == "content_block_delta":
@@ -711,9 +789,13 @@ class ResponseMetrics:
             self._last_output = self._arrival_time
             self._output_events += 1
 
-    def _metadata(self, envelope: dict[str, Any]) -> None:
+    def _metadata(self, envelope: dict[str, Any], *, outer: dict[str, Any] | None = None) -> None:
         model = envelope.get("model")
-        response_id = envelope.get("id")
+        if model is None and isinstance(envelope.get("modelVersion"), str):
+            model = envelope["modelVersion"].removeprefix("models/")
+        response_id = envelope.get("id") or envelope.get("responseId")
+        if response_id is None and outer is not None:
+            response_id = outer.get("traceId")
         tier = envelope.get("service_tier")
         if isinstance(model, str) and 0 < len(model) <= 512:
             self._model = model
@@ -721,6 +803,175 @@ class ResponseMetrics:
             self._response_id = response_id
         if isinstance(tier, str) and 0 < len(tier) <= 64:
             self._service_tier = tier
+
+    def _observe_gemini(self, envelope: dict[str, Any]) -> bool:
+        meaningful = False
+        prompt_feedback = envelope.get("promptFeedback")
+        if isinstance(prompt_feedback, dict):
+            block_reason = prompt_feedback.get("blockReason")
+            if (
+                isinstance(block_reason, str)
+                and block_reason
+                and block_reason != "BLOCK_REASON_UNSPECIFIED"
+            ):
+                self._terminal = True
+                if self._outcome != "stream_error":
+                    self._outcome = "incomplete"
+                    self._capture_incomplete("gemini.prompt_feedback", "content_filter")
+        candidates = envelope.get("candidates")
+        if not isinstance(candidates, list):
+            return meaningful
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            grounding = candidate.get("groundingMetadata")
+            url_context = candidate.get("urlContextMetadata")
+            if (isinstance(grounding, dict) and grounding) or (
+                isinstance(url_context, dict) and url_context
+            ):
+                self._unsupported_costs = True
+            content = candidate.get("content")
+            if isinstance(content, dict) and isinstance(content.get("parts"), list):
+                for part in content["parts"]:
+                    if not isinstance(part, dict):
+                        continue
+                    if any(
+                        part.get(key)
+                        for key in (
+                            "inlineData",
+                            "inline_data",
+                            "executableCode",
+                            "executable_code",
+                            "codeExecutionResult",
+                            "code_execution_result",
+                        )
+                    ):
+                        self._unsupported_costs = True
+                    if _has_text(part.get("text")):
+                        meaningful = True
+                    else:
+                        call = part.get("functionCall") or part.get("function_call")
+                        if isinstance(call, dict) and (
+                            _has_text(call.get("name")) or bool(call.get("args"))
+                        ):
+                            meaningful = True
+            finish = candidate.get("finishReason")
+            if isinstance(finish, str) and finish and finish != "FINISH_REASON_UNSPECIFIED":
+                self._terminal = True
+                if finish != "STOP" and self._outcome != "stream_error":
+                    self._outcome = "incomplete"
+                    if finish == "MAX_TOKENS":
+                        reason: str | None = "max_output_tokens"
+                    elif finish in _GEMINI_CONTENT_FILTER_REASONS:
+                        reason = "content_filter"
+                    else:
+                        reason = None
+                    self._capture_incomplete("gemini.candidate", reason)
+        return meaningful
+
+    def _merge_gemini_usage(self, usage_meta: dict[str, Any]) -> None:
+        for detail_key in (
+            "promptTokensDetails",
+            "cacheTokensDetails",
+            "candidatesTokensDetails",
+            "toolUsePromptTokensDetails",
+        ):
+            details = usage_meta.get(detail_key)
+            if isinstance(details, list):
+                for entry in details:
+                    if not isinstance(entry, dict):
+                        continue
+                    modality = entry.get("modality")
+                    count = entry.get("tokenCount")
+                    if modality not in (None, "TEXT", "MODALITY_UNSPECIFIED") and count not in (
+                        None,
+                        0,
+                    ):
+                        self._unsupported_costs = True
+        tool_tokens: int | None = None
+        if "toolUsePromptTokenCount" in usage_meta:
+            tool_tokens = _token_count(usage_meta["toolUsePromptTokenCount"])
+            if tool_tokens is None:
+                self._incomplete = True
+            elif tool_tokens > 0:
+                self._unsupported_costs = True
+        prompt_tokens: int | None = None
+        if "promptTokenCount" in usage_meta:
+            prompt_tokens = _token_count(usage_meta["promptTokenCount"])
+            if prompt_tokens is None:
+                self._incomplete = True
+            else:
+                self._usage["input_tokens"] = prompt_tokens
+                self._usage_source = "upstream"
+        cached_invalid = False
+        if "cachedContentTokenCount" in usage_meta:
+            cached_tokens = _token_count(usage_meta["cachedContentTokenCount"])
+            if cached_tokens is None:
+                self._incomplete = True
+                cached_invalid = True
+            else:
+                self._usage["cached_input_tokens"] = cached_tokens
+                self._usage_source = "upstream"
+        elif prompt_tokens is not None and self._usage["cached_input_tokens"] is None:
+            self._usage["cached_input_tokens"] = 0
+        if cached_invalid:
+            self._usage["cached_input_tokens"] = None
+        candidates_invalid = False
+        candidates_tokens: int | None = None
+        if "candidatesTokenCount" in usage_meta:
+            candidates_tokens = _token_count(usage_meta["candidatesTokenCount"])
+            if candidates_tokens is None:
+                self._incomplete = True
+                candidates_invalid = True
+        thoughts_invalid = False
+        thoughts_tokens: int | None = None
+        if "thoughtsTokenCount" in usage_meta:
+            thoughts_tokens = _token_count(usage_meta["thoughtsTokenCount"])
+            if thoughts_tokens is None:
+                self._incomplete = True
+                thoughts_invalid = True
+            else:
+                self._usage["reasoning_tokens"] = thoughts_tokens
+                self._usage_source = "upstream"
+        total_tokens: int | None = None
+        if "totalTokenCount" in usage_meta:
+            total_tokens = _token_count(usage_meta["totalTokenCount"])
+            if total_tokens is None:
+                self._incomplete = True
+            else:
+                self._usage["total_tokens"] = total_tokens
+                self._usage_source = "upstream"
+        if not candidates_invalid and not thoughts_invalid:
+            effective_thoughts = (
+                thoughts_tokens
+                if thoughts_tokens is not None
+                else (self._usage["reasoning_tokens"] or 0)
+            )
+            if candidates_tokens is not None or thoughts_tokens is not None:
+                combined = _token_count((candidates_tokens or 0) + effective_thoughts)
+                if combined is None:
+                    self._incomplete = True
+                else:
+                    self._usage["output_tokens"] = combined
+                    self._usage_source = "upstream"
+            elif (
+                self._usage["output_tokens"] is None
+                and prompt_tokens is not None
+                and total_tokens is not None
+                and total_tokens == prompt_tokens + (tool_tokens or 0)
+            ):
+                self._usage["output_tokens"] = 0
+                self._usage_source = "upstream"
+        in_tok, out_tok = self._usage["input_tokens"], self._usage["output_tokens"]
+        if "totalTokenCount" not in usage_meta and in_tok is not None and out_tok is not None:
+            self._usage["total_tokens"] = _token_count(in_tok + out_tok)
+        elif (
+            total_tokens is not None
+            and in_tok is not None
+            and out_tok is not None
+            and total_tokens != in_tok + out_tok
+        ):
+            self._unsupported_costs = True
 
     def _inspect_output_costs(self, envelope: dict[str, Any]) -> None:
         for key in ("output", "content"):

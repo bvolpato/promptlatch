@@ -460,3 +460,44 @@ def test_tampered_cache_is_not_used(tmp_path):
     reloaded = PricingCatalog(catalog.cache_path)
     reloaded.load()
     assert reloaded.estimate("fixture-model", "openai", USAGE)["cost_usd"] is None
+
+
+def test_matching_reasoning_rate_and_maps_grounding_allow_plain_gemini_pricing(tmp_path):
+    catalog = cached_catalog(
+        tmp_path,
+        {
+            "gemini/fixture-flash": RATE
+            | {
+                "litellm_provider": "gemini",
+                "output_cost_per_reasoning_token": RATE["output_cost_per_token"],
+                "google_maps_grounding_cost_per_query": 0.025,
+            }
+        },
+    )
+    quote = catalog.estimate("fixture-flash", "gemini", USAGE | {"reasoning_tokens": 8})
+    assert quote["cost_usd"] == pytest.approx(0.00032)
+    assert quote["pricing_model"] == "gemini/fixture-flash"
+    assert (
+        catalog.estimate("fixture-flash", "gemini", USAGE | {"unsupported_costs": True})["cost_usd"]
+        is None
+    )
+
+
+def test_bundled_catalog_prices_gemini_models_offline(tmp_path):
+    catalog = PricingCatalog(tmp_path / "missing-cache.json")
+    catalog.load()
+    for model in ("gemini-2.5-pro", "gemini-3.1-pro-preview", "gemini-3.8-flash"):
+        quote = catalog.estimate(
+            model,
+            "gemini",
+            {
+                "input_tokens": 1_000,
+                "output_tokens": 250,
+                "total_tokens": 1_250,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 50,
+            },
+        )
+        assert quote["cost_usd"] is not None and quote["cost_usd"] > 0
+        assert quote["cost_source"] == "litellm_estimate"
+        assert quote["pricing_model"] == f"gemini/{model}"

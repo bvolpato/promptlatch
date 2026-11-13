@@ -3,11 +3,11 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Install PromptLatch and its Codex and Claude Code shims with uv.
+Install PromptLatch and its Codex, Claude Code, and Gemini CLI shims with uv.
 
 Usage: ./install.sh [--help]
 
-The installer adds codex-latch and claude-latch to uv's tool bin directory.
+The installer adds codex-latch, claude-latch, and gemini-latch to uv's tool bin directory.
 It does not edit client configuration, PromptLatch server settings, or shell startup files.
 EOF
 }

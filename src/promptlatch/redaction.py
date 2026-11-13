@@ -88,7 +88,7 @@ _ASCII_ASSIGNMENT_CANDIDATES = {
         r"[\"']?\s*[:=]"
     ),
     dict(BUILTIN_PATTERNS)["auth_header"]: re.compile(
-        r"[^a-z0-9_.-]((?:authorization|proxy-authorization|x-api-key|api-key|"
+        r"[^a-z0-9_.-]((?:authorization|proxy-authorization|x-api-key|x-goog-api-key|api-key|"
         r"x-auth-token|x-auth-key|cf-access-token))[\"']?\s*[:=]"
     ),
 }
@@ -118,13 +118,76 @@ _PayloadContext = Literal[
     "responses-tool-output-content",
     "responses-image-part",
     "responses-encrypted-content-part",
+    "gemini-request",
+    "gemini-inner-request",
+    "gemini-content",
+    "gemini-part",
+    "gemini-function-response",
+    "gemini-inline-image-blob",
 ]
+_RedactionProtocol = Literal["openai-responses", "gemini-generate-content"]
 _IMAGE_MIME_SIGNATURES = {
     "data:image/png;base64": (b"\x89PNG\r\n\x1a\n",),
     "data:image/jpeg;base64": (b"\xff\xd8\xff",),
     "data:image/gif;base64": (b"GIF87a", b"GIF89a"),
     "data:image/webp;base64": (b"RIFF",),
 }
+_GEMINI_IMAGE_SIGNATURES = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
+    "image/webp": (b"RIFF",),
+}
+
+
+def _mapping_or_attr_field(value: Any, key: str) -> tuple[bool, Any]:
+    if isinstance(value, Mapping):
+        return (key in value, value.get(key))
+    model_fields = getattr(type(value), "model_fields", None)
+    model_copy = getattr(value, "model_copy", None)
+    if isinstance(model_fields, Mapping) and callable(model_copy):
+        model_extra = getattr(value, "model_extra", None)
+        if isinstance(model_extra, Mapping) and key in model_extra:
+            return (True, model_extra[key])
+        if key in model_fields and hasattr(value, key):
+            attr_val = getattr(value, key)
+            fields_set = getattr(value, "model_fields_set", None)
+            if attr_val is not None or (
+                isinstance(fields_set, (set, frozenset)) and key in fields_set
+            ):
+                return (True, attr_val)
+    return (False, None)
+
+
+def _is_gemini_inline_image_blob(value: Any) -> bool:
+    has_camel, mime_camel = _mapping_or_attr_field(value, "mimeType")
+    has_snake, mime_snake = _mapping_or_attr_field(value, "mime_type")
+    if not has_camel and not has_snake:
+        return False
+    if has_camel and has_snake and mime_camel != mime_snake:
+        return False
+    mime = mime_camel if has_camel else mime_snake
+    if not isinstance(mime, str):
+        return False
+    signatures = _GEMINI_IMAGE_SIGNATURES.get(mime)
+    has_data, encoded = _mapping_or_attr_field(value, "data")
+    if (
+        signatures is None
+        or not has_data
+        or not isinstance(encoded, str)
+        or not encoded
+        or len(encoded) % 4
+    ):
+        return False
+    try:
+        image = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    if not image.startswith(signatures) or base64.b64encode(image).decode("ascii") != encoded:
+        return False
+    if mime == "image/webp":
+        return len(image) >= 12 and image[8:12] == b"WEBP"
+    return True
 
 
 def _is_opaque_response_content(value: Any) -> bool:
@@ -168,6 +231,16 @@ def _is_response_image_data(value: Any) -> bool:
 
 
 def _response_object_context(value: Any, context: _PayloadContext | None) -> _PayloadContext | None:
+    if context == "gemini-inline-image-blob":
+        return context if _is_gemini_inline_image_blob(value) else None
+    if context in (
+        "gemini-request",
+        "gemini-inner-request",
+        "gemini-content",
+        "gemini-part",
+        "gemini-function-response",
+    ):
+        return context
     item_type = value.get("type") if isinstance(value, Mapping) else getattr(value, "type", None)
     if context == "responses-image-part":
         return context if item_type == "input_image" else None
@@ -1018,14 +1091,18 @@ class SecretRedactor:
         return self._sub_tagged_safe(pattern, value, rule_name)
 
     def redact_payload(
-        self, payload: Any, *, protocol: Literal["openai-responses"] | None = None
+        self, payload: Any, *, protocol: _RedactionProtocol | None = None
     ) -> RedactionResult:
-        if protocol not in (None, "openai-responses"):
+        if protocol not in (None, "openai-responses", "gemini-generate-content"):
             raise ValueError("unsupported redaction protocol")
         stats = RedactionStats()
         if not self.config.enabled:
             return RedactionResult(payload, stats)
-        context = "responses-request" if protocol == "openai-responses" else None
+        context: _PayloadContext | None = None
+        if protocol == "openai-responses":
+            context = "responses-request"
+        elif protocol == "gemini-generate-content":
+            context = "gemini-request"
         if (
             self.config.redact_mode != "tagged"
             or getattr(self._tag_local, "state", None) is not None
@@ -1173,13 +1250,19 @@ class SecretRedactor:
             and _is_response_image_data(value)
         ):
             return value
+        if context == "gemini-inline-image-blob" and key == "data" and isinstance(value, str):
+            return value
         if self._is_sensitive_field(key):
             return self._redact_sensitive_field(value, stats, strict=self._is_strict_field(key))
         child_context: _PayloadContext | None = None
+        allow_sequence = False
+        allow_mapping = False
         if context == "responses-request" and key == "input":
             child_context = "responses-input-item"
+            allow_sequence = True
         elif context == "responses-agent-message" and key == "content":
             child_context = "responses-agent-message-content"
+            allow_sequence = True
         elif (context == "responses-message" and key == "content") or (
             context == "responses-tool-output" and key == "output"
         ):
@@ -1188,9 +1271,46 @@ class SecretRedactor:
                 if context == "responses-message"
                 else "responses-tool-output-content"
             )
-        if child_context is not None and isinstance(value, (list, tuple)):
-            items = [self._walk(item, stats, context=child_context) for item in value]
-            return tuple(items) if isinstance(value, tuple) else items
+            allow_sequence = True
+        elif context == "gemini-request" and key in (
+            "request",
+            "generateContentRequest",
+            "generate_content_request",
+        ):
+            child_context = "gemini-inner-request"
+            allow_mapping = True
+        elif context in ("gemini-request", "gemini-inner-request") and key in (
+            "contents",
+            "systemInstruction",
+            "system_instruction",
+        ):
+            child_context = "gemini-content"
+            allow_sequence = True
+            allow_mapping = True
+        elif context in ("gemini-content", "gemini-function-response") and key == "parts":
+            child_context = "gemini-part"
+            allow_sequence = True
+        elif context in ("gemini-content", "gemini-part") and key in (
+            "functionResponse",
+            "function_response",
+        ):
+            child_context = "gemini-function-response"
+            allow_mapping = True
+        elif (
+            context in ("gemini-content", "gemini-part")
+            and key in ("inlineData", "inline_data")
+            and _is_gemini_inline_image_blob(value)
+        ):
+            child_context = "gemini-inline-image-blob"
+            allow_mapping = True
+        if child_context is not None:
+            if allow_sequence and isinstance(value, (list, tuple)):
+                items = [self._walk(item, stats, context=child_context) for item in value]
+                return tuple(items) if isinstance(value, tuple) else items
+            if allow_mapping and (
+                isinstance(value, Mapping) or self._model_fields(value) is not None
+            ):
+                return self._walk(value, stats, context=child_context)
         return self._walk(value, stats)
 
     def _is_sensitive_field(self, key: Any) -> bool:

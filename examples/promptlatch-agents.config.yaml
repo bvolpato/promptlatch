@@ -9,6 +9,8 @@ target:
     - https://chatgpt.com/backend-api/codex
     - https://api.openai.com/v1
     - https://api.anthropic.com
+    - https://generativelanguage.googleapis.com
+    - https://cloudcode-pa.googleapis.com
   block_private_targets: true
 
 redaction:

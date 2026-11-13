@@ -15,6 +15,7 @@ from promptlatch.config import (
 )
 from promptlatch.history import HistoryReader
 from promptlatch.proxy import create_app
+from promptlatch.redaction import SecretRedactor
 from tests.fixtures import OPENAI_FAKE
 
 
@@ -282,3 +283,122 @@ async def test_native_image_request_larger_than_old_limit_is_redacted_and_forwar
     assert OPENAI_FAKE not in stored["request_body"]
     assert len(stored["request_body"].encode()) <= settings.observability.max_body_bytes
     assert stored["body_truncated"]
+
+
+def test_gemini_protocol_preserves_canonical_inline_images_only() -> None:
+    png_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00" + OPENAI_FAKE.encode("ascii")).decode(
+        "ascii"
+    )
+    webp_b64 = base64.b64encode(b"RIFF\x10\x00\x00\x00WEBP" + OPENAI_FAKE.encode("ascii")).decode(
+        "ascii"
+    )
+    fake_png_b64 = base64.b64encode(b"NOTPNG000" + OPENAI_FAKE.encode("ascii")).decode("ascii")
+    fragment = base64.b64encode(OPENAI_FAKE.encode("ascii")).decode("ascii")[:24]
+    assert fragment in png_b64 and fragment in webp_b64 and fragment in fake_png_b64
+    redactor = SecretRedactor(
+        RedactionConfig(engine="basic", rules=[RuleConfig(type="exact", value=fragment)])
+    )
+
+    payload = {
+        "systemInstruction": {
+            "parts": [
+                {"text": "sys " + OPENAI_FAKE},
+                {"inlineData": {"mimeType": "image/png", "data": png_b64}},
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": "prompt " + OPENAI_FAKE},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/webp",
+                            "data": webp_b64,
+                            "displayName": "shot " + OPENAI_FAKE,
+                            "api_key": "sensitive-sibling",
+                        }
+                    },
+                    {"inlineData": {"mimeType": "text/plain", "data": OPENAI_FAKE}},
+                    {"inlineData": {"mimeType": "image/png", "data": fake_png_b64}},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "mime_type": "image/jpeg",
+                            "data": png_b64,
+                        }
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "name": "tool",
+                            "response": {
+                                "inlineData": {"mimeType": "image/png", "data": OPENAI_FAKE}
+                            },
+                            "parts": [{"inline_data": {"mime_type": "image/png", "data": png_b64}}],
+                        }
+                    }
+                ],
+            },
+        ],
+    }
+
+    result = redactor.redact_payload(payload, protocol="gemini-generate-content").value
+    assert result["systemInstruction"]["parts"][0]["text"] == "sys [REDACTED_SECRET]"
+    assert result["systemInstruction"]["parts"][1]["inlineData"]["data"] == png_b64
+    user_parts = result["contents"][0]["parts"]
+    assert user_parts[0]["text"] == "prompt [REDACTED_SECRET]"
+    assert user_parts[1]["inlineData"]["data"] == webp_b64
+    assert user_parts[1]["inlineData"]["displayName"] == "shot [REDACTED_SECRET]"
+    assert user_parts[1]["inlineData"]["api_key"] == "[REDACTED_SECRET]"
+    assert user_parts[2]["inlineData"]["data"] == "[REDACTED_SECRET]"
+    assert fragment not in user_parts[3]["inlineData"]["data"]
+    assert fragment not in user_parts[4]["inlineData"]["data"]
+    fn_resp = result["contents"][1]["parts"][0]["functionResponse"]
+    assert fn_resp["response"]["inlineData"]["data"] == "[REDACTED_SECRET]"
+    assert fn_resp["parts"][0]["inline_data"]["data"] == png_b64
+
+    wrapped = {
+        "model": "gemini-2.5-pro",
+        "request": {
+            "contents": [{"parts": [{"inlineData": {"mimeType": "image/png", "data": png_b64}}]}]
+        },
+    }
+    assert (
+        redactor.redact_payload(wrapped, protocol="gemini-generate-content").value["request"][
+            "contents"
+        ][0]["parts"][0]["inlineData"]["data"]
+        == png_b64
+    )
+
+    from pydantic import BaseModel
+
+    class DualOptionalBlob(BaseModel):
+        mimeType: str | None = None
+        mime_type: str | None = None
+        data: str
+
+    class PartModel(BaseModel):
+        inline_data: DualOptionalBlob
+
+    class ContentModel(BaseModel):
+        parts: list[PartModel]
+
+    class RequestModel(BaseModel):
+        contents: list[ContentModel]
+
+    model_payload = RequestModel(
+        contents=[
+            ContentModel(
+                parts=[PartModel(inline_data=DualOptionalBlob(mime_type="image/png", data=png_b64))]
+            )
+        ]
+    )
+    redacted_model = redactor.redact_payload(
+        model_payload, protocol="gemini-generate-content"
+    ).value
+    assert redacted_model.contents[0].parts[0].inline_data.data == png_b64

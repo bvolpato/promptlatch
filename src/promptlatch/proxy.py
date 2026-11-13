@@ -10,7 +10,7 @@ import socket
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import anyio
@@ -38,6 +38,8 @@ from promptlatch.observability import (
     Observability,
     ObservabilityMiddleware,
     RequestObservation,
+    is_gemini_api_request,
+    parse_gemini_route,
 )
 from promptlatch.patterns import SENSITIVE_FIELD_RE
 from promptlatch.redaction import RedactionKeyCollisionError, RedactionStats, SecretRedactor
@@ -96,11 +98,12 @@ SENSITIVE_DEBUG_HEADERS = {
     "cookie",
     "set-cookie",
     "x-api-key",
+    "x-goog-api-key",
     "x-auth-token",
     "x-target-api-key",
     "x-target-authorization",
 }
-CLIENT_AUTH_HEADERS = {"authorization", "x-api-key", "x-auth-token"}
+CLIENT_AUTH_HEADERS = {"authorization", "x-api-key", "x-goog-api-key", "x-auth-token"}
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -406,12 +409,39 @@ def _effective_decompressed_limit(settings: Settings) -> tuple[int, str]:
     return 0, ""
 
 
+def _redaction_protocol_for_request(
+    request: Request, path: str, *, parse_json: bool
+) -> Literal["openai-responses", "gemini-generate-content"] | None:
+    if request.method != "POST" or parse_json:
+        return None
+    normalized = path.rstrip("/")
+    if normalized in {
+        "/responses",
+        "/responses/compact",
+        "/v1/responses",
+        "/v1/responses/compact",
+        "/backend-api/codex/responses",
+        "/backend-api/codex/responses/compact",
+    }:
+        return "openai-responses"
+    gemini_route = parse_gemini_route(normalized)
+    if gemini_route is not None and gemini_route.action in {
+        "generateContent",
+        "streamGenerateContent",
+        "countTokens",
+    }:
+        return "gemini-generate-content"
+    return None
+
+
 def _redact_request(
     request: Request, path: str, body: bytes, settings: Settings, parse_json: bool
 ) -> tuple[list[tuple[str, str]], bytes, bytes, RedactionStats, Any | None]:
     redactor = _redactor_for_request(request, settings)
     audit: AuditLogger = request.app.state.audit
-    query_params, query_stats = _redact_query_params(request, redactor)
+    query_params, query_stats = _redact_query_params(
+        request, redactor, path=path, settings=settings
+    )
     audit.redaction(f"query:{path}", query_stats)
     decompressed_limit, decompressed_limit_detail = _effective_decompressed_limit(settings)
     raw_body, content, body_stats, json_payload = _redact_request_body(
@@ -419,19 +449,7 @@ def _redact_request(
         body,
         redactor,
         parse_json=parse_json,
-        preserve_responses=(
-            request.method == "POST"
-            and not parse_json
-            and path.rstrip("/")
-            in {
-                "/responses",
-                "/responses/compact",
-                "/v1/responses",
-                "/v1/responses/compact",
-                "/backend-api/codex/responses",
-                "/backend-api/codex/responses/compact",
-            }
-        ),
+        redaction_protocol=_redaction_protocol_for_request(request, path, parse_json=parse_json),
         max_decompressed_bytes=decompressed_limit,
         decompressed_limit_detail=decompressed_limit_detail,
     )
@@ -514,6 +532,7 @@ def _redact_request_body(
     *,
     parse_json: bool = False,
     preserve_responses: bool = False,
+    redaction_protocol: Literal["openai-responses", "gemini-generate-content"] | None = None,
     max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_REQUEST_BODY_BYTES,
     decompressed_limit_detail: str = "",
 ) -> tuple[bytes, bytes, RedactionStats, Any | None]:
@@ -569,10 +588,11 @@ def _redact_request_body(
             payload = json.loads(body)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="invalid JSON request body") from None
+        protocol = redaction_protocol or ("openai-responses" if preserve_responses else None)
         try:
             result = (
-                redactor.redact_payload(payload, protocol="openai-responses")
-                if preserve_responses
+                redactor.redact_payload(payload, protocol=protocol)
+                if protocol is not None
                 else redactor.redact_payload(payload)
             )
         except RedactionKeyCollisionError:
@@ -592,9 +612,33 @@ def _redact_request_body(
 
 
 def _redact_query_params(
-    request: Request, redactor: SecretRedactor
+    request: Request,
+    redactor: SecretRedactor,
+    *,
+    path: str = "",
+    settings: Settings | None = None,
 ) -> tuple[list[tuple[str, str]], RedactionStats]:
-    return _redact_parameter_pairs(request.query_params.multi_items(), redactor)
+    pairs = list(request.query_params.multi_items())
+    if settings is None:
+        return _redact_parameter_pairs(pairs, redactor)
+    base_url = request.headers.get("x-target-base-url") or settings.target.default_base_url
+    if not is_gemini_api_request(path, base_url):
+        return _redact_parameter_pairs(pairs, redactor)
+    forward_auth = _forwards_client_auth(request, settings)
+    redacted: list[tuple[str, str]] = []
+    stats = RedactionStats()
+    for param_name, param_value in pairs:
+        lowered = param_name.lower()
+        if lowered == "key":
+            if forward_auth:
+                redacted.append((param_name, param_value))
+            continue
+        if lowered == "api_key" and not forward_auth:
+            continue
+        result = redactor.redact_payload({param_name: param_value})
+        stats.merge(result.stats)
+        redacted.append(next(iter(result.value.items())))
+    return redacted, stats
 
 
 def _redact_parameter_pairs(
@@ -720,16 +764,31 @@ def _is_private_host(host: str) -> bool:
     return not ips or any(not ip.is_global for ip in ips)
 
 
+def _forwards_client_auth(request: Request, settings: Settings) -> bool:
+    target_api_key = request.headers.get("x-target-api-key")
+    target_authorization = request.headers.get("x-target-authorization")
+    configured_api_key = (
+        settings.target.api_key if _uses_configured_target(request, settings) else None
+    )
+    has_target_auth = bool(configured_api_key or target_api_key or target_authorization)
+    return bool(
+        settings.target.forward_client_authorization
+        and not settings.server.api_key
+        and not has_target_auth
+    )
+
+
 def _forward_headers(request: Request, settings: Settings) -> dict[str, str]:
     target_api_key = request.headers.get("x-target-api-key")
     target_authorization = request.headers.get("x-target-authorization")
     configured_api_key = (
         settings.target.api_key if _uses_configured_target(request, settings) else None
     )
+    forward_client_auth = _forwards_client_auth(request, settings)
     target_api_key_header = (
         request.headers.get("x-target-api-key-header") or settings.target.api_key_header
     ).lower()
-    if target_api_key_header not in {"authorization", "x-api-key"}:
+    if target_api_key_header not in {"authorization", "x-api-key", "x-goog-api-key"}:
         raise HTTPException(status_code=400, detail="invalid X-Target-API-Key-Header header")
     headers: dict[str, str] = {}
     dropped = DROP_REQUEST_HEADERS | _connection_header_names(request.headers)
@@ -747,12 +806,7 @@ def _forward_headers(request: Request, settings: Settings) -> dict[str, str]:
         }:
             continue
         if lowered in CLIENT_AUTH_HEADERS:
-            has_target_auth = configured_api_key or target_api_key or target_authorization
-            if (
-                settings.server.api_key
-                or has_target_auth
-                or not settings.target.forward_client_authorization
-            ):
+            if not forward_client_auth:
                 continue
         elif SENSITIVE_FIELD_RE.search(lowered):
             continue
@@ -782,8 +836,8 @@ def _uses_configured_target(request: Request, settings: Settings) -> bool:
 
 
 def _set_target_api_key(headers: dict[str, str], api_key: str, header: str) -> None:
-    if header == "x-api-key":
-        headers["x-api-key"] = api_key
+    if header in {"x-api-key", "x-goog-api-key"}:
+        headers[header] = api_key
         return
     headers["authorization"] = f"Bearer {api_key}"
 

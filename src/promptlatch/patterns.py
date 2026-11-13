@@ -135,7 +135,7 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "auth_header",
         re.compile(
             r"(?i)(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
-            r"(?:authorization|proxy-authorization|x-api-key|api-key|x-auth-token|"
+            r"(?:authorization|proxy-authorization|x-api-key|x-goog-api-key|api-key|x-auth-token|"
             r"x-auth-key|cf-access-token)"
             r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']?)"
             r"(?:(?:bearer|token|basic|key)\s+)?)"

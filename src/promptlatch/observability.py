@@ -17,6 +17,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from uuid import uuid4
@@ -52,6 +53,8 @@ _ENDPOINTS = {
     "/v1/completions",
     "/v1/embeddings",
     "/v1/models",
+    "/v1beta/models",
+    "/v1alpha/models",
     "/v1/audio/transcriptions",
     "/v1/audio/speech",
     "/v1/images/generations",
@@ -71,6 +74,7 @@ _PROVIDERS = {
     "api.anthropic.com": "anthropic",
     "openrouter.ai": "openrouter",
     "generativelanguage.googleapis.com": "gemini",
+    "cloudcode-pa.googleapis.com": "gemini",
     "api.groq.com": "groq",
     "api.deepseek.com": "deepseek",
     "api.mistral.ai": "mistral",
@@ -85,12 +89,126 @@ _PROVIDERS = {
 _AUTH_HEADERS = (
     "authorization",
     "x-api-key",
+    "x-goog-api-key",
     "x-auth-token",
     "x-target-api-key",
     "x-target-authorization",
 )
 _BUILTIN_RULES = {name for name, _ in BUILTIN_PATTERNS} | {"sensitive_field"}
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:+-]{0,255}\Z")
+_MODEL_LIST_ENDPOINTS = {
+    "/models",
+    "/v1/models",
+    "/v1beta/models",
+    "/v1alpha/models",
+    "/tunedModels",
+    "/v1beta/tunedModels",
+    "/v1alpha/tunedModels",
+}
+_GEMINI_MODEL_ACTION_RE = re.compile(
+    r"^/(?:(?P<version>v1|v1beta|v1alpha)/)?(?P<collection>models|tunedModels)/"
+    r"(?P<model>[^/]+):"
+    r"(?P<action>generateContent|streamGenerateContent|embedContent|batchEmbedContents|countTokens)\Z"
+)
+_GEMINI_INTERNAL_ACTION_RE = re.compile(
+    r"^/v1internal:(?P<action>generateContent|streamGenerateContent|countTokens|loadCodeAssist|"
+    r"onboardUser|fetchAdminControls|getCodeAssistGlobalUserSetting|setCodeAssistGlobalUserSetting|"
+    r"listExperiments|retrieveUserQuota|recordCodeAssistMetrics)\Z"
+)
+_GEMINI_API_PREFIXES = ("/v1beta/", "/v1alpha/", "/tunedModels/")
+_GEMINI_EXACT_PATHS = frozenset({"/v1beta", "/v1alpha", "/tunedModels"})
+_GEMINI_HOSTS = frozenset({"generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com"})
+_GEMINI_INFERENCE_ACTIONS = frozenset(
+    {"generateContent", "streamGenerateContent", "embedContent", "batchEmbedContents"}
+)
+_GEMINI_MEDIA_PART_KEYS = frozenset(
+    {
+        "inlineData",
+        "inline_data",
+        "fileData",
+        "file_data",
+        "executableCode",
+        "executable_code",
+        "codeExecutionResult",
+        "code_execution_result",
+    }
+)
+_GEMINI_INNER_HINT_KEYS = frozenset(
+    {
+        "contents",
+        "systemInstruction",
+        "system_instruction",
+        "cachedContent",
+        "cached_content",
+        "generationConfig",
+        "generation_config",
+    }
+)
+
+
+@dataclass(frozen=True)
+class GeminiRoute:
+    canonical_path: str
+    action: str
+    url_model: str | None = None
+
+
+def parse_gemini_route(path: str) -> GeminiRoute | None:
+    normalized = path.partition("?")[0].rstrip("/")
+    match = _GEMINI_MODEL_ACTION_RE.fullmatch(normalized)
+    if match is not None:
+        version = match.group("version")
+        collection = match.group("collection")
+        action = match.group("action")
+        prefix = f"/{version}" if version else ""
+        return GeminiRoute(
+            canonical_path=f"{prefix}/{collection}/:{action}",
+            action=action,
+            url_model=match.group("model"),
+        )
+    match = _GEMINI_INTERNAL_ACTION_RE.fullmatch(normalized)
+    if match is not None:
+        action = match.group("action")
+        return GeminiRoute(canonical_path=f"/v1internal:{action}", action=action)
+    return None
+
+
+def _safe_hostname(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except (UnicodeError, ValueError):
+        return ""
+
+
+def is_gemini_api_request(path: str, target_base_url: str = "") -> bool:
+    clean = path.partition("?")[0].rstrip("/")
+    if parse_gemini_route(clean) is not None:
+        return True
+    if clean in _GEMINI_EXACT_PATHS or clean.startswith(_GEMINI_API_PREFIXES):
+        return True
+    return _safe_hostname(target_base_url) in _GEMINI_HOSTS
+
+
+def _gemini_inner_request(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("request", "generateContentRequest", "generate_content_request"):
+        nested = payload.get(key)
+        if isinstance(nested, dict) and (_GEMINI_INNER_HINT_KEYS & nested.keys()):
+            return nested
+    return payload
+
+
+def _is_gemini_tool_result_turn(item: dict[str, Any]) -> bool:
+    parts = item.get("parts")
+    return (
+        isinstance(parts, list)
+        and bool(parts)
+        and all(
+            isinstance(part, dict) and ("functionResponse" in part or "function_response" in part)
+            for part in parts
+        )
+    )
+
+
 _REQUEST_COMPRESSION_VALUES = ("identity", "gzip", "zstd", "other")
 _MAX_REQUEST_BYTES = 2**63 - 1
 _MAX_REQUEST_COMPRESSION_MS = float(2**63 - 1)
@@ -107,6 +225,12 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _request_query_items(request: Request) -> list[tuple[str, str]]:
+    if not request.scope.get("query_string"):
+        return []
+    return list(request.query_params.multi_items())
+
+
 def _known_secrets(
     request: Request, settings: Settings, redactor: SecretRedactor
 ) -> tuple[str, ...]:
@@ -116,6 +240,12 @@ def _known_secrets(
             values.add(value)
             if name.endswith("authorization") and " " in value:
                 values.add(value.split(" ", 1)[1])
+    target = request.headers.get("x-target-base-url") or settings.target.default_base_url
+    gemini_req = is_gemini_api_request(request.scope.get("path", ""), target)
+    for param_name, param_val in _request_query_items(request):
+        lowered = param_name.lower()
+        if lowered == "api_key" or (gemini_req and lowered == "key"):
+            values.add(param_val)
     values.update(rule.value for rule in redactor.config.rules if rule.type == "exact")
     return tuple(sorted((value for value in values if value), key=len, reverse=True))
 
@@ -140,17 +270,71 @@ def _remove_known(value: Any, credentials: tuple[str, ...]) -> Any:
     return value
 
 
+def _is_supported_tool_declaration(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    if tool.get("type") in {"function", "custom"}:
+        return True
+    return (
+        "type" not in tool
+        and bool(tool)
+        and set(tool.keys()) <= {"functionDeclarations", "function_declarations"}
+    )
+
+
+def _gemini_part_has_media(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    if _GEMINI_MEDIA_PART_KEYS & part.keys():
+        return True
+    for resp_key in ("functionResponse", "function_response"):
+        fn_resp = part.get(resp_key)
+        if isinstance(fn_resp, dict):
+            nested_parts = fn_resp.get("parts")
+            if isinstance(nested_parts, list) and any(
+                _gemini_part_has_media(nested) for nested in nested_parts
+            ):
+                return True
+    return False
+
+
+def _gemini_content_has_media(value: Any) -> bool:
+    items = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        parts = item.get("parts")
+        candidates = parts if isinstance(parts, list) else [item]
+        if any(_gemini_part_has_media(part) for part in candidates):
+            return True
+    return False
+
+
 def _unsupported_costs(payload: dict[str, Any]) -> bool:
-    if payload.get("web_search_options") or any(
-        modality != "text" for modality in (payload.get("modalities") or [])
-    ):
-        return True
-    tools = payload.get("tools")
-    if isinstance(tools, list) and any(
-        not isinstance(tool, dict) or tool.get("type") not in {"function", "custom"}
-        for tool in tools
-    ):
-        return True
+    inner = _gemini_inner_request(payload)
+    envelopes = (payload, inner) if inner is not payload else (payload,)
+    for envelope in envelopes:
+        if envelope.get("web_search_options") or any(
+            modality != "text" for modality in (envelope.get("modalities") or [])
+        ):
+            return True
+        gen_config = envelope.get("generationConfig", envelope.get("generation_config"))
+        if isinstance(gen_config, dict):
+            modalities = gen_config.get("responseModalities", gen_config.get("response_modalities"))
+            if isinstance(modalities, list) and any(
+                not isinstance(modality, str) or modality.upper() != "TEXT"
+                for modality in modalities
+            ):
+                return True
+        tools = envelope.get("tools")
+        if isinstance(tools, list) and any(
+            not _is_supported_tool_declaration(tool) for tool in tools
+        ):
+            return True
+        if _gemini_content_has_media(envelope.get("contents")) or _gemini_content_has_media(
+            envelope.get("systemInstruction", envelope.get("system_instruction"))
+        ):
+            return True
     messages = payload.get("messages", payload.get("input", []))
     if not isinstance(messages, list):
         return False
@@ -301,6 +485,11 @@ class Observability:
                 ),
                 None,
             )
+        inner = _gemini_inner_request(payload)
+        if not explicit and (inner is not payload or "contents" in payload):
+            candidate_session = inner.get("session_id") or payload.get("session_id")
+            if isinstance(candidate_session, str) and candidate_session:
+                explicit = candidate_session
         if explicit:
             return self.digest("thread:" + scope, explicit), "explicit"
         previous = payload.get("previous_response_id")
@@ -325,6 +514,19 @@ class Observability:
                 prefix.append(message)
                 if message.get("role") == "user":
                     return self.digest("history:" + scope, _json(prefix)), "inferred_history"
+        contents = inner.get("contents")
+        if isinstance(contents, list):
+            prefix = []
+            system_instruction = inner.get("systemInstruction", inner.get("system_instruction"))
+            if system_instruction is not None:
+                prefix.append({"systemInstruction": system_instruction})
+            for item in contents:
+                if not isinstance(item, dict) or item.get("role") not in {None, "user"}:
+                    break
+                if _is_gemini_tool_result_turn(item):
+                    break
+                prefix.append(item)
+                return self.digest("history:" + scope, _json(prefix)), "inferred_history"
         return uuid4().hex, "request"
 
     def begin(self, request: Request) -> RequestObservation:
@@ -347,6 +549,12 @@ class RequestObservation:
         self.observer_failed = False
         self.upstream_transport_failed = False
         path = request.scope["path"].rstrip("/")
+        self.gemini_route = parse_gemini_route(path)
+        canonical_path = (
+            self.gemini_route.canonical_path
+            if self.gemini_route is not None
+            else (path if path in _ENDPOINTS else "/other")
+        )
         method = (
             request.method
             if request.method in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"}
@@ -359,7 +567,7 @@ class RequestObservation:
             "started_at": time.time(),
             "completed_at": None,
             "method": method,
-            "path": path if path in _ENDPOINTS else "/other",
+            "path": canonical_path,
             "provider": "custom",
             "model": None,
             "stream": False,
@@ -373,6 +581,16 @@ class RequestObservation:
             "body_truncated": False,
             "body_omitted_reason": "not_captured",
         }
+
+    def _normalize_model(self, candidate: Any) -> str | None:
+        if isinstance(candidate, str) and (
+            self.gemini_route is not None or self.record["provider"] == "gemini"
+        ):
+            for prefix in ("models/", "tunedModels/"):
+                if candidate.startswith(prefix):
+                    candidate = candidate.removeprefix(prefix)
+                    break
+        return self.owner.model(candidate, self.credentials, self.metadata_redactor)
 
     def prepare(
         self,
@@ -400,6 +618,12 @@ class RequestObservation:
         target = (
             request.headers.get("x-target-base-url") or self.owner.settings.target.default_base_url
         )
+        gemini_req = is_gemini_api_request(request.scope.get("path", ""), target)
+        caller_params = [
+            (param_name.lower(), param_val)
+            for param_name, param_val in _request_query_items(request)
+            if param_name.lower() == "api_key" or (gemini_req and param_name.lower() == "key")
+        ]
         self.scope = self.owner.digest(
             "scope",
             _json(
@@ -407,10 +631,11 @@ class RequestObservation:
                     target,
                     self.owner.settings.target.api_key,
                     [(name, request.headers.getlist(name)) for name in _AUTH_HEADERS],
+                    caller_params,
                 ]
             ),
         )
-        self.record["provider"] = _PROVIDERS.get(urlsplit(target).hostname or "", "custom")
+        self.record["provider"] = _PROVIDERS.get(_safe_hostname(target), "custom")
         media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
         encoded = not getattr(
             request.state, "body_decoded", False
@@ -423,16 +648,30 @@ class RequestObservation:
             with suppress(ValueError, UnicodeError):
                 payload = json.loads(content)
         if isinstance(payload, dict):
-            self.record["model"] = self.owner.model(
-                payload.get("model"), self.credentials, self.metadata_redactor
+            inner = _gemini_inner_request(payload)
+            raw_model = payload.get("model")
+            if raw_model is None and inner is not payload:
+                raw_model = inner.get("model")
+            if raw_model is None and self.gemini_route is not None:
+                raw_model = self.gemini_route.url_model
+            self.record["model"] = self._normalize_model(raw_model)
+            self.record["stream"] = payload.get("stream") is True or (
+                self.gemini_route is not None
+                and self.gemini_route.action == "streamGenerateContent"
             )
-            self.record["stream"] = payload.get("stream") is True
-            self.record["usage_applicable"] = request.method == "POST" and (
-                self.record["model"] is not None
-                or "input" in payload
-                or "messages" in payload
-                or self.record["path"] in _ENDPOINTS - {"/models", "/v1/models"}
-            )
+            if self.gemini_route is not None:
+                self.record["usage_applicable"] = (
+                    request.method == "POST"
+                    and self.gemini_route.action in _GEMINI_INFERENCE_ACTIONS
+                )
+            else:
+                self.record["usage_applicable"] = request.method == "POST" and (
+                    self.record["model"] is not None
+                    or "input" in payload
+                    or "messages" in payload
+                    or "contents" in payload
+                    or self.record["path"] in _ENDPOINTS - _MODEL_LIST_ENDPOINTS
+                )
             self.record["thread_id"], self.record["thread_source"] = self.owner.thread(
                 request, payload, self.scope
             )
@@ -441,6 +680,13 @@ class RequestObservation:
             self.service_tier = tier if isinstance(tier, str) else None
             self.unsupported_costs = _unsupported_costs(payload)
         else:
+            if self.gemini_route is not None:
+                self.record["model"] = self._normalize_model(self.gemini_route.url_model)
+                self.record["stream"] = self.gemini_route.action == "streamGenerateContent"
+                self.record["usage_applicable"] = (
+                    request.method == "POST"
+                    and self.gemini_route.action in _GEMINI_INFERENCE_ACTIONS
+                )
             self.record["thread_id"], self.record["thread_source"] = self.owner.thread(
                 request, {}, self.scope
             )
@@ -502,28 +748,50 @@ class RequestObservation:
                 "response:" + self.scope, previous
             )
         messages = payload.get("messages", payload.get("input"))
-        if not isinstance(messages, list):
+        if isinstance(messages, list):
+            self.record["message_count"] = len(messages)
+            # Incremental Responses input does not expose the session's turn number.
+            if previous:
+                return
+            user_turn = 0
+            last_user = None
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "user":
+                    content = message.get("content")
+                    if (
+                        isinstance(content, list)
+                        and content
+                        and all(
+                            isinstance(part, dict) and part.get("type") == "tool_result"
+                            for part in content
+                        )
+                    ):
+                        continue
+                    user_turn += 1
+                    last_user = message
+            if last_user is not None:
+                self.record.update(
+                    user_turn=user_turn,
+                    turn_source="inferred",
+                    turn_id=self.owner.digest(
+                        "turn:" + self.record["thread_id"], _json([user_turn, last_user])
+                    ),
+                )
             return
-        self.record["message_count"] = len(messages)
-        # Incremental Responses input does not expose the session's turn number.
-        if previous:
+
+        inner = _gemini_inner_request(payload)
+        contents = inner.get("contents")
+        if not isinstance(contents, list):
             return
+        self.record["message_count"] = len(contents)
         user_turn = 0
         last_user = None
-        for message in messages:
-            if isinstance(message, dict) and message.get("role") == "user":
-                content = message.get("content")
-                if (
-                    isinstance(content, list)
-                    and content
-                    and all(
-                        isinstance(part, dict) and part.get("type") == "tool_result"
-                        for part in content
-                    )
-                ):
+        for item in contents:
+            if isinstance(item, dict) and item.get("role", "user") == "user":
+                if _is_gemini_tool_result_turn(item):
                     continue
                 user_turn += 1
-                last_user = message
+                last_user = item
         if last_user is not None:
             self.record.update(
                 user_turn=user_turn,
@@ -624,7 +892,7 @@ class RequestObservation:
         self.metrics.finish_response(complete=outcome in {"success", "http_error"})
         fields = self.metrics.snapshot()
         fields["upstream_error"] = self._upstream_error()
-        self.record["stream"] = fields["response_format"] == "sse"
+        self.record["stream"] = fields["response_format"] == "sse" or self.metrics.json_stream
         if self.observer_failed:
             fields["metrics_incomplete"] = True
             fields["metrics_unavailable_reason"] = "observer_error"
@@ -650,9 +918,7 @@ class RequestObservation:
                 metrics_unavailable_reason="not_applicable",
                 cost_unavailable_reason="not_applicable",
             )
-        model = self.owner.model(
-            fields.pop("model", None), self.credentials, self.metadata_redactor
-        )
+        model = self._normalize_model(fields.pop("model", None))
         response_id = fields.pop("response_id", None)
         if (
             self.record["usage_applicable"]

@@ -1685,3 +1685,394 @@ async def test_iteration_metadata_and_previews_ignore_tool_cycles(
     assert saved[0]["body_truncated"] is True
     assert len(saved[0]["user_preview"]) <= 200
     assert all(item["body_truncated"] for item in saved)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_gemini_routes_turns_pricing_and_count_tokens_applicability(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://generativelanguage.googleapis.com",
+            block_private_targets=False,
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(database_path=path, pricing_enabled=True),
+    )
+    fake_gemini_key = "AI" + "zaSyDa1234567890abcdef1234567890abcde"
+
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "responseId": "gem_1",
+                    "modelVersion": "models/gemini-2.5-pro",
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {"functionCall": {"name": "lookup", "args": {"q": "status"}}}
+                                ],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 100,
+                        "candidatesTokenCount": 20,
+                        "thoughtsTokenCount": 10,
+                        "totalTokenCount": 130,
+                    },
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "responseId": "gem_2",
+                    "modelVersion": "models/gemini-2.5-pro",
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "All systems green."}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 140,
+                        "cachedContentTokenCount": 50,
+                        "candidatesTokenCount": 15,
+                        "totalTokenCount": 155,
+                    },
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "responseId": "gem_3",
+                    "modelVersion": "models/gemini-2.5-pro",
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "Grounded reply."}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 180,
+                        "candidatesTokenCount": 25,
+                        "totalTokenCount": 205,
+                    },
+                },
+            ),
+        ]
+    )
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:countTokens"
+    ).mock(return_value=httpx.Response(200, json={"totalTokens": 42}))
+
+    turn1 = [{"role": "user", "parts": [{"text": f"Check status with {fake_gemini_key}"}]}]
+    turn1_tool = [
+        *turn1,
+        {"role": "model", "parts": [{"functionCall": {"name": "lookup", "args": {"q": "status"}}}]},
+        {
+            "role": "user",
+            "parts": [{"functionResponse": {"name": "lookup", "response": {"ok": True}}}],
+        },
+    ]
+    turn2_grounded = [
+        *turn1_tool,
+        {"role": "model", "parts": [{"text": "All systems green."}]},
+        {"role": "user", "parts": [{"text": "Search latest release notes"}]},
+    ]
+    fn_tools = [{"functionDeclarations": [{"name": "lookup", "description": "Check status"}]}]
+
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        headers = {"x-goog-api-key": fake_gemini_key}
+        assert (
+            await client.post(
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                headers=headers,
+                json={
+                    "systemInstruction": {"parts": [{"text": "Be concise."}]},
+                    "contents": turn1,
+                    "tools": fn_tools,
+                },
+            )
+        ).status_code == 200
+        assert (
+            await client.post(
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                headers=headers,
+                json={
+                    "systemInstruction": {"parts": [{"text": "Be concise."}]},
+                    "contents": turn1_tool,
+                    "tools": fn_tools,
+                },
+            )
+        ).status_code == 200
+        assert (
+            await client.post(
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                headers=headers,
+                json={
+                    "systemInstruction": {"parts": [{"text": "Be concise."}]},
+                    "contents": turn2_grounded,
+                    "tools": [{"googleSearch": {}}],
+                },
+            )
+        ).status_code == 200
+        assert (
+            await client.post(
+                "/v1beta/models/gemini-2.5-pro:countTokens",
+                headers=headers,
+                json={"contents": turn1},
+            )
+        ).status_code == 200
+
+    saved = sorted(records(path), key=lambda item: item["started_at"])
+    assert [item["path"] for item in saved] == [
+        "/v1beta/models/:generateContent",
+        "/v1beta/models/:generateContent",
+        "/v1beta/models/:generateContent",
+        "/v1beta/models/:countTokens",
+    ]
+    assert all(item["provider"] == "gemini" for item in saved)
+    assert all(item["model"] == "gemini-2.5-pro" for item in saved)
+    assert [item["usage_applicable"] for item in saved] == [True, True, True, False]
+
+    inference = saved[:3]
+    assert len({item["thread_id"] for item in inference}) == 1
+    assert [item["thread_source"] for item in inference] == [
+        "inferred_history",
+        "inferred_history",
+        "inferred_history",
+    ]
+    assert [item["user_turn"] for item in inference] == [1, 1, 2]
+    assert inference[0]["turn_id"] == inference[1]["turn_id"]
+    assert inference[2]["turn_id"] != inference[1]["turn_id"]
+
+    assert inference[0]["input_tokens"] == 100
+    assert inference[0]["output_tokens"] == 30
+    assert inference[0]["reasoning_tokens"] == 10
+    assert inference[0]["cached_input_tokens"] == 0
+    assert inference[0]["cost_usd"] is not None and inference[0]["cost_usd"] > 0
+    assert inference[1]["cached_input_tokens"] == 50
+    assert inference[1]["cost_usd"] is not None and inference[1]["cost_usd"] > 0
+    assert inference[2]["cost_usd"] is None
+    assert inference[2]["cost_unavailable_reason"] == "unsupported_costs"
+
+    reader = HistoryReader(path)
+    assert reader.requests(traffic="inference")["total"] == 3
+    summary = reader.summary()
+    assert summary["totals"]["usage_applicable_requests"] == 3
+    for db_file in tmp_path.glob("*.sqlite3"):
+        assert fake_gemini_key.encode() not in db_file.read_bytes()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_gemini_code_assist_sse_and_ancillary_routes(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://cloudcode-pa.googleapis.com",
+            block_private_targets=False,
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(database_path=path, pricing_enabled=True),
+    )
+    sse_wire = (
+        b'data: {"response":{"responseId":"ca_1","modelVersion":"gemini-3.8-flash",'
+        b'"candidates":[{"content":{"role":"model","parts":[{"text":"Hello from GCA"}]}}]}}\n\n'
+        b'data: {"response":{"candidates":[{"finishReason":"STOP"}],'
+        b'"usageMetadata":{"promptTokenCount":25,"candidatesTokenCount":5,"totalTokenCount":30}}}\n\n'
+    )
+    respx.post("https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent").mock(
+        return_value=httpx.Response(
+            200, content=sse_wire, headers={"content-type": "text/event-stream"}
+        )
+    )
+    respx.post("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist").mock(
+        return_value=httpx.Response(200, json={"cloudaicompanionProject": "proj-1"})
+    )
+
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        fake_oauth = "ya29." + "OpaqueOauthTokenValue"
+        headers = {"Authorization": f"Bearer {fake_oauth}"}
+        assert (
+            await client.post(
+                "/v1internal:loadCodeAssist",
+                headers=headers,
+                json={"metadata": {"ideType": "GEMINI_CLI"}},
+            )
+        ).status_code == 200
+        stream_resp = await client.post(
+            "/v1internal:streamGenerateContent?alt=sse",
+            headers=headers,
+            json={
+                "model": "models/gemini-3.8-flash",
+                "project": "proj-1",
+                "request": {
+                    "session_id": "gca-session-42",
+                    "contents": [{"role": "user", "parts": [{"text": "Explain status"}]}],
+                },
+            },
+        )
+        assert stream_resp.status_code == 200
+        assert stream_resp.content == sse_wire
+
+    saved = sorted(records(path), key=lambda item: item["started_at"])
+    assert [item["path"] for item in saved] == [
+        "/v1internal:loadCodeAssist",
+        "/v1internal:streamGenerateContent",
+    ]
+    assert [item["usage_applicable"] for item in saved] == [False, True]
+    gen = saved[1]
+    assert gen["provider"] == "gemini"
+    assert gen["model"] == "gemini-3.8-flash"
+    assert gen["stream"] is True
+    assert gen["thread_source"] == "explicit"
+    assert gen["user_preview"] == "Explain status"
+    assert gen["total_tokens"] == 30
+    assert gen["cost_usd"] is not None and gen["cost_usd"] > 0
+    for db_file in tmp_path.glob("*.sqlite3"):
+        assert b"OpaqueOauthTokenValue" not in db_file.read_bytes()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_gemini_tuned_models_json_array_stream_query_key_scope_and_tool_media(tmp_path):
+    from promptlatch.observability import parse_gemini_route
+
+    parsed_tuned = parse_gemini_route(
+        "/v1beta/tunedModels/custom-gem-1:streamGenerateContent?alt=sse"
+    )
+    assert parsed_tuned is not None
+    assert parsed_tuned.canonical_path == "/v1beta/tunedModels/:streamGenerateContent"
+    assert parsed_tuned.url_model == "custom-gem-1"
+    parsed_colon = parse_gemini_route("/v1beta/models/gemma3:27b:generateContent")
+    assert parsed_colon is not None
+    assert parsed_colon.url_model == "gemma3:27b"
+
+    path = tmp_path / "history.sqlite3"
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://generativelanguage.googleapis.com",
+            forward_client_authorization=True,
+            block_private_targets=False,
+        ),
+        redaction=RedactionConfig(engine="basic"),
+        observability=ObservabilityConfig(database_path=path, pricing_enabled=True),
+    )
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "responseId": "arr_1",
+                    "modelVersion": "models/gemini-2.5-pro",
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "Done."}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 30,
+                        "candidatesTokenCount": 5,
+                        "totalTokenCount": 35,
+                    },
+                }
+            ],
+        )
+    )
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/tunedModels/my-tuned:generateContent"
+    ).mock(
+        return_value=httpx.Response(
+            400,
+            json={"error": {"message": "Rejected OpaqueQueryCredAlpha"}},
+        )
+    )
+
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        # JSON-array stream + multimodal functionResponse.parts -> stream=True & unsupported_costs
+        for caller_cred in ("OpaqueQueryCredAlpha", "OpaqueQueryCredBeta"):
+            resp = await client.post(
+                "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+                params={"key": caller_cred},
+                json={
+                    "contents": [
+                        {"role": "user", "parts": [{"text": "Same prompt"}]},
+                        {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "functionResponse": {
+                                        "name": "shot",
+                                        "response": {"ok": True},
+                                        "parts": [
+                                            {
+                                                "inlineData": {
+                                                    "mimeType": "image/png",
+                                                    "data": "AAAA",
+                                                }
+                                            }
+                                        ],
+                                    }
+                                }
+                            ],
+                        },
+                    ]
+                },
+            )
+            assert resp.status_code == 200
+        err_resp = await client.post(
+            "/v1beta/tunedModels/my-tuned:generateContent",
+            params={"key": "OpaqueQueryCredAlpha"},
+            json={"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]},
+        )
+        assert err_resp.status_code == 400
+        bad_target_resp = await client.post(
+            "/v1/chat/completions",
+            headers={"X-Target-Base-URL": "http://[invalid"},
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert bad_target_resp.status_code == 400
+        assert bad_target_resp.json()["detail"] == "invalid target URL"
+
+    saved = sorted(records(path), key=lambda item: item["started_at"])
+    assert saved[0]["stream"] is True
+    assert saved[0]["cost_usd"] is None
+    assert saved[0]["cost_unavailable_reason"] == "unsupported_costs"
+    # Different ?key= callers must get isolated session scopes
+    assert saved[0]["thread_id"] != saved[1]["thread_id"]
+    assert saved[2]["path"] == "/v1beta/tunedModels/:generateContent"
+    assert saved[2]["model"] == "my-tuned"
+    assert saved[2]["upstream_error"]["message"] == "Rejected [REDACTED_SECRET]"
+    for db_file in tmp_path.glob("*.sqlite3"):
+        raw = db_file.read_bytes()
+        assert b"OpaqueQueryCredAlpha" not in raw
+        assert b"OpaqueQueryCredBeta" not in raw

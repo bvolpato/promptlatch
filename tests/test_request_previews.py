@@ -92,3 +92,55 @@ def test_responses_history_ignores_nonmessage_items():
         "user_preview": "follow up",
         "assistant_preview": "answer",
     }
+
+
+def test_gemini_contents_and_code_assist_wrapper_extract_previews_without_thoughts():
+    direct = extract_request_previews(
+        {
+            "systemInstruction": {"parts": [{"text": "ignore system"}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "first gemini question"}]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {"thought": True, "text": "internal chain of thought"},
+                        {"functionCall": {"name": "lookup", "args": {"q": "secret"}}},
+                        {"text": "visible gemini answer"},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [{"functionResponse": {"name": "lookup", "response": {"ok": True}}}],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo="}},
+                        {"text": "second gemini question"},
+                    ],
+                },
+            ],
+        }
+    )
+    assert direct == {
+        "session_preview": "first gemini question",
+        "user_preview": "second gemini question",
+        "assistant_preview": "visible gemini answer",
+    }
+
+    wrapped = extract_request_previews(
+        {
+            "model": "gemini-2.5-pro",
+            "request": {
+                "contents": [
+                    {"parts": [{"text": "implicit user role"}]},
+                    {"role": "model", "parts": [{"thought": True, "text": "only thought"}]},
+                ]
+            },
+        }
+    )
+    assert wrapped == {
+        "session_preview": "implicit user role",
+        "user_preview": "implicit user role",
+        "assistant_preview": None,
+    }

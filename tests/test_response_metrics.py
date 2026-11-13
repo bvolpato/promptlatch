@@ -1005,3 +1005,234 @@ def test_observed_audio_and_hosted_tools_disable_plain_token_costs(payload: dict
     metrics.feed(event(payload))
     assert metrics.snapshot()["unsupported_costs"] is True
     assert "private" not in json.dumps(metrics.snapshot())
+
+
+def test_gemini_sse_and_code_assist_wrapper_merge_usage_and_thought_timing() -> None:
+    clock = Clock()
+    metrics = ResponseMetrics(clock.now, clock=clock)
+    clock.now = 11
+    metrics.feed(
+        event(
+            {
+                "traceId": "trace-outer-1",
+                "response": {
+                    "responseId": "gem_resp_1",
+                    "modelVersion": "models/gemini-2.5-pro",
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "internal thought", "thought": True}],
+                            }
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    assert metrics.snapshot()["ttft_ms"] == 1000
+    clock.now = 13
+    metrics.feed(
+        event(
+            {
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "visible answer"}],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 40,
+                        "candidatesTokenCount": 7,
+                        "thoughtsTokenCount": 5,
+                        "totalTokenCount": 52,
+                    },
+                }
+            }
+        )
+    )
+    metrics.finish_stream()
+    snap = metrics.snapshot()
+    assert snap["model"] == "gemini-2.5-pro"
+    assert snap["response_id"] == "gem_resp_1"
+    assert snap["input_tokens"] == 40
+    assert snap["cached_input_tokens"] == 0
+    assert snap["reasoning_tokens"] == 5
+    assert snap["output_tokens"] == 12
+    assert snap["total_tokens"] == 52
+    assert snap["ttft_ms"] == 1000
+    assert snap["generation_ms"] == 2000
+    assert snap["tps"] == pytest.approx(11 / 2)
+    assert snap["outcome_override"] is None
+    assert snap["metrics_incomplete"] is False
+    assert snap["unsupported_costs"] is False
+    assert "internal thought" not in json.dumps(snap)
+    assert "visible answer" not in json.dumps(snap)
+
+
+def test_gemini_json_array_stream_complete_and_truncated() -> None:
+    complete = ResponseMetrics(1)
+    complete.observe_body(
+        json.dumps(
+            [
+                {
+                    "responseId": "gem_arr_1",
+                    "modelVersion": "gemini-2.5-flash",
+                    "candidates": [{"content": {"parts": [{"text": "part 1"}]}}],
+                },
+                {
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "part 2"}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 15,
+                        "cachedContentTokenCount": 5,
+                        "candidatesTokenCount": 4,
+                        "totalTokenCount": 19,
+                    },
+                },
+            ]
+        ).encode()
+    )
+    snap = complete.snapshot()
+    assert snap["model"] == "gemini-2.5-flash"
+    assert snap["response_id"] == "gem_arr_1"
+    assert snap["input_tokens"] == 15
+    assert snap["cached_input_tokens"] == 5
+    assert snap["output_tokens"] == 4
+    assert snap["total_tokens"] == 19
+    assert snap["metrics_incomplete"] is False
+
+    truncated_bytes = b'[{"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}'
+    truncated = ResponseMetrics(1)
+    truncated.observe_body(truncated_bytes)
+    trunc_snap = truncated.snapshot()
+    assert trunc_snap["metrics_incomplete"] is True
+    assert trunc_snap["metrics_unavailable_reason"] == "malformed_response"
+
+    unterminated_array = ResponseMetrics(1)
+    unterminated_array.observe_body(
+        json.dumps([{"candidates": [{"content": {"parts": [{"text": "partial"}]}}]}]).encode()
+    )
+    unterm_snap = unterminated_array.snapshot()
+    assert unterminated_array.json_stream is True
+    assert unterm_snap["outcome_override"] == "incomplete"
+    assert unterm_snap["metrics_incomplete"] is True
+    assert unterminated_array.take_error_details()["code"] == "stream_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [
+        (
+            {
+                "candidates": [
+                    {"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "x"}]}}
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 5,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": 6,
+                },
+            },
+            "upstream_incomplete_max_output_tokens",
+        ),
+        (
+            {
+                "candidates": [{"finishReason": "SAFETY"}],
+                "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 5},
+            },
+            "upstream_incomplete_content_filter",
+        ),
+        (
+            {
+                "promptFeedback": {"blockReason": "BLOCKLIST"},
+                "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 5},
+            },
+            "upstream_incomplete_content_filter",
+        ),
+        (
+            {
+                "candidates": [{"finishReason": "MALFORMED_FUNCTION_CALL"}],
+                "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 5},
+            },
+            "upstream_incomplete",
+        ),
+    ],
+)
+def test_gemini_finish_and_block_reasons_set_incomplete_outcome(
+    payload: dict[str, Any], expected_code: str
+) -> None:
+    metrics = ResponseMetrics(1)
+    metrics.observe_body(json.dumps(payload).encode())
+    snap = metrics.snapshot()
+    details = metrics.take_error_details()
+    assert snap["outcome_override"] == "incomplete"
+    assert details["code"] == expected_code
+    assert snap["output_tokens"] == (1 if "max_output_tokens" in expected_code else 0)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "candidates": [{"groundingMetadata": {"webSearchQueries": ["private"]}}],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7,
+            },
+        },
+        {
+            "candidates": [
+                {"urlContextMetadata": {"urlMetadata": [{"retrievedUrl": "https://x"}]}}
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7,
+            },
+        },
+        {
+            "candidates": [
+                {"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]}}
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7,
+            },
+        },
+        {
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "toolUsePromptTokenCount": 3,
+                "totalTokenCount": 10,
+            }
+        },
+        {
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7,
+                "promptTokensDetails": [{"modality": "AUDIO", "tokenCount": 5}],
+            }
+        },
+    ],
+)
+def test_gemini_grounding_media_and_tool_prompt_tokens_disable_plain_text_pricing(
+    payload: dict[str, Any],
+) -> None:
+    metrics = ResponseMetrics(1)
+    metrics.observe_body(json.dumps(payload).encode())
+    snap = metrics.snapshot()
+    assert snap["unsupported_costs"] is True
+    assert "private" not in json.dumps(snap)

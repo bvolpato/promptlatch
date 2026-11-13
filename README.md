@@ -978,12 +978,14 @@ exact-tail or regex matches. It does not load or call a model.
 Coverage includes fixture-shaped examples for:
 
 - AI provider keys: OpenAI/Codex, Anthropic, Gemini, OpenRouter, Z.AI,
-  MiniMax, DeepSeek, xAI/Grok, and Fireworks.
+  MiniMax, DeepSeek, xAI/Grok, Fireworks, Groq, Perplexity, Cerebras, Replicate,
+  and Tavily.
 - Developer and cloud credentials: GitHub, GitLab, Atlassian, AWS,
-  Cloudflare, Slack, Stripe, Google Cloud, Azure, npm, PyPI, and other common
-  service tokens.
-- Structured credentials: JWTs, signed URLs, URL userinfo, PEM keys, encrypted
-  PEM keys, and PGP private keys.
+  Cloudflare, Slack, Stripe, Google Cloud, Azure, Supabase, Tailscale, Grafana,
+  Postman, PlanetScale, Neon, Vercel, npm, PyPI, and other common service tokens.
+- Structured credentials: JWTs, signed URLs, URL/DSN userinfo (HTTP, Postgres,
+  MySQL, MariaDB, MongoDB, Redis, AMQP, ClickHouse, and `+driver` schemes), PEM
+  keys, encrypted PEM keys, and PGP private keys.
 - Labeled values and JSON fields such as `password`, `token`, `api_key`,
   `authorization`, `credentials`, `signed_url`, and `sas_token`.
 - User-defined exact-tail and regex rules for private formats.

@@ -787,6 +787,103 @@ def test_connection_string_password_is_redacted() -> None:
     assert result.value == "postgresql://user:[REDACTED_SECRET]@localhost/app"
 
 
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize(
+    "scheme",
+    [
+        "rediss",
+        "amqp",
+        "amqps",
+        "mariadb",
+        "mariadb+mariadbconnector",
+        "postgresql+asyncpg",
+        "postgres+psycopg",
+        "mysql+pymysql",
+        "clickhouse",
+        "clickhouses",
+        "clickhouse+native",
+        "clickhousedb",
+        "clickhousedb+connect",
+        "POSTGRESQL+ASYNCPG",
+    ],
+)
+def test_expanded_dsn_schemes_redact_url_credentials(
+    engine: Literal["basic", "detect-secrets"], scheme: str
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine=engine))
+    password = "dsn-password-without-known-prefix"
+    dsn = f"{scheme}://service_user:{password}@db.internal:5432/prod"
+
+    result = redactor.redact_text(dsn)
+
+    assert password not in result.value
+    assert result.value == f"{scheme}://service_user:[REDACTED_SECRET]@db.internal:5432/prod"
+    if engine == "basic":
+        assert result.stats.rule_hits == {"url_credentials": 1}
+    else:
+        assert result.stats.redactions >= 1
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+def test_new_provider_prefixes_redact_standalone_and_comma_separated(
+    engine: Literal["basic", "detect-secrets"],
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine=engine))
+    tokens: list[tuple[str, str, str]] = [
+        ("groq_api_key", "groq_api_key", PROVIDER_FIXTURES["groq_api_key"]),
+        ("perplexity_api_key", "perplexity_api_key", PROVIDER_FIXTURES["perplexity_api_key"]),
+        ("cerebras_api_key", "cerebras_api_key", PROVIDER_FIXTURES["cerebras_api_key"]),
+        ("replicate_api_token", "replicate_api_token", PROVIDER_FIXTURES["replicate_api_token"]),
+        ("tavily_api_key", "tavily_api_key", PROVIDER_FIXTURES["tavily_api_key"]),
+        ("tavily_bare_key", "tavily_api_key", "tvl" + "y-" + ("B" * 32)),
+        ("supabase_pat", "supabase_token", EXPANDED_PROVIDER_FIXTURES["supabase_pat"]),
+        ("supabase_pat_v0", "supabase_token", "sb" + "p_v0_" + ("b" * 40)),
+        ("supabase_oauth", "supabase_token", "sb" + "p_oauth_" + ("c" * 40)),
+        (
+            "supabase_secret_key",
+            "supabase_token",
+            EXPANDED_PROVIDER_FIXTURES["supabase_secret_key"],
+        ),
+        ("tailscale_key", "tailscale_key", EXPANDED_PROVIDER_FIXTURES["tailscale_key"]),
+        (
+            "tailscale_auth_tl",
+            "tailscale_key",
+            "ts" + "key-auth-k123456-" + ("z" * 28) + "--TL" + ("Q" * 32),
+        ),
+        ("tailscale_scim_single", "tailscale_key", "ts" + "key-scim-" + ("m" * 32)),
+        ("tailscale_webhook", "tailscale_key", "ts" + "key-webhook--" + ("w" * 28)),
+        ("grafana_sa_token", "grafana_token", EXPANDED_PROVIDER_FIXTURES["grafana_sa_token"]),
+        ("grafana_sa_upper", "grafana_token", "gl" + "sa_" + ("A" * 32) + "_" + ("F" * 8)),
+        ("grafana_cloud_token", "grafana_token", EXPANDED_PROVIDER_FIXTURES["grafana_cloud_token"]),
+        ("postman_api_key", "postman_api_key", EXPANDED_PROVIDER_FIXTURES["postman_api_key"]),
+        ("planetscale_token", "planetscale_token", EXPANDED_PROVIDER_FIXTURES["planetscale_token"]),
+        (
+            "planetscale_oauth_padded",
+            "planetscale_token",
+            "psc" + "ale_oauth_" + ("B" * 16) + ".-" + ("C" * 18) + "=",
+        ),
+        ("neon_api_key", "neon_api_key", EXPANDED_PROVIDER_FIXTURES["neon_api_key"]),
+        (
+            "vercel_access_token",
+            "vercel_access_token",
+            EXPANDED_PROVIDER_FIXTURES["vercel_access_token"],
+        ),
+    ]
+
+    for label, expected_rule, token in tokens:
+        standalone = redactor.redact_text(f"seen in log {token} after.")
+        assert token not in standalone.value, label
+        assert standalone.value == "seen in log [REDACTED_SECRET] after.", label
+        if engine == "basic":
+            assert standalone.stats.rule_hits == {expected_rule: 1}, label
+
+    comma_joined = ",".join(token for _, _, token in tokens)
+    comma_result = redactor.redact_text(comma_joined)
+    for label, _, token in tokens:
+        assert token not in comma_result.value, label
+    assert comma_result.value == ",".join("[REDACTED_SECRET]" for _ in tokens)
+
+
 def test_comma_separated_provider_api_keys_are_redacted() -> None:
     redactor = SecretRedactor(RedactionConfig(engine="detect-secrets"))
     text = ", ".join(PROVIDER_FIXTURES.values())

@@ -412,6 +412,7 @@ server:
   port: 8000
   api_key: null
   max_request_body_bytes: 0
+  max_decompressed_request_body_bytes: 67108864
 
 target:
   default_base_url: https://api.openai.com/v1
@@ -462,6 +463,9 @@ available through `redact_mode: partial`.
 Request size is unlimited by default (`0`), including inline base64 images and
 conversation history. Set `server.max_request_body_bytes` or
 `PROMPTLATCH_MAX_REQUEST_BODY_BYTES` to a positive byte count to impose a limit.
+Decompressed `gzip` and `zstd` client request bodies are capped at 64 MiB by
+default (`server.max_decompressed_request_body_bytes` or
+`PROMPTLATCH_MAX_DECOMPRESSED_REQUEST_BODY_BYTES`; set to `0` to disable).
 Existing configs retain their explicit limit; set it to `0` to remove it. Requests
 are buffered for redaction, so available memory and upstream provider limits still
 apply. History capture remains capped at 256 KiB per request and SQLite storage at
@@ -500,8 +504,8 @@ Request history records the redacted body size before compression, encoded body
 size, codec, and compression time. Byte counts describe the prepared HTTP body.
 Compression failures fall back to uncompressed bytes
 before sending; failed upstream POSTs are never replayed automatically. Incoming
-compressed client requests still require redaction to be disabled; leave Codex's
-client request compression disabled when using PromptLatch.
+`gzip` and `zstd` client request bodies are decompressed in bounded chunks before
+redaction and re-compressed for configured upstream endpoints when eligible.
 
 Provider token and decompressed-body limits still apply. For the public OpenAI
 Responses endpoint, PromptLatch skips zstd when it would exceed the documented
@@ -998,8 +1002,10 @@ Coverage includes fixture-shaped examples for:
 JSON, query parameters, and URL-encoded form fields are scanned structurally.
 Other unencoded text bodies are scanned without changing unrelated bytes.
 Multipart uploads are rejected with `415` while redaction is enabled: raw byte
-scanning cannot reliably protect attachment contents or form fields. Compressed
-request bodies are also rejected; decompress them before sending.
+scanning cannot reliably protect attachment contents or form fields. Incoming
+`gzip` and `zstd` request bodies are decompressed with bounded expansion checks
+before scanning; unsupported or stacked `Content-Encoding` values are rejected
+with `415`.
 
 Every scan runs locally without an LLM. Entropy-only matching is disabled; use
 custom rules for opaque internal formats.

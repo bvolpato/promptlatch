@@ -21,6 +21,7 @@ LEGACY_CONFIG_DIR = Path.home() / ".config" / "promptcloak"
 LEGACY_CONFIG_PATH = LEGACY_CONFIG_DIR / "config.yaml"
 LEGACY_KEY_PATH = LEGACY_CONFIG_DIR / "key"
 DEFAULT_MAX_REQUEST_BODY_BYTES = 0
+DEFAULT_MAX_DECOMPRESSED_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -32,8 +33,11 @@ class ServerConfig(BaseModel):
     debug_requests: bool = False
     debug_max_body_chars: int = Field(default=20000, ge=0)
     max_request_body_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BODY_BYTES, ge=0)
+    max_decompressed_request_body_bytes: int = Field(
+        default=DEFAULT_MAX_DECOMPRESSED_REQUEST_BODY_BYTES, ge=0
+    )
 
-    @field_validator("max_request_body_bytes")
+    @field_validator("max_request_body_bytes", "max_decompressed_request_body_bytes")
     @classmethod
     def validate_request_body_limit(cls, value: int) -> int:
         if 0 < value < 1024:
@@ -234,6 +238,10 @@ def _env_overrides() -> dict[str, Any]:
         "PROMPTLATCH_DEBUG_REQUESTS": ("server", "debug_requests"),
         "PROMPTLATCH_DEBUG_MAX_BODY_CHARS": ("server", "debug_max_body_chars"),
         "PROMPTLATCH_MAX_REQUEST_BODY_BYTES": ("server", "max_request_body_bytes"),
+        "PROMPTLATCH_MAX_DECOMPRESSED_REQUEST_BODY_BYTES": (
+            "server",
+            "max_decompressed_request_body_bytes",
+        ),
         "PROMPTLATCH_TARGET_DEFAULT_BASE_URL": ("target", "default_base_url"),
         "PROMPTLATCH_TARGET_BASE_URL": ("target", "default_base_url"),
         "PROMPTLATCH_TARGET_API_KEY": ("target", "api_key"),
@@ -391,6 +399,7 @@ def config_template(target_base_url: str, target_api_key_env: str) -> str:
                 "debug_requests": False,
                 "debug_max_body_chars": 20000,
                 "max_request_body_bytes": DEFAULT_MAX_REQUEST_BODY_BYTES,
+                "max_decompressed_request_body_bytes": DEFAULT_MAX_DECOMPRESSED_REQUEST_BODY_BYTES,
             },
             "target": {
                 "default_base_url": target_base_url,

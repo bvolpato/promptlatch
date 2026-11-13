@@ -21,24 +21,39 @@ def test_default_and_generated_request_limits_allow_image_heavy_sessions() -> No
     )
 
     assert Settings().server.max_request_body_bytes == 0
+    assert Settings().server.max_decompressed_request_body_bytes == 64 * 1024**2
     assert generated.server.max_request_body_bytes == 0
+    assert generated.server.max_decompressed_request_body_bytes == 64 * 1024**2
 
 
 @pytest.mark.parametrize("limit", [0, 256 * 1024**2])
 def test_request_limit_environment_overrides_existing_config(monkeypatch, tmp_path, limit) -> None:
     config = tmp_path / "config.yaml"
-    config.write_text("server:\n  max_request_body_bytes: 33554432\n", encoding="utf-8")
+    config.write_text(
+        "server:\n"
+        "  max_request_body_bytes: 33554432\n"
+        "  max_decompressed_request_body_bytes: 16777216\n",
+        encoding="utf-8",
+    )
     monkeypatch.delenv("PROMPTLATCH_MAX_REQUEST_BODY_BYTES", raising=False)
-    assert load_settings(config).server.max_request_body_bytes == 32 * 1024**2
+    monkeypatch.delenv("PROMPTLATCH_MAX_DECOMPRESSED_REQUEST_BODY_BYTES", raising=False)
+    loaded = load_settings(config)
+    assert loaded.server.max_request_body_bytes == 32 * 1024**2
+    assert loaded.server.max_decompressed_request_body_bytes == 16 * 1024**2
     monkeypatch.setenv("PROMPTLATCH_MAX_REQUEST_BODY_BYTES", str(limit))
+    monkeypatch.setenv("PROMPTLATCH_MAX_DECOMPRESSED_REQUEST_BODY_BYTES", str(limit))
 
-    assert load_settings(config).server.max_request_body_bytes == limit
+    overridden = load_settings(config)
+    assert overridden.server.max_request_body_bytes == limit
+    assert overridden.server.max_decompressed_request_body_bytes == limit
 
 
 @pytest.mark.parametrize("limit", [-1, 1, 1023])
 def test_request_limits_reject_invalid_sizes(limit) -> None:
     with pytest.raises(ValidationError):
         ServerConfig(max_request_body_bytes=limit)
+    with pytest.raises(ValidationError):
+        ServerConfig(max_decompressed_request_body_bytes=limit)
 
 
 def test_request_compression_environment_overrides(monkeypatch, tmp_path):

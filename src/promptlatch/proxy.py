@@ -192,10 +192,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
             "observability": {
                 "enabled": expanded.observability.enabled,
-                "healthy": monitoring is not None
-                and monitoring.store.status["running"]
-                and not monitoring.store.status["write_errors"]
-                and not monitoring.store.status["dropped_writes"],
+                "healthy": monitoring is not None and monitoring.store.status["healthy"],
             },
         }
 

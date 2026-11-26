@@ -3,6 +3,7 @@ import gzip
 import json
 import logging
 import threading
+from typing import Any
 from urllib.parse import parse_qsl
 
 import httpx
@@ -16,15 +17,27 @@ from promptlatch.config import (
     ObservabilityConfig,
     RedactionConfig,
     RequestCompressionConfig,
+    RuleConfig,
     ServerConfig,
     Settings,
     TargetConfig,
 )
 from promptlatch.history import HistoryReader
-from promptlatch.proxy import _read_request_body, create_app
+from promptlatch.proxy import _read_request_body, _redact_request_body, create_app
 from promptlatch.redaction import SecretRedactor
 from promptlatch.request_compression import zstd
 from tests.fixtures import OPENAI_FAKE, PROVIDER_FIXTURES
+
+
+def _unmonitored_settings(**sections: Any) -> Settings:
+    sections.setdefault("redaction", RedactionConfig(engine="basic"))
+    return Settings(
+        target=TargetConfig(
+            default_base_url="https://upstream.example", block_private_targets=False
+        ),
+        observability=ObservabilityConfig(enabled=False),
+        **sections,
+    )
 
 
 @pytest.mark.asyncio
@@ -1918,7 +1931,8 @@ async def test_responses_to_chat_bridge_maps_chat_tool_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_dynamic_target_returns_client_error() -> None:
+@pytest.mark.parametrize("target", ["https://[]", "https://999.1.1.1/v1"])
+async def test_malformed_dynamic_target_returns_client_error(target: str) -> None:
     settings = Settings(
         target=TargetConfig(
             default_base_url="https://upstream.example/v1",
@@ -1930,7 +1944,7 @@ async def test_malformed_dynamic_target_returns_client_error() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
             "/v1/responses",
-            headers={"X-Target-Base-URL": "https://[]"},
+            headers={"X-Target-Base-URL": target},
             json={"input": "hello"},
         )
 
@@ -2003,10 +2017,309 @@ async def test_connection_named_hop_headers_are_not_forwarded() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
             "/v1/responses",
-            headers={"Connection": "X-Client-Hop", "X-Client-Hop": "remove-me"},
+            headers=[
+                ("Connection", "keep-alive"),
+                ("Connection", "X-Client-Hop"),
+                ("X-Client-Hop", "remove-me"),
+            ],
             json={"input": "hello"},
         )
 
     assert response.status_code == 200
     assert "x-client-hop" not in route.calls.last.request.headers
     assert "x-upstream-hop" not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content_type", [None, "text/plain;charset=UTF-8", "application/x-www-form-urlencoded"]
+)
+@respx.mock
+async def test_undeclared_json_is_scanned_after_decoding_escapes(content_type: str | None) -> None:
+    route = respx.post("https://upstream.example/api/generate").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    headers = {"Content-Type": content_type} if content_type else {}
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/generate",
+            headers=headers,
+            content=json.dumps({"model": "llama3", "prompt": f"1+1=2 & 100%\n{OPENAI_FAKE}\n"}),
+        )
+        clean_body = b'{ "prompt": "1+1=2 & 100%" }'
+        clean = await client.post("/api/generate", headers=headers, content=clean_body)
+
+    assert response.status_code == clean.status_code == 200
+    assert json.loads(route.calls[0].request.content) == {
+        "model": "llama3",
+        "prompt": "1+1=2 & 100%\n[REDACTED_SECRET]\n",
+    }
+    assert route.calls[1].request.content == clean_body
+
+
+@pytest.mark.parametrize(
+    "content_type", [None, "text/plain;charset=UTF-8", "application/x-www-form-urlencoded"]
+)
+@pytest.mark.parametrize(
+    ("body", "secrets"),
+    [
+        # Only the text scan reads these keys and numbers.
+        ('{"env":{"PGPASSWORD":"hunter2hunter2"}}', ["hunter2hunter2"]),
+        (
+            '{"env":{"PGPASSWORD":"hunter2hunter2"},"prompt":"a\\n' + OPENAI_FAKE + '"}',
+            ["hunter2hunter2", OPENAI_FAKE],
+        ),
+        (
+            '{"card": 4111111111111111, "prompt": "\\u0041\\u000a' + OPENAI_FAKE + '"}',
+            ["4111111111111111", OPENAI_FAKE],
+        ),
+        # A rule can depend on the original spacing or number format.
+        (
+            '{"acct": "A-99", "amount": 123.450, "prompt": "\\u0041\\u000a' + OPENAI_FAKE + '"}',
+            ["A-99", "123.450", OPENAI_FAKE],
+        ),
+        # Parsing drops the first value.
+        (
+            '{"p":"\\u0041\\u000a\\u0073' + OPENAI_FAKE[1:] + '","p":"clean"}',
+            [OPENAI_FAKE[1:]],
+        ),
+        ('"\\u0041\\u000a\\u0073' + OPENAI_FAKE[1:] + '"', [OPENAI_FAKE[1:]]),
+    ],
+)
+def test_undeclared_json_secrets_reach_neither_upstream_nor_history(
+    content_type: str | None, body: str, secrets: list[str]
+) -> None:
+    headers = [(b"content-type", content_type.encode())] if content_type else []
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": headers})
+    redactor = SecretRedactor(
+        RedactionConfig(
+            engine="basic",
+            rules=[
+                RuleConfig(type="regex", value=r"\b4\d{15}\b"),
+                RuleConfig(type="regex", value=r'"acct": "[^"]+"'),
+                RuleConfig(type="regex", value=r"\b\d{3}\.\d{2}0\b"),
+            ],
+        )
+    )
+
+    _, content, _, payload = _redact_request_body(request, body.encode(), redactor)
+
+    for secret in secrets:
+        assert secret not in content.decode()
+        assert secret not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_undeclared_json_keys_that_collide_after_redaction_return_client_error() -> None:
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "text/plain"},
+            content=json.dumps({OPENAI_FAKE + "a": "one", OPENAI_FAKE + "b": "two"}),
+        )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
+@pytest.mark.parametrize("depth", [1_500, 200_000])
+async def test_deeply_nested_json_returns_client_error(content_type: str, depth: int) -> None:
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": content_type},
+            content="[" * depth + "]" * depth,
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "JSON request body is nested too deeply"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_provider_cookies_are_not_replayed_for_other_clients() -> None:
+    route = respx.get("https://upstream.example/v1/models").mock(
+        return_value=httpx.Response(200, headers={"Set-Cookie": "session=first-client; Path=/"})
+    )
+    app = create_app(_unmonitored_settings())
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client,
+    ):
+        await client.get("/v1/models", headers={"X-Target-API-Key": "first-client-key"})
+        await client.get("/v1/models", headers={"X-Target-API-Key": "second-client-key"})
+
+    assert route.call_count == 2
+    assert "cookie" not in route.calls[1].request.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("segment", ["org%2Fmodel", "a%3Fb", "a%23b", "100%2541", "caf%E9"])
+@respx.mock
+async def test_encoded_path_delimiters_are_forwarded_unchanged(segment: str) -> None:
+    route = respx.route(host="upstream.example").mock(return_value=httpx.Response(200))
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.delete(f"/v1/models/{segment}?tag=one")
+
+    assert response.status_code == 200
+    assert route.calls.last.request.url.raw_path == f"/v1/models/{segment}?tag=one".encode()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_repeated_and_non_ascii_headers_are_preserved() -> None:
+    route = respx.get("https://upstream.example/v1/models").mock(
+        return_value=httpx.Response(200, headers=[(b"X-Model-Name", "模型".encode())])
+    )
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            "/v1/models",
+            headers=[
+                (b"Anthropic-Beta", b"first"),
+                (b"Anthropic-Beta", b"second"),
+                (b"X-Title", "Café".encode()),
+            ],
+        )
+
+    assert response.status_code == 200
+    assert (b"x-model-name", "模型".encode()) in response.headers.raw
+    forwarded = route.calls.last.request.headers
+    assert forwarded.get_list("anthropic-beta") == ["first", "second"]
+    assert (b"x-title", "Café".encode()) in forwarded.raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", ["local-token", "clé-locale"])
+@respx.mock
+async def test_proxy_auth_compares_non_ascii_keys(configured: str) -> None:
+    respx.get("https://upstream.example/v1/models").mock(return_value=httpx.Response(200))
+    settings = _unmonitored_settings(server=ServerConfig(api_key=configured))
+    transport = httpx.ASGITransport(app=create_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        rejected = await client.get(
+            "/v1/models", headers=[(b"Authorization", "Bearer clé-fausse".encode())]
+        )
+        accepted = await client.get(
+            "/v1/models", headers=[(b"Authorization", f"Bearer {configured}".encode())]
+        )
+
+    assert rejected.status_code == 401
+    assert accepted.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redaction_enabled", [True, False])
+async def test_undecodable_json_body_returns_client_error(redaction_enabled: bool) -> None:
+    settings = _unmonitored_settings(
+        redaction=RedactionConfig(enabled=redaction_enabled),
+        compat=CompatConfig(responses_to_chat=True),
+    )
+    transport = httpx.ASGITransport(app=create_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "application/json"},
+            content=b'{"input": "caf\xe9"}',
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "invalid JSON request body"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_per_request_rules_accept_utf8_header_values() -> None:
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    rules = '[{"type":"exact","value":"contraseña-larga-123456"}]'
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers=[(b"X-Redact-Extra-Rules", rules.encode())],
+            json={"input": "use contraseña-larga-123456 here"},
+        )
+
+    assert response.status_code == 200
+    assert json.loads(route.calls.last.request.content)["input"] == "use [REDACTED_SECRET] here"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent", [b'{ "input": "hello" }', b'{"input":"hello"}'])
+@respx.mock
+async def test_body_digests_are_dropped_only_when_body_changes(sent: bytes) -> None:
+    route = respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "application/json", "Content-Digest": "sha-256=:original:"},
+            content=sent,
+        )
+
+    forwarded = route.calls.last.request
+    assert ("content-digest" in forwarded.headers) == (forwarded.content == sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@respx.mock
+async def test_responses_to_chat_bridge_reads_response_despite_client_zstd(stream: bool) -> None:
+    delta = {"choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}]}
+    message = {"choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}]}
+    body = f"data: {json.dumps(delta)}\n\ndata: [DONE]\n\n" if stream else json.dumps(message)
+    content_type = "text/event-stream" if stream else "application/json"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if "zstd" not in request.headers["accept-encoding"]:
+            return httpx.Response(200, text=body, headers={"Content-Type": content_type})
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(zstd.compress(body.encode())),
+            headers={"Content-Type": content_type, "Content-Encoding": "zstd"},
+        )
+
+    respx.post("https://upstream.example/v1/chat/completions").mock(side_effect=respond)
+    settings = _unmonitored_settings(compat=CompatConfig(responses_to_chat=True))
+    transport = httpx.ASGITransport(app=create_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Accept-Encoding": "gzip, deflate, br, zstd"},
+            json={"model": "test", "input": "hi", "stream": stream},
+        )
+
+    assert response.status_code == 200
+    assert '"text":"hello"' in response.text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_responses_to_chat_bridge_preserves_lone_surrogates() -> None:
+    # Output limits can cut an emoji in half.
+    respx.post("https://upstream.example/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            content=b'{"choices":[{"message":{"content":"hi \\ud83d"},"finish_reason":"length"}]}',
+            headers={"Content-Type": "application/json"},
+        )
+    )
+    settings = _unmonitored_settings(compat=CompatConfig(responses_to_chat=True))
+    transport = httpx.ASGITransport(app=create_app(settings))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/v1/responses", json={"model": "test", "input": "hi"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/json"
+    assert response.json()["output"][0]["content"][0]["text"] == "hi \ud83d"

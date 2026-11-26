@@ -20,8 +20,7 @@ Choose one proxy installation method.
 Homebrew:
 
 ```bash
-brew tap bvolpato/tap
-brew install promptlatch
+brew install bvolpato/tap/promptlatch
 promptlatch version
 ```
 

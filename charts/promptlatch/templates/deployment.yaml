@@ -37,7 +37,8 @@ spec:
                 name: {{ .Values.existingSecret | quote }}
           {{- end }}
           env:
-            {{- if not (hasKey (.Values.env | default dict) "XDG_STATE_HOME") }}
+            {{- $secretEnv := ternary dict (.Values.secretEnv | default dict) (not (empty .Values.existingSecret)) }}
+            {{- if not (or (hasKey (.Values.env | default dict) "XDG_STATE_HOME") (hasKey $secretEnv "XDG_STATE_HOME")) }}
             - name: XDG_STATE_HOME
               value: /var/lib/promptlatch
             {{- end }}

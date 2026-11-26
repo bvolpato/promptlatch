@@ -108,6 +108,24 @@ def container_env(document: dict[str, Any]) -> list[dict[str, Any]]:
     return document["spec"]["template"]["spec"]["containers"][0]["env"]
 
 
+def assert_writable_state(document: dict[str, Any]) -> None:
+    pod = document["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    state_home = [
+        item["value"] for item in container_env(document) if item["name"] == "XDG_STATE_HOME"
+    ]
+    volumes = {item["name"] for item in pod.get("volumes", [])}
+    mounts = {
+        item["mountPath"]
+        for item in container.get("volumeMounts", [])
+        if item["name"] in volumes and not item.get("readOnly")
+    }
+    if container["securityContext"].get("readOnlyRootFilesystem") and not (
+        len(state_home) == 1 and state_home[0] in mounts
+    ):
+        raise SystemExit("read-only root filesystem has no writable request history path")
+
+
 def main() -> None:
     assert_existing_selector_preserved()
 
@@ -119,6 +137,7 @@ def main() -> None:
         for item in container_env(default_deployment)
     ):
         raise SystemExit("default chart does not require configured proxy authentication")
+    assert_writable_state(default_deployment)
     if not any(item.get("kind") == "Secret" for item in default_documents):
         raise SystemExit("default chart did not render managed Secret")
 

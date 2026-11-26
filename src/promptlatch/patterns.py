@@ -22,80 +22,113 @@ STRICT_SENSITIVE_FIELD_RE = re.compile(
     r"credentials?|authorization)$"
 )
 
+# `\b` reads the letter of a `\n` escape, a color code, a percent escape, or CJK text as
+# part of the token, so a key right after one of them would not match. Accented Latin
+# letters still count as part of a word.
+TOKEN_START = (
+    r"(?:(?<![A-Za-z0-9_\u00C0-\u024F])|(?<=[\\\[;0-9A-Fa-f].)(?:(?<=\\[nrtbfv])|"
+    r"(?<=%[0-9A-Fa-f]{2})|(?<=\\x[0-9A-Fa-f]{2})|(?<=\\u[0-9A-Fa-f]{4})|"
+    r"(?<=[\[;0-9][mK])))"
+)
+_TOKEN_END = r"(?<=[A-Za-z0-9_=-])(?![A-Za-z0-9_])"
+
+
+def _token(
+    head: str, tail: str, *, start: str = TOKEN_START, end: str = _TOKEN_END
+) -> re.Pattern[str]:
+    # Look for the head first. The boundary check is too slow to run at every position.
+    return re.compile(rf"(?={head}){start}{head}{tail}{end}")
+
+
 BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
-    ("openrouter_key", re.compile(r"\bsk-or-v1-[A-Za-z0-9_-]{20,}\b")),
-    ("minimax_key", re.compile(r"\bsk-cp-[A-Za-z0-9_-]{20,}\b")),
-    ("openai_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
-    ("fireworks_key", re.compile(r"\bfw_[A-Za-z0-9_-]{20,}\b")),
-    ("xai_key", re.compile(r"\bxai-[A-Za-z0-9_-]{20,}\b")),
-    ("groq_api_key", re.compile(r"\bgsk_[A-Za-z0-9]{48,}\b")),
-    ("perplexity_api_key", re.compile(r"\bpplx-[A-Za-z0-9]{40,}\b")),
-    ("cerebras_api_key", re.compile(r"\bcsk-[A-Za-z0-9]{40,}\b")),
-    ("replicate_api_token", re.compile(r"\br8_[A-Za-z0-9]{35,}\b")),
-    ("tavily_api_key", re.compile(r"\btvly-(?:dev-|prod-)?[A-Za-z0-9]{24,}\b")),
-    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b")),
-    ("github_fine_grained_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{30,}\b")),
-    ("atlassian_api_token", re.compile(r"\bATATT3xFfGF0[A-Za-z0-9_-]{20,}\b")),
-    ("gitlab_token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b")),
-    ("slack_token", re.compile(r"\bxox[abpors]-[A-Za-z0-9-]{20,}\b")),
-    ("stripe_key", re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}\b")),
-    ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
-    ("aws_access_key_extended", re.compile(r"\b(?:A3T[A-Z0-9]|ABIA|ACCA)[A-Z2-7]{16}\b")),
-    ("aws_bedrock_api_key", re.compile(r"\bABSK[A-Za-z0-9+/]{80,}={0,2}\b")),
-    ("gemini_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35,}\b")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
-    ("google_oauth_token", re.compile(r"\bya29\.[A-Za-z0-9._-]{20,}\b")),
-    ("onepassword_service_account_token", re.compile(r"\bops_eyJ[A-Za-z0-9+/]{120,}={0,3}\b")),
-    ("age_secret_key", re.compile(r"\bAGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}\b")),
-    ("databricks_api_token", re.compile(r"\bdapi[a-f0-9]{32}(?:-\d)?\b")),
-    ("digitalocean_token", re.compile(r"\bd(?:op|oo|or)_v1_[a-f0-9]{64}\b")),
-    ("huggingface_token", re.compile(r"\b(?:hf_|api_org_)[A-Za-z0-9]{34,}\b")),
-    ("linear_api_key", re.compile(r"\blin_api_[A-Za-z0-9]{40}\b")),
-    ("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")),
-    ("pypi_upload_token", re.compile(r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,1000}\b")),
-    ("sendgrid_token", re.compile(r"\bSG\.[A-Za-z0-9_.=-]{66}\b")),
+    ("anthropic_key", _token(r"sk-ant-", r"[A-Za-z0-9_-]{20,}")),
+    ("openrouter_key", _token(r"sk-or-v1-", r"[A-Za-z0-9_-]{20,}")),
+    ("minimax_key", _token(r"sk-cp-", r"[A-Za-z0-9_-]{20,}")),
+    ("openai_key", _token(r"sk-", r"(?:proj-)?[A-Za-z0-9_-]{20,}")),
+    ("fireworks_key", _token(r"fw_", r"[A-Za-z0-9_-]{20,}")),
+    ("xai_key", _token(r"xai-", r"[A-Za-z0-9_-]{20,}")),
+    ("groq_api_key", _token(r"gsk_", r"[A-Za-z0-9]{48,}")),
+    ("perplexity_api_key", _token(r"pplx-", r"[A-Za-z0-9]{40,}")),
+    ("cerebras_api_key", _token(r"csk-", r"[A-Za-z0-9]{40,}")),
+    ("replicate_api_token", _token(r"r8_", r"[A-Za-z0-9]{35,}")),
+    ("tavily_api_key", _token(r"tvly-", r"(?:dev-|prod-)?[A-Za-z0-9]{24,}")),
+    ("github_token", _token(r"gh[pousr]_", r"[A-Za-z0-9_]{30,}")),
+    ("github_fine_grained_pat", _token(r"github_pat_", r"[A-Za-z0-9_]{30,}")),
+    ("atlassian_api_token", _token(r"ATATT3xFfGF0", r"[A-Za-z0-9_-]{20,}(?:=[A-F0-9]{8})?")),
+    ("gitlab_token", _token(r"glpat-", r"[A-Za-z0-9_-]{20,}(?:\.[0-9a-z]{9})?")),
+    ("slack_token", _token(r"xox[abpors]-", r"[A-Za-z0-9-]{20,}")),
+    ("stripe_key", _token(r"(?:sk|rk)_(?:live|test)_", r"[A-Za-z0-9]{20,}")),
+    ("aws_access_key", _token(r"(?:AKIA|ASIA)", r"[A-Z0-9]{16}")),
+    ("aws_access_key_extended", _token(r"(?:A3T[A-Z0-9]|ABIA|ACCA)", r"[A-Z2-7]{16}")),
+    ("aws_bedrock_api_key", _token(r"ABSK", r"[A-Za-z0-9+/]{80,}={0,2}")),
+    ("gemini_api_key", _token(r"AIza", r"[0-9A-Za-z_-]{35,}")),
+    ("jwt", _token(r"eyJ", r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("google_oauth_token", _token(r"ya29\.", r"[A-Za-z0-9._-]{20,}")),
+    ("onepassword_service_account_token", _token(r"ops_eyJ", r"[A-Za-z0-9+/]{120,}={0,3}")),
+    ("age_secret_key", _token(r"AGE-SECRET-KEY-1", r"[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}")),
+    ("databricks_api_token", _token(r"dapi", r"[a-f0-9]{32}(?:-\d)?")),
+    ("digitalocean_token", _token(r"d(?:op|oo|or)_v1_", r"[a-f0-9]{64}")),
+    ("huggingface_token", _token(r"(?:hf_|api_org_)", r"[A-Za-z0-9]{34,}")),
+    ("linear_api_key", _token(r"lin_api_", r"[A-Za-z0-9]{40}")),
+    ("npm_token", _token(r"npm_", r"[A-Za-z0-9]{36}")),
+    ("pypi_upload_token", _token(r"pypi-AgEIcHlwaS5vcmc", r"[A-Za-z0-9_-]{50,}")),
+    ("sendgrid_token", _token(r"SG\.", r"[A-Za-z0-9_.=-]{66}")),
     (
         "slack_webhook",
-        re.compile(
-            r"\bhttps?://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,80}\b"
+        _token(
+            r"https?://hooks\.slack\.com/",
+            r"(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,}",
         ),
     ),
-    ("telegram_bot_token", re.compile(r"\b[0-9]{5,16}:A[A-Za-z0-9_-]{34}\b")),
-    ("twilio_api_key", re.compile(r"\bSK[0-9a-fA-F]{32}\b")),
-    ("vault_token", re.compile(r"\bhv[bs]\.[A-Za-z0-9_-]{80,300}\b")),
-    ("shopify_token", re.compile(r"\bshp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}\b")),
-    ("sentry_token", re.compile(r"\bsntry[su]_[A-Za-z0-9]{40,}\b")),
+    (
+        "telegram_bot_token",
+        # Bot API URLs join the token to a literal `bot`.
+        _token(r"[0-9]{5,16}:A", r"[A-Za-z0-9_-]{34}", start=rf"(?:{TOKEN_START}|(?<=/bot))"),
+    ),
+    ("twilio_api_key", _token(r"SK", r"[0-9a-fA-F]{32}")),
+    ("vault_token", _token(r"hv[bs]\.", r"[A-Za-z0-9_-]{80,}")),
+    ("shopify_token", _token(r"shp(?:at|ca|pa|ss)_", r"[a-fA-F0-9]{32}")),
+    (
+        "sentry_token",
+        # Organization tokens are base64 JSON, an underscore, and the secret.
+        _token(r"sntry[su]_", r"[A-Za-z0-9+/]{40,}(?:={0,2}_[A-Za-z0-9+/]{40,})?"),
+    ),
     (
         "supabase_token",
-        re.compile(
-            r"\bsb(?:p_(?:v0_|oauth_)?[a-f0-9]{40}\b|_secret_[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-]))"
+        _token(
+            r"sb",
+            r"(?:p_(?:v0_|oauth_)?[a-f0-9]{40}|_secret_[A-Za-z0-9_-]{30,})",
         ),
     ),
     (
         "tailscale_key",
-        re.compile(
-            r"\btskey-(?:auth|api|client|scim|webhook)-(?:[A-Za-z0-9]{1,32}-|-)?"
-            r"[A-Za-z0-9_]{16,}(?:--TL[A-Za-z0-9+/=_-]+)?(?![A-Za-z0-9+/=_-])"
+        _token(
+            r"tskey-",
+            r"(?:auth|api|client|scim|webhook)-(?:[A-Za-z0-9]{1,32}-|-)?"
+            r"[A-Za-z0-9_]{16,}(?:--TL[A-Za-z0-9+/=_-]+)?",
+            end=r"(?![A-Za-z0-9+/=_-])",
         ),
     ),
     (
         "grafana_token",
-        re.compile(
-            r"\bgl(?:sa_[A-Za-z0-9]{32}_[a-fA-F0-9]{8}\b|"
-            r"c_eyJ[A-Za-z0-9+/_-]{32,}={0,3}(?![A-Za-z0-9+/=_-]))"
+        _token(
+            r"gl",
+            r"(?:sa_[A-Za-z0-9]{32}_[a-fA-F0-9]{8}(?![A-Za-z0-9_])|"
+            r"c_eyJ[A-Za-z0-9+/_-]{32,}={0,3}(?![A-Za-z0-9+/=_-]))",
+            end="",
         ),
     ),
-    ("postman_api_key", re.compile(r"\bPMAK-[a-fA-F0-9]{24}-[a-fA-F0-9]{34}\b")),
+    ("postman_api_key", _token(r"PMAK-", r"[a-fA-F0-9]{24}-[a-fA-F0-9]{34}")),
     (
         "planetscale_token",
-        re.compile(
-            r"\bpscale_(?:tkn|pw|oauth)_[A-Za-z0-9_-][A-Za-z0-9_.-]{30,}"
-            r"[A-Za-z0-9_-]={0,2}(?![A-Za-z0-9_=-])"
+        _token(
+            r"pscale_",
+            r"(?:tkn|pw|oauth)_[A-Za-z0-9_-][A-Za-z0-9_.-]{30,}[A-Za-z0-9_-]={0,2}",
+            end=r"(?![A-Za-z0-9_=-])",
         ),
     ),
-    ("neon_api_key", re.compile(r"\bnapi_[A-Za-z0-9]{50,}\b")),
-    ("vercel_access_token", re.compile(r"\bvcp_[A-Za-z0-9]{48,}\b")),
+    ("neon_api_key", _token(r"napi_", r"[A-Za-z0-9]{50,}")),
+    ("vercel_access_token", _token(r"vcp_", r"[A-Za-z0-9]{48,}")),
     (
         "private_key",
         re.compile(
@@ -114,9 +147,9 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "signed_url_query_param",
         re.compile(
-            r"(?i)([?&](?:x-amz-signature|x-amz-credential|x-amz-security-token|"
-            r"x-goog-signature|x-goog-credential|googleaccessid|signature|sig)=)"
-            r"([^&#\s]+)"
+            r"(?i)((?:[?&](?:amp;)?|\\u0026)(?:x-amz-signature|x-amz-credential|"
+            r"x-amz-security-token|x-goog-signature|x-goog-credential|googleaccessid|"
+            r"signature|sig)=)([^&#\s\"'<>`\\)]+)"
         ),
     ),
     (
@@ -126,8 +159,9 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"(?P<field>[A-Za-z0-9_.-]*(?:api[_-]?keys?|client[_-]?secrets?|"
             r"secrets?|passwords?|passwd|pwd|tokens?|access[_-]?tokens?|"
             r"refresh[_-]?tokens?|id[_-]?tokens?|auth[_-]?tokens?|session[_-]?tokens?|"
-            r"private[_-]?keys?|credentials?|webhook[_-]?urls?)[A-Za-z0-9_.-]*)"
-            r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']?))"
+            r"private[_-]?keys?|credentials?|webhook[_-]?urls?|"
+            r"(?:account|access)[_-]?keys?(?![_-]?(?:id|name)))[A-Za-z0-9_.-]*)"
+            r"\\*(?P=key_quote)\s*[:=]\s*(?P<value_quote>(?:\\*[\"'])?))"
             r"(?P<secret>[^\"'\s;\[\]]{8,})(?P=value_quote)"
         ),
     ),
@@ -137,18 +171,23 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"(?i)(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
             r"(?:authorization|proxy-authorization|x-api-key|x-goog-api-key|api-key|x-auth-token|"
             r"x-auth-key|cf-access-token)"
-            r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']?)"
-            r"(?:(?:bearer|token|basic|key)\s+)?)"
-            r"(?P<secret>[A-Za-z0-9._~+/=-]{8,})(?P=value_quote)"
+            r"\\*(?P=key_quote)\s*[:=]\s*(?:\[\s*(?=\\*[\"']|bearer\s|basic\s))?"
+            r"(?P<value_quote>(?:\\*[\"'])?)"
+            r"(?:(?:bearer|token|basic|key|api-?key|geniekey|splunk|ssws)\s+)?)"
+            r"(?P<secret>(?!geniekey\s)[A-Za-z0-9._~+/=-]{8,})(?P=value_quote)"
         ),
     ),
     (
         "url_credentials",
         re.compile(
-            r"\b((?i:https?|postgres(?:ql)?(?:\+[a-z0-9_]+)?|mysql(?:\+[a-z0-9_]+)?|"
+            rf"(?=(?i:[acmpr]|https?:)){TOKEN_START}"
+            # A database password can hold a raw `/`. In HTTP that starts a path.
+            r"(?!(?i:https?)://[^\s/@]*/)"
+            r"((?i:https?|postgres(?:ql)?(?:\+[a-z0-9_]+)?|mysql(?:\+[a-z0-9_]+)?|"
             r"mariadb(?:\+[a-z0-9_]+)?|mongodb(?:\+srv)?|rediss?|amqps?|"
             r"clickhouse(?:s|db)?(?:\+[a-z0-9_]+)?)://"
-            r"[^:\s/@]+:)([^@\s/]+)(@)"
+            r"[^:\s/@]*:)(?![0-9]+/)"
+            r"([^@\s/\"]+(?:/[^@\s/?#\"'<>`,\\]+)*(?:@[^@\s/?#\"'<>`,\\]+)*)(@)"
         ),
     ),
 ]

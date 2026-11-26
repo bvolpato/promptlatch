@@ -5,6 +5,7 @@ import json
 import random
 import re
 import threading
+import time
 
 import pytest
 
@@ -636,12 +637,12 @@ def test_positive_candidate_lines_keep_redaction_output_and_hit_counts(
     repeated = redactor.redact_text(text)
     variant = redactor.redact_text(f"{text}\ncontext fixture")
 
-    expected = 'password="[[REDACTED_SECRET]]"\npassword="[[REDACTED_SECRET]]"'
+    expected = 'password="[REDACTED_SECRET]"\npassword="[REDACTED_SECRET]"'
     assert first.value == expected
-    assert first.stats.redactions == 4
+    assert first.stats.redactions == 2
     assert repeated.value == first.value
     assert repeated.stats.rule_hits == first.stats.rule_hits
-    assert variant.stats.redactions == 4
+    assert variant.stats.redactions == 2
     assert len(scanned) > scans_after_first
 
 
@@ -780,3 +781,15 @@ def test_concurrent_scans_match_a_single_scan() -> None:
         thread.join()
 
     assert [results[index] for index in range(len(texts))] == expected
+
+
+def test_unterminated_private_key_headers_are_scanned_once() -> None:
+    header = "-----BEGIN RSA " + "PRIVATE KEY-----\n"
+    complete = header + "QUJD\n-----END RSA " + "PRIVATE KEY-----\n"
+    redactor = SecretRedactor(RedactionConfig(engine="basic"))
+    started = time.process_time()
+    result = redactor.redact_text(complete + header * 8_000)
+
+    assert result.value == "[REDACTED_SECRET]\n" + header * 8_000
+    # Scanning the rest of the text once per header takes more than five seconds.
+    assert time.process_time() - started < 2

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import suppress
@@ -11,8 +10,6 @@ from typing import Any
 from uuid import uuid4
 
 from pydantic_core import from_json
-
-_SSE_NON_CRLF_LINE_BREAK = re.compile(r"[\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 class ResponsesInputError(ValueError):
@@ -36,12 +33,16 @@ def responses_to_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if tools:
             chat["tools"] = _responses_tools_to_chat(tools)
     if "tool_choice" in payload:
-        chat["tool_choice"] = _tool_choice_to_chat(payload["tool_choice"])
-    if "parallel_tool_calls" in payload:
-        parallel_tool_calls = payload["parallel_tool_calls"]
+        tool_choice = _tool_choice_to_chat(payload["tool_choice"])
+        # Chat Completions rejects tool options without tools; Responses accepts them.
+        if "tools" in chat or tool_choice not in ("auto", "none"):
+            chat["tool_choice"] = tool_choice
+    parallel_tool_calls = payload.get("parallel_tool_calls")
+    if parallel_tool_calls is not None:
         if not isinstance(parallel_tool_calls, bool):
             raise ResponsesInputError("Responses parallel_tool_calls must be boolean")
-        chat["parallel_tool_calls"] = parallel_tool_calls
+        if "tools" in chat:
+            chat["parallel_tool_calls"] = parallel_tool_calls
     for source, target in {
         "temperature": "temperature",
         "top_p": "top_p",
@@ -635,7 +636,7 @@ def _chat_sse_event_to_responses(raw_lines: list[str], state: _ChatStreamState) 
         return
     if len(raw_lines) == 1:
         line = raw_lines[0]
-        if line.startswith("data:") and _SSE_NON_CRLF_LINE_BREAK.search(line) is None:
+        if line.startswith("data:"):
             event_name = None
             data = line[5:].lstrip()
         else:
@@ -758,11 +759,7 @@ def _chat_sse_event_to_responses(raw_lines: list[str], state: _ChatStreamState) 
                 yield event
 
 
-def _chat_sse_event_fields(raw_lines: list[str]) -> tuple[str | None, str]:
-    if any(_SSE_NON_CRLF_LINE_BREAK.search(line) for line in raw_lines):
-        lines = "\n".join(raw_lines).splitlines()
-    else:
-        lines = raw_lines
+def _chat_sse_event_fields(lines: list[str]) -> tuple[str | None, str]:
     event_name = next(
         (line.removeprefix("event:").lstrip() for line in lines if line.startswith("event:")),
         None,
@@ -1049,6 +1046,8 @@ def _response_format(text_config: Any) -> dict[str, Any] | None:
     fmt = text_config.get("format")
     if not isinstance(fmt, dict):
         return None
+    if fmt.get("type") == "json_object":
+        return {"type": "json_object"}
     if fmt.get("type") != "json_schema":
         return None
     return {
@@ -1215,13 +1214,25 @@ def _responses_usage(usage: Any) -> dict[str, Any] | None:
     input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
     output_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
     total_tokens = usage.get("total_tokens") or input_tokens + output_tokens
+    input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+    output_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details")
     return {
         "input_tokens": input_tokens,
-        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+        "input_tokens_details": {
+            key: _usage_detail(input_details, key)
+            for key in ("cached_tokens", "cache_write_tokens")
+        },
         "output_tokens": output_tokens,
-        "output_tokens_details": {"reasoning_tokens": 0},
+        "output_tokens_details": {
+            "reasoning_tokens": _usage_detail(output_details, "reasoning_tokens")
+        },
         "total_tokens": total_tokens,
     }
+
+
+def _usage_detail(details: Any, key: str) -> int:
+    value = details.get(key) if isinstance(details, dict) else None
+    return value if type(value) is int else 0
 
 
 def _tool_name(item: dict[str, Any]) -> str:

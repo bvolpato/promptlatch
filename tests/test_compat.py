@@ -132,17 +132,55 @@ async def test_chat_stream_accepts_crlf_events_split_between_chunks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_keeps_unicode_line_separator_fallback() -> None:
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+@pytest.mark.parametrize("prefix", ["", "event: message\n"])
+async def test_chat_stream_preserves_unicode_line_separators_in_content(
+    separator: str, prefix: str
+) -> None:
+    text = f"before{separator}after"
     payload = json.dumps(
-        {"choices": [{"delta": {"content": "before\u2028after"}}]},
+        {"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]},
         ensure_ascii=False,
     )
-    output = await _collect([f"data: {payload}\n\n".encode()])
+    output = await _collect([f"{prefix}data: {payload}\n\ndata: [DONE]\n\n".encode()])
 
-    events = _events(output)
-    assert not any(event["type"] == "response.output_text.delta" for event in events)
-    assert events[-2]["code"] == "upstream_stream_invalid"
-    assert events[-1]["type"] == "response.failed"
+    terminal = _events(output)[-1]
+    assert terminal["type"] == "response.completed"
+    assert terminal["response"]["output"][0]["content"][0]["text"] == text
+
+
+@pytest.mark.asyncio
+async def test_chat_usage_details_survive_responses_conversion() -> None:
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+        "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30},
+        "completion_tokens_details": {"reasoning_tokens": 40},
+    }
+    finish = {"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}
+    output = await _collect(
+        [
+            f"data: {json.dumps(finish)}\n\n".encode(),
+            f"data: {json.dumps({'choices': [], 'usage': usage})}\n\n".encode(),
+            b"data: [DONE]\n\n",
+        ]
+    )
+    buffered = chat_response_to_responses(
+        {
+            "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+            "usage": usage,
+        }
+    )
+
+    for converted in (_events(output)[-1]["response"]["usage"], buffered["usage"]):
+        assert converted == {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30},
+            "output_tokens": 50,
+            "output_tokens_details": {"reasoning_tokens": 40},
+            "total_tokens": 150,
+        }
 
 
 @pytest.mark.asyncio
@@ -989,6 +1027,47 @@ def test_responses_named_tool_choice_uses_chat_function_shape() -> None:
         "type": "function",
         "function": {"name": "inspect_config"},
     }
+
+
+@pytest.mark.parametrize("tools", [{}, {"tools": []}])
+@pytest.mark.parametrize("tool_choice", ["auto", "none"])
+def test_responses_omits_tool_options_without_tools(tools: dict, tool_choice: str) -> None:
+    chat = responses_to_chat_payload(
+        {
+            "model": "fixture-model",
+            "input": "hello",
+            "tool_choice": tool_choice,
+            "parallel_tool_calls": False,
+            **tools,
+        }
+    )
+
+    assert chat.keys() == {"model", "messages", "stream"}
+
+
+def test_responses_null_parallel_tool_calls_uses_provider_default() -> None:
+    tool = {"type": "function", "name": "inspect", "parameters": {"type": "object"}}
+    request = {"model": "fixture-model", "input": "hello", "tools": [tool], "tool_choice": "auto"}
+
+    chat = responses_to_chat_payload({**request, "parallel_tool_calls": None})
+    assert chat["tool_choice"] == "auto"
+    assert "parallel_tool_calls" not in chat
+    assert (
+        responses_to_chat_payload({**request, "parallel_tool_calls": False})["parallel_tool_calls"]
+        is False
+    )
+
+
+def test_responses_json_object_format_maps_to_chat_response_format() -> None:
+    chat = responses_to_chat_payload(
+        {
+            "model": "fixture-model",
+            "input": "Reply in JSON.",
+            "text": {"format": {"type": "json_object"}},
+        }
+    )
+
+    assert chat["response_format"] == {"type": "json_object"}
 
 
 def test_responses_namespace_tool_and_choice_use_flattened_chat_name() -> None:

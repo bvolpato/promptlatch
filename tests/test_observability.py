@@ -17,7 +17,7 @@ from starlette.requests import Request
 
 from promptlatch.config import ObservabilityConfig, RedactionConfig, Settings, TargetConfig
 from promptlatch.history import HistoryReader, HistoryStore
-from promptlatch.observability import Observability
+from promptlatch.observability import Observability, _unsupported_costs
 from promptlatch.pricing import CATALOG_URL, PricingCatalog
 from promptlatch.proxy import _stream_upstream, create_app
 from promptlatch.redaction import RedactionStats, SecretRedactor
@@ -1304,6 +1304,37 @@ async def test_retained_subscription_repricing_pages_and_keeps_stats_consistent(
 
 
 @pytest.mark.asyncio
+async def test_repricing_leaves_queue_capacity_for_live_requests(tmp_path, monkeypatch):
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.observability.pricing_enabled = True
+    settings.observability.queue_size = 8
+    observer = Observability(settings)
+    observer.start()
+    candidates = [{"request_id": str(index), "model": "gpt-6.1-sol"} for index in range(20)]
+    monkeypatch.setattr(
+        observer.reader,
+        "subscription_pricing_candidates",
+        lambda *args, **kwargs: {"items": candidates, "next_cursor": None},
+    )
+    monkeypatch.setattr(observer.pricing, "estimate", lambda *args: {"cost_usd": 0.25})
+    depths = []
+
+    def submit_reprice(request_id, quote):
+        depths.append(observer.store.status["queue_depth"])
+        return observer.store._submit("reprice", {"request_id": request_id})
+
+    monkeypatch.setattr(observer.store, "submit_reprice", submit_reprice)
+    try:
+        await observer.reprice_subscriptions()
+    finally:
+        observer.close()
+    assert len(depths) == len(candidates)
+    assert max(depths) < settings.observability.queue_size // 2
+    assert observer.store.dropped_writes == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error_type", [sqlite3.OperationalError, sqlite3.DatabaseError, PermissionError, ValueError]
 )
@@ -1379,6 +1410,160 @@ async def test_nonstream_response_alias_usage_and_get_bookkeeping(tmp_path):
     assert models["usage_applicable"] is False
     totals = HistoryReader(path).summary()["totals"]
     assert totals["unknown_usage_requests"] == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "target,endpoint,payload",
+    [
+        ("https://api.anthropic.com", "/v1/messages/count_tokens", {"messages": []}),
+        ("https://api.openai.com", "/v1/responses/input_tokens", {"input": "hi"}),
+    ],
+)
+async def test_token_counting_does_not_count_as_missing_usage(tmp_path, target, endpoint, payload):
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.target.default_base_url = target
+    respx.post(target + endpoint).mock(return_value=httpx.Response(200, json={"input_tokens": 10}))
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        response = await client.post(endpoint, json={"model": "fixture-model", **payload})
+        assert response.json() == {"input_tokens": 10}
+    saved = records(path)[0]
+    assert saved["usage_applicable"] is False
+    assert saved["cost_unavailable_reason"] == "not_applicable"
+    totals = HistoryReader(path).summary()["totals"]
+    assert totals["unknown_usage_requests"] == 0
+    assert totals["unknown_cost_requests"] == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "tool,priced",
+    [
+        ({"name": "lookup", "input_schema": {"type": "object"}}, True),
+        ({"type": None, "name": "lookup", "input_schema": {"type": "object"}}, True),
+        ({"type": "web_search_20250305", "name": "web_search"}, False),
+    ],
+)
+async def test_anthropic_client_tools_do_not_block_token_pricing(tmp_path, tool, priced):
+    path = tmp_path / "history.sqlite3"
+    settings = settings_for(path)
+    settings.observability.pricing_enabled = True
+    settings.target.default_base_url = "https://api.anthropic.com"
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(503))
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "type": "message",
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+        )
+    )
+    app = create_app(settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [tool],
+            },
+        )
+    saved = records(path)[0]
+    assert (saved["cost_usd"] is not None) is priced
+    assert saved["cost_unavailable_reason"] == (None if priced else "unsupported_costs")
+
+
+@pytest.mark.parametrize(
+    "nested,unsupported",
+    [([{"type": "function"}, {"type": "custom"}], False), ([{"type": "web_search"}], True)],
+)
+def test_namespaced_client_tools_do_not_block_token_pricing(nested, unsupported):
+    payload = {"input": [], "tools": [{"type": "namespace", "name": "files", "tools": nested}]}
+    assert _unsupported_costs(payload) is unsupported
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_lone_surrogates_do_not_discard_captured_content(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    respx.post("https://upstream.example/v1/responses").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    app = create_app(settings_for(path))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        response = await client.post(
+            "/v1/responses",
+            content=b'{"input":"cut \\ud83d here ' + OPENAI_FAKE.encode() + b'"}',
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 200
+    saved = records(path)[0]
+    assert saved["body_omitted_reason"] is None
+    assert saved["request_body"].startswith('{"input":"cut ? here ')
+    assert saved["user_preview"].startswith("cut ? here ")
+    assert OPENAI_FAKE not in json.dumps(saved)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_moving_cache_breakpoints_keep_one_thread_and_turn(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    respx.post("https://upstream.example/v1/messages").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    cached = {"cache_control": {"type": "ephemeral"}}
+    tool_result = {"type": "tool_result", "content": "ok", **cached}
+    cycle = [
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "lookup", "input": {}}]},
+        {"role": "user", "content": [tool_result]},
+    ]
+    reminder, prompt = {"type": "text", "text": "reminder"}, {"type": "text", "text": "hi"}
+    # A breakpoint on string content requires its single-block equivalent.
+    contents = [[[reminder, prompt | cached], [reminder, prompt]], [[prompt | cached], "hi"]]
+    app = create_app(settings_for(path))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client,
+    ):
+        for first, later in contents:
+            for messages in (
+                [{"role": "user", "content": first}],
+                [{"role": "user", "content": later}, *cycle],
+            ):
+                await client.post("/v1/messages", json={"model": "fixture", "messages": messages})
+    saved = sorted(records(path), key=lambda item: item["started_at"])
+    assert {item["thread_source"] for item in saved} == {"inferred_history"}
+    for key in ("thread_id", "turn_id"):
+        assert saved[0][key] == saved[1][key] != saved[2][key] == saved[3][key]
 
 
 @pytest.mark.asyncio

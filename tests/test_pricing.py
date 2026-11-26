@@ -297,6 +297,7 @@ def test_unsupported_cache_write_ttl_only_affects_cache_writes(tmp_path):
             | {
                 "cache_creation_input_token_cost": 0.000003,
                 "cache_creation_input_token_cost_above_1hr": 0.000004,
+                "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 0.000008,
             }
         },
     )
@@ -317,6 +318,7 @@ def test_unsupported_cache_write_ttl_only_affects_cache_writes(tmp_path):
         {"unknown_cost_per_token": 0.000001},
         {"unknown_cost_per_token_priority": 0.000001},
         {"unknown_cost_per_token_ultrafast": 0.000001},
+        {"off_peak_pricing": {"hours_utc": "16:00-00:00", "input_cost_per_token": 0.000001}},
     ],
 )
 def test_unsupported_billing_meters_are_unknown(tmp_path, extra):

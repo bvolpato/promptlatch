@@ -68,6 +68,12 @@ _ENDPOINTS = {
     "/backend-api/codex/responses",
     "/backend-api/codex/responses/compact",
 }
+_TOKEN_COUNT_ENDPOINTS = {
+    "/v1/messages/count_tokens",
+    "/messages/count_tokens",
+    "/v1/responses/input_tokens",
+    "/responses/input_tokens",
+}
 _PROVIDERS = {
     "api.openai.com": "openai",
     "chatgpt.com": "chatgpt",
@@ -273,13 +279,35 @@ def _remove_known(value: Any, credentials: tuple[str, ...]) -> Any:
 def _is_supported_tool_declaration(tool: Any) -> bool:
     if not isinstance(tool, dict):
         return False
-    if tool.get("type") in {"function", "custom"}:
+    kind = tool.get("type")
+    if kind in {"function", "custom"} or (kind is None and "input_schema" in tool):
         return True
+    if kind == "namespace":
+        nested = tool.get("tools")
+        return isinstance(nested, list) and all(map(_is_supported_tool_declaration, nested))
     return (
         "type" not in tool
         and bool(tool)
         and set(tool.keys()) <= {"functionDeclarations", "function_declarations"}
     )
+
+
+def _grouping_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Ignore prompt-cache breakpoints, which clients move on every request."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    blocks = [
+        {key: value for key, value in block.items() if key != "cache_control"}
+        if isinstance(block, dict)
+        else block
+        for block in content
+    ]
+    block = blocks[0] if len(blocks) == 1 else None
+    if isinstance(block, dict) and block.keys() == {"type", "text"} and block["type"] == "text":
+        # String content is shorthand for a single text block.
+        return {**message, "content": block["text"]}
+    return {**message, "content": blocks}
 
 
 def _gemini_part_has_media(part: Any) -> bool:
@@ -429,6 +457,7 @@ class Observability:
             await asyncio.sleep(self.settings.observability.pricing_refresh_hours * 3600)
 
     async def reprice_subscriptions(self) -> None:
+        queue_size = self.settings.observability.queue_size
         cursor = None
         while True:
             try:
@@ -440,9 +469,12 @@ class Observability:
                 return
             for record in page["items"]:
                 quote = self.pricing.estimate(record.get("model"), "chatgpt", record)
-                if quote["cost_usd"] is not None and not self.store.submit_reprice(
-                    record["request_id"], quote
-                ):
+                if quote["cost_usd"] is None:
+                    continue
+                # Leave half the shared queue free so live requests are never dropped.
+                while self.store.status["queue_depth"] * 2 >= queue_size:
+                    await asyncio.sleep(0.05)
+                if not self.store.submit_reprice(record["request_id"], quote):
                     return
             cursor = page["next_cursor"]
             if cursor is None:
@@ -511,7 +543,7 @@ class Observability:
                     "user",
                 }:
                     break
-                prefix.append(message)
+                prefix.append(_grouping_message(message))
                 if message.get("role") == "user":
                     return self.digest("history:" + scope, _json(prefix)), "inferred_history"
         contents = inner.get("contents")
@@ -665,12 +697,16 @@ class RequestObservation:
                     and self.gemini_route.action in _GEMINI_INFERENCE_ACTIONS
                 )
             else:
-                self.record["usage_applicable"] = request.method == "POST" and (
-                    self.record["model"] is not None
-                    or "input" in payload
-                    or "messages" in payload
-                    or "contents" in payload
-                    or self.record["path"] in _ENDPOINTS - _MODEL_LIST_ENDPOINTS
+                self.record["usage_applicable"] = (
+                    request.method == "POST"
+                    and request.scope["path"].rstrip("/") not in _TOKEN_COUNT_ENDPOINTS
+                    and (
+                        self.record["model"] is not None
+                        or "input" in payload
+                        or "messages" in payload
+                        or "contents" in payload
+                        or self.record["path"] in _ENDPOINTS - _MODEL_LIST_ENDPOINTS
+                    )
                 )
             self.record["thread_id"], self.record["thread_source"] = self.owner.thread(
                 request, payload, self.scope
@@ -730,7 +766,7 @@ class RequestObservation:
                     body = None
                     reason = "unsupported_body"
                 if body is not None:
-                    encoded_body = body.encode("utf-8")
+                    encoded_body = body.encode("utf-8", errors="replace")
                     bounded = encoded_body[: config.max_body_bytes]
                     self.record["request_body"] = bounded.decode("utf-8", errors="ignore")
                     self.record["body_truncated"] = len(bounded) < len(encoded_body)
@@ -774,7 +810,8 @@ class RequestObservation:
                     user_turn=user_turn,
                     turn_source="inferred",
                     turn_id=self.owner.digest(
-                        "turn:" + self.record["thread_id"], _json([user_turn, last_user])
+                        "turn:" + self.record["thread_id"],
+                        _json([user_turn, _grouping_message(last_user)]),
                     ),
                 )
             return

@@ -11,16 +11,24 @@ import re
 import threading
 from bisect import bisect_right
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
+from itertools import pairwise
+from types import GeneratorType
 from typing import Any, Literal
 
 from detect_secrets.custom_types import NamedIO
 
 from promptlatch.config import _ENV_REF_RE, RedactionConfig, RuleConfig
-from promptlatch.patterns import BUILTIN_PATTERNS, SENSITIVE_FIELD_RE, STRICT_SENSITIVE_FIELD_RE
+from promptlatch.patterns import (
+    BUILTIN_PATTERNS,
+    SENSITIVE_FIELD_RE,
+    SIGNED_VALUE_CHAR,
+    STRICT_SENSITIVE_FIELD_RE,
+    TOKEN_START,
+)
 
 MASK = "[REDACTED_SECRET]"
 _TAGGED_PLACEHOLDER_RE = re.compile(r"\[REDACTED:([A-Za-z0-9_.-]{1,64})#([0-9a-f]{8})\]")
@@ -28,9 +36,10 @@ _TAGGED_OR_MASK_RE = re.compile(
     r"\[REDACTED_SECRET\]|\[REDACTED:([A-Za-z0-9_.-]{1,64})#([0-9a-f]{8})\]"
 )
 _SIGNED_URL_TAGGED_RE = re.compile(
-    r"(?i)([?&](?:x-amz-signature|x-amz-credential|x-amz-security-token|"
-    r"x-goog-signature|x-goog-credential|googleaccessid|signature|sig)=)"
-    r"((?:\[REDACTED:[A-Za-z0-9_.-]{1,64}#[0-9a-f]{8}\]|[^&#\s])+)"
+    r"(?i)((?:[?&](?:amp;)?|\\u0026)(?:x-amz-signature|x-amz-credential|"
+    r"x-amz-security-token|x-goog-signature|x-goog-credential|googleaccessid|"
+    r"signature|sig)=)"
+    rf"((?:\[REDACTED:[A-Za-z0-9_.-]{{1,64}}#[0-9a-f]{{8}}\]|{SIGNED_VALUE_CHAR})+)"
 )
 _MAX_DYNAMIC_TAG_LABELS = 4096
 _TAG_KEY_PBKDF2_ITERATIONS = 600_000
@@ -85,11 +94,11 @@ _ASCII_ASSIGNMENT_CANDIDATES = {
     _ASSIGNED_SECRET_PATTERN: re.compile(
         r"[^a-z0-9_.-]((?>[a-z0-9_.-]*?"
         r"(?:key|secret|password|passwd|pwd|token|credential|url))[a-z0-9_.-]*+)"
-        r"[\"']?\s*[:=]"
+        r"\\*[\"']?\s*[:=]"
     ),
     dict(BUILTIN_PATTERNS)["auth_header"]: re.compile(
         r"[^a-z0-9_.-]((?:authorization|proxy-authorization|x-api-key|x-goog-api-key|api-key|"
-        r"x-auth-token|x-auth-key|cf-access-token))[\"']?\s*[:=]"
+        r"x-auth-token|x-auth-key|cf-access-token))\\*[\"']?\s*[:=]"
     ),
 }
 _ASSIGNMENT_FIELD_CHARS = frozenset(
@@ -100,8 +109,73 @@ _CODE_REFERENCE_PREFIX = re.compile(
     re.ASCII,
 )
 _CREDENTIAL_PLACEHOLDER = re.compile(
-    r"(?i)<your[-_](?:api[-_]key|client[-_]secret|password|token|secret)(?:[-_]here)?>"
+    r"(?i)<your[-_](?:api[-_]key|client[-_]secret|password|token|secret)(?:[-_]here)?>|"
+    r"\$\{[a-z_][a-z0-9_]*\}"
 )
+_TOKEN_COUNT = re.compile(r"[0-9]+(?=[^A-Za-z0-9_.-]|$)")
+_TOKEN_COUNT_LABEL = re.compile(
+    r"(?i)(?:budget|cached?|completion|creation|input|max|new|num|output|prompt|read|reasoning|"
+    r"thinking|total)[_-]?tokens\\*[\"']?\s*[:=]\s*$"
+)
+# A statement on the indented line after `if token:`. Data uses the same shapes, so the line
+# above must also open a code block.
+_BLOCK_OPENER = re.compile(
+    r"[ \t}]*(?:async[ \t]+)?(?:case|class|def|elif|except|for|if|match|when|while|with)\b.*:[ \t]*"
+)
+_WORD_OR_SIGN = re.compile(r"[A-Za-z_]\w*|[^\w\s]")
+_OPENER_WORDS = frozenset(
+    {"and", "as", "async", "await", "case", "class", "def", "elif", "except", "for", "if", "in",
+     "is", "match", "not", "or", "when", "while", "with"}
+)  # fmt: skip
+_NEXT_STATEMENT = re.compile(
+    r"(?:continue|raise|return)(?=\s|$)|"
+    r"[A-Za-z_][A-Za-z_.-]*(?:[ \t]+[-+*/|&]?=[ \t]|[(\[])"
+)
+
+# These plugins report a value because of where it stands, not because of its shape.
+_POSITIONAL_SECRET_TYPES = frozenset({"Secret Keyword", "Basic Auth Credentials"})
+# An entry of a mapping that stands under a sensitive label.
+_MAPPING_ENTRY = re.compile(r"([A-Za-z_][A-Za-z_.-]*)(?:[ \t]*=[ \t]+|:(?:[ \t]+|$))")
+_MAPPING_KEY = re.compile(r"[A-Za-z_][A-Za-z_.-]*")
+# A quoted mapping key is a label, not a value.
+_CLOSING_QUOTE = re.compile(r"\\*[\"'`](?!\s*:)")
+_VALUE_LABEL = re.compile(
+    r"(?i)(?P<option>--?[a-z0-9-]{0,32})?"
+    r"(?:api[_-]?key|credential|passw(?:or)?d|passphrase|pwd|secret|token|"
+    r"(?:access|account|auth|encryption|private|signing)[_-]?key|"
+    r"(?<![a-z])(?:pass|auth(?:orization)?)(?![a-z]))[a-z0-9_.-]{0,32}"
+    r"(?:\[[^\]\n]{0,16}\])?\\*[\"'`]?"
+    r"(?:[ \t]*(?:[=:!?+]=|[:=>])[ \t]*(?:(?:basic|bearer|token)[ \t]+)?|(?(option)[ \t]+|(?!)))"
+    r"\\*[\"'`]?$"
+)
+_LINE_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_PLAIN_WORD = re.compile(r"[A-Za-z][a-z]*|[A-Z]+")
+_FIELD_NAME = re.compile(r"[A-Za-z_.]+")
+_TYPE_NAMES = frozenset(
+    {"any", "array", "bool", "boolean", "bytes", "false", "float", "int", "integer", "nil", "none",
+     "null", "number", "object", "str", "string", "true", "undefined"}
+)  # fmt: skip
+# The other plugins can stop inside a longer token.
+_TOKEN_REST = re.compile(r"-*[A-Za-z0-9_][A-Za-z0-9_+/=-]*")
+_BASE64_REST = re.compile(r"[A-Za-z0-9+/]*={0,2}")
+_BASE64_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+_PRIVATE_KEY_END = {
+    "private_key": re.compile(r"-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"),
+    "pgp_private_key": re.compile(r"-----END PGP " + r"PRIVATE KEY BLOCK-----"),
+}
+_SURROGATES = re.compile(r"[\ud800-\udfff]")
+
+_SCHEMA_MEMBERS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
+# Text such as `default` or `description` can hold a credential, so it is not listed.
+_SCHEMA_KEYWORDS = _SCHEMA_MEMBERS | {
+    "$id", "$ref", "$schema", "additionalProperties", "allOf", "anyOf", "enum",
+    "exclusiveMaximum", "exclusiveMinimum", "format", "items", "maxItems", "maxLength",
+    "maxProperties", "maximum", "minItems", "minLength", "minProperties", "minimum",
+    "multipleOf", "nullable", "oneOf", "pattern", "prefixItems", "propertyOrdering",
+    "readOnly", "required", "type", "uniqueItems", "writeOnly",
+}  # fmt: skip
+_SIGNED_REASONING_TYPES = ("thinking", "reasoning.text")
+_REASONING_SIGNATURE = re.compile(r"[A-Za-z0-9+/_:.-]+={0,2}")
 
 # Scan results are kept per string, so repeated text is scanned once.
 _CACHE_MAX_ENTRIES = 16_384
@@ -283,6 +357,163 @@ def _is_code_reference(value: str, start: int, end: int) -> bool:
         return False
     reference = _CODE_REFERENCE_PREFIX.match(value, start)
     return reference is not None and reference.end() >= end
+
+
+def _is_next_statement(value: str, start: int) -> bool:
+    """Recognize code on an indented line, not a value carried over from the line above."""
+    label_end = _line_above(value, start)
+    if label_end is None or _NEXT_STATEMENT.match(value, start) is None:
+        return False
+    label_start = value.rfind("\n", max(0, label_end - 512), label_end) + 1
+    if (not label_start and label_end > 512) or (
+        _BLOCK_OPENER.fullmatch(value, label_start, label_end) is None
+    ):
+        return False
+    # Two plain words in a row are prose, such as `for staging use this password:`.
+    words = _WORD_OR_SIGN.findall(value, label_start, label_end)
+    return not any(
+        all(word[0].isalnum() and word not in _OPENER_WORDS for word in pair)
+        for pair in pairwise(words)
+    )
+
+
+def _every_occurrence(secret: str, value: str, test: Callable[[str, int], object]) -> bool:
+    found = False
+    for start, _ in _occurrences(secret, value):
+        if not test(value, start):
+            return False
+        found = True
+    return found
+
+
+def _line_above(value: str, start: int) -> int | None:
+    """Return the end of the line above when `start` is the first text on an indented line."""
+    position = start
+    while position and value[position - 1] in " \t":
+        position -= 1
+    if not 0 < position < start or value[position - 1] != "\n":
+        return None
+    return position - 1
+
+
+def _is_next_label(value: str, separator: int, start: int, end: int) -> bool:
+    """Recognize the label of the next line, which the line above does not have as its value."""
+    if "\n" not in value[separator:start]:
+        return False
+    name = _MAPPING_KEY.match(value, start, end)
+    if name is None:
+        return False
+    if value[name.end() : end] == ":":
+        return True
+    position = end
+    while position < len(value) and value[position] in " \t":
+        position += 1
+    return name.end() == end and value[position : position + 1] in (":", "=")
+
+
+def _is_token_count(value: str, start: int) -> bool:
+    """Recognize a number assigned to a plural field such as `max_tokens`."""
+    return (
+        _TOKEN_COUNT.match(value, start) is not None
+        and _TOKEN_COUNT_LABEL.search(value[max(0, start - 32) : start]) is not None
+    )
+
+
+def _is_common_value(secret: str) -> bool:
+    """Recognize a value that ordinary text or a field name is likely to contain."""
+    if len(secret) < 8 and (len(secret) < 5 or secret.isdigit()):
+        return True
+    if _PLAIN_WORD.fullmatch(secret) is not None:
+        return True
+    return _FIELD_NAME.fullmatch(secret) is not None and any(
+        match.end() == len(secret) for match in SENSITIVE_FIELD_RE.finditer(secret)
+    )
+
+
+def _is_value_position(value: str, start: int, end: int) -> bool:
+    """Recognize a labeled or quoted value, a URL password, or the rest of an INI line."""
+    if _VALUE_LABEL.search(value[max(0, start - 96) : start]) is not None:
+        return True
+    before = value[max(0, start - 1) : start]
+    if before == ":" and value.startswith("@", end):
+        return True
+    if before and before in "\"'`" and _CLOSING_QUOTE.match(value, end):
+        return True
+    while start and value[start - 1] in " \t":
+        start -= 1
+    while end < len(value) and value[end] in " \t":
+        end += 1
+    return (not start or value[start - 1] in "=:" or value[start - 1] in _LINE_BREAKS) and (
+        end == len(value) or value[end] in _LINE_BREAKS
+    )
+
+
+def _token_span(value: str, start: int, end: int, secret_type: str) -> tuple[int, int]:
+    """Extend a plugin match to the whole token that contains it."""
+    if secret_type == "Private Key":
+        # The plugin reports the header, which the private key rules need to find the end.
+        return start, end
+    rest = _TOKEN_REST.match(value, end)
+    if secret_type == "AWS Access Key" and end - start == 40:
+        # The secret access key rule also matches a window of a longer session token.
+        while start and value[start - 1] in _BASE64_CHARS:
+            start -= 1
+        rest = _BASE64_REST.match(value, end)
+    return start, rest.end() if rest is not None else end
+
+
+def _detected_spans(
+    secret: str, value: str, secret_type: str, original: str
+) -> list[tuple[int, int]]:
+    """Find the text to replace for a secret that a plugin reported without its offset."""
+    if "\ufffd" in secret:
+        value, original = _SURROGATES.sub("\ufffd", value), _SURROGATES.sub("\ufffd", original)
+    positional = secret_type in _POSITIONAL_SECRET_TYPES
+    if positional and secret.rstrip(",;").lower() in _TYPE_NAMES:
+        return []
+    common = positional and _is_common_value(secret)
+    spans: list[tuple[int, int]] = []
+    elsewhere: list[tuple[int, int]] = []
+    for start, end in _occurrences(secret, value):
+        if spans and start < spans[-1][1]:
+            continue
+        if secret_type == "Secret Keyword" and _is_code_reference(value, start, end):
+            continue
+        if common and not _is_value_position(value, start, end):
+            elsewhere.append((start, end))
+            continue
+        spans.append((start, end) if positional else _token_span(value, start, end, secret_type))
+    if spans or any(_is_value_position(original, *span) for span in _occurrences(secret, original)):
+        return spans
+    return elsewhere
+
+
+def _occurrences(secret: str, value: str) -> Iterator[tuple[int, int]]:
+    end = 0
+    while (start := value.find(secret, end)) >= 0:
+        end = start + len(secret)
+        yield start, end
+
+
+def _is_object_schema(value: Mapping[Any, Any]) -> bool:
+    schema_type = value.get("type")
+    types = schema_type if isinstance(schema_type, (list, tuple)) else (schema_type,)
+    return any(isinstance(item, str) and item.lower() == "object" for item in types)
+
+
+def _is_reasoning_signature(parent: Any, key: Any, value: Any) -> bool:
+    """Recognize a signature that the provider must get back unchanged."""
+    return (
+        (
+            key in ("thoughtSignature", "thought_signature")
+            or (
+                key == "signature"
+                and _mapping_or_attr_field(parent, "type")[1] in _SIGNED_REASONING_TYPES
+            )
+        )
+        and isinstance(value, str)
+        and _REASONING_SIGNATURE.fullmatch(value) is not None
+    )
 
 
 @dataclass
@@ -812,9 +1043,8 @@ def _literal_prefix(pattern: re.Pattern[str]) -> str | None:
         return None
     literal: list[str] = []
     try:
-        parsed = import_module("re._parser").parse(
-            pattern.pattern.removeprefix(r"\b"), pattern.flags
-        )
+        source = pattern.pattern.rpartition(TOKEN_START)[2].removeprefix(r"\b")
+        parsed = import_module("re._parser").parse(source, pattern.flags)
         for operation, argument in parsed:
             if str(operation) != "LITERAL":
                 break
@@ -897,9 +1127,9 @@ class SecretRedactor:
             _cache_from._derived_tag_pair if _cache_from is not None else None
         )
         # Validate any configured or environment-expanded tag_key eagerly; only run
-        # PBKDF2 eagerly when tagged mode is active.
+        # PBKDF2 eagerly when the mode writes tags.
         self._resolve_tag_key()
-        if self.config.redact_mode == "tagged":
+        if self.config.redact_mode != "full":
             self._active_tag_pair()
         self._static_tag_labels = (
             frozenset(
@@ -982,7 +1212,7 @@ class SecretRedactor:
         return secret, tag_id
 
     def _tag_context_id(self) -> str:
-        if self.config.redact_mode != "tagged":
+        if self.config.redact_mode == "full":
             return ""
         _, tag_id = self._active_tag_pair()
         return f"{tag_id}:{self._dynamic_tag_labels.version}"
@@ -1004,6 +1234,11 @@ class SecretRedactor:
         match = _TAGGED_PLACEHOLDER_RE.fullmatch(candidate)
         return match is not None and self._is_valid_tag_label(match.group(1))
 
+    def _is_placeholder(self, candidate: str) -> bool:
+        if self.config.redact_mode == "tagged":
+            return self._is_tagged_placeholder(candidate)
+        return candidate == self.placeholder
+
     def _protected_tag_spans(self, value: str) -> list[tuple[int, int]]:
         if "[REDACTED" not in value:
             return []
@@ -1013,14 +1248,14 @@ class SecretRedactor:
             if match.group(1) is None or self._is_valid_tag_label(match.group(1))
         ]
 
-    def _format_tagged(self, secret: str, rule_name: str) -> str:
-        label = self._safe_tag_label(rule_name)
+    def _keyed_tag(self, secret: str) -> str | None:
+        """Derive a keyed tag, or None when one call has derived too many."""
         state: _TagCallState | None = getattr(self._tag_local, "state", None)
         tag = state.memo.get(secret) if state is not None else None
         if tag is None:
             if state is not None and state.derivations >= _MAX_TAG_DERIVATIONS_PER_CALL:
                 state.capped_count += 1
-                return MASK
+                return None
             tag_secret, _ = self._active_tag_pair()
             tag = hashlib.pbkdf2_hmac(
                 "sha256",
@@ -1032,18 +1267,20 @@ class SecretRedactor:
             if state is not None:
                 state.derivations += 1
                 state.memo[secret] = tag
-        return f"[REDACTED:{label}#{tag}]"
+        return tag
+
+    def _format_tagged(self, secret: str, rule_name: str) -> str:
+        label = self._safe_tag_label(rule_name)
+        tag = self._keyed_tag(secret)
+        return MASK if tag is None else f"[REDACTED:{label}#{tag}]"
 
     def _sub_tagged_safe(
         self,
         pattern: re.Pattern[str],
         value: str,
         rule_name: str,
-        *,
-        keyword: bool = False,
     ) -> tuple[str, int]:
-        protected = self._protected_tag_spans(value)
-        if not protected and not keyword:
+        if not self._protected_tag_spans(value):
             count = 0
 
             def replace_fast(match: re.Match[str]) -> str:
@@ -1053,11 +1290,16 @@ class SecretRedactor:
 
             return pattern.sub(replace_fast, value), count
 
+        return self._replace_tagged_spans(
+            [match.span() for match in pattern.finditer(value)], value, rule_name
+        )
+
+    def _replace_tagged_spans(
+        self, spans: list[tuple[int, int]], value: str, rule_name: str
+    ) -> tuple[str, int]:
+        protected = self._protected_tag_spans(value)
         spans_to_replace: list[tuple[int, int]] = []
-        for match in pattern.finditer(value):
-            start, end = match.start(), match.end()
-            if keyword and _is_code_reference(value, start, end):
-                continue
+        for start, end in spans:
             if any(ps <= start and end <= pe for ps, pe in protected):
                 continue
             merged_start, merged_end = start, end
@@ -1103,10 +1345,7 @@ class SecretRedactor:
             context = "responses-request"
         elif protocol == "gemini-generate-content":
             context = "gemini-request"
-        if (
-            self.config.redact_mode != "tagged"
-            or getattr(self._tag_local, "state", None) is not None
-        ):
+        if self.config.redact_mode == "full" or getattr(self._tag_local, "state", None) is not None:
             return RedactionResult(self._walk(payload, stats, context=context), stats)
         state = _TagCallState()
         self._tag_local.state = state
@@ -1120,10 +1359,7 @@ class SecretRedactor:
         stats = RedactionStats()
         if not self.config.enabled:
             return RedactionResult(text, stats)
-        if (
-            self.config.redact_mode != "tagged"
-            or getattr(self._tag_local, "state", None) is not None
-        ):
+        if self.config.redact_mode == "full" or getattr(self._tag_local, "state", None) is not None:
             return RedactionResult(self._redact_string(text, stats), stats)
         state = _TagCallState()
         self._tag_local.state = state
@@ -1148,8 +1384,12 @@ class SecretRedactor:
                     (
                         name,
                         re.compile(
-                            rf"(?<![A-Za-z0-9_./+-])[A-Za-z0-9_./+-]{{8,}}{tail}"
-                            rf"(?![A-Za-z0-9_./+=-])"
+                            # The letter of a `\n` escape and the end of a sentence are not
+                            # part of the token.
+                            r"(?:(?<![A-Za-z0-9_./+-])|(?<=\\[nrtbf])|(?<=\\u[0-9A-Fa-f]{4}))"
+                            r"(?!(?<=\\)(?:[nrtbf]|u[0-9A-Fa-f]{4}))"
+                            rf"[A-Za-z0-9_./+-]{{8,}}{tail}"
+                            r"(?![A-Za-z0-9_/+=-]|\.[A-Za-z0-9_])"
                         ),
                     )
                 )
@@ -1171,15 +1411,74 @@ class SecretRedactor:
             return [self._walk(item, stats) for item in value]
         if isinstance(value, tuple):
             return tuple(self._walk(item, stats) for item in value)
+        if isinstance(value, (GeneratorType, map, filter)):
+            return [self._walk(item, stats) for item in value]
         if isinstance(value, Mapping):
+            schema = _is_object_schema(value)
             redacted: dict[Any, Any] = {}
             for key, item in value.items():
                 redacted_key = self._redact_string(key, stats) if isinstance(key, str) else key
                 if redacted_key in redacted:
                     raise RedactionKeyCollisionError("mapping keys collide after redaction")
-                redacted[redacted_key] = self._redact_field_value(key, item, stats, context=context)
+                if schema and key in _SCHEMA_MEMBERS and isinstance(item, Mapping):
+                    redacted[redacted_key] = self._redact_schema_members(item, stats)
+                elif _is_reasoning_signature(value, key, item):
+                    redacted[redacted_key] = self._walk(item, stats)
+                else:
+                    redacted[redacted_key] = self._redact_field_value(
+                        key, item, stats, context=context
+                    )
             return redacted
         return value
+
+    def _redact_schema_members(
+        self, members: Mapping[Any, Any], stats: RedactionStats
+    ) -> dict[Any, Any]:
+        """Keep JSON Schema structure under parameter names such as `password`."""
+        redacted: dict[Any, Any] = {}
+        for name, schema in members.items():
+            redacted_name = self._redact_string(name, stats) if isinstance(name, str) else name
+            if redacted_name in redacted:
+                raise RedactionKeyCollisionError("mapping keys collide after redaction")
+            redacted[redacted_name] = (
+                self._redact_sensitive_schema(schema, stats, strict=self._is_strict_field(name))
+                if isinstance(schema, Mapping) and self._is_sensitive_field(name)
+                else self._redact_field_value(name, schema, stats)
+            )
+        return redacted
+
+    def _redact_sensitive_schema(self, schema: Any, stats: RedactionStats, *, strict: bool) -> Any:
+        if isinstance(schema, list):
+            return [self._redact_sensitive_schema(item, stats, strict=strict) for item in schema]
+        if not isinstance(schema, Mapping):
+            return self._walk(schema, stats)
+        redacted = self._redact_sensitive_field(
+            {key: item for key, item in schema.items() if key not in _SCHEMA_KEYWORDS},
+            stats,
+            strict=strict,
+        )
+        for key, item in schema.items():
+            if key in _SCHEMA_MEMBERS and isinstance(item, Mapping):
+                redacted[key] = self._redact_sensitive_members(item, stats, strict=strict)
+            elif key in _SCHEMA_KEYWORDS:
+                redacted[key] = self._redact_sensitive_schema(item, stats, strict=strict)
+        return redacted
+
+    def _redact_sensitive_members(
+        self, members: Mapping[Any, Any], stats: RedactionStats, *, strict: bool
+    ) -> dict[Any, Any]:
+        """Keep the structure of a nested schema. Its text belongs to the sensitive field."""
+        redacted: dict[Any, Any] = {}
+        for name, schema in members.items():
+            redacted_name = self._redact_string(name, stats) if isinstance(name, str) else name
+            if redacted_name in redacted:
+                raise RedactionKeyCollisionError("mapping keys collide after redaction")
+            redacted[redacted_name] = (
+                self._redact_sensitive_schema(schema, stats, strict=strict)
+                if isinstance(schema, Mapping)
+                else self._redact_sensitive_field(schema, stats, strict=strict)
+            )
+        return redacted
 
     def _model_fields(self, value: Any) -> Mapping[str, Any] | None:
         model_fields = getattr(type(value), "model_fields", None)
@@ -1205,11 +1504,12 @@ class SecretRedactor:
             except AttributeError:
                 continue
             before = stats.redactions
-            redacted = (
-                self._redact_sensitive_field(item, stats, strict=strict)
-                if sensitive
-                else self._redact_field_value(name, item, stats, context=context)
-            )
+            if sensitive:
+                redacted = self._redact_sensitive_field(item, stats, strict=strict)
+            elif _is_reasoning_signature(value, name, item):
+                redacted = self._walk(item, stats)
+            else:
+                redacted = self._redact_field_value(name, item, stats, context=context)
             if stats.redactions > before:
                 updates[name] = redacted
 
@@ -1220,11 +1520,12 @@ class SecretRedactor:
                     raise ValueError("model extra key cannot be safely redacted")
             for name, item in model_extra.items():
                 before = stats.redactions
-                redacted = (
-                    self._redact_sensitive_field(item, stats, strict=strict)
-                    if sensitive
-                    else self._redact_field_value(name, item, stats, context=context)
-                )
+                if sensitive:
+                    redacted = self._redact_sensitive_field(item, stats, strict=strict)
+                elif _is_reasoning_signature(value, name, item):
+                    redacted = self._walk(item, stats)
+                else:
+                    redacted = self._redact_field_value(name, item, stats, context=context)
                 if stats.redactions > before:
                     updates[name] = redacted
 
@@ -1335,12 +1636,11 @@ class SecretRedactor:
             stripped = value.strip()
             if not stripped or (not strict and len(stripped) < 8):
                 return value
-            if self.config.redact_mode == "tagged":
-                if self._is_tagged_placeholder(stripped):
-                    return value
-                stats.add("sensitive_field", 1)
-                return self._format_tagged(value, "sensitive_field")
+            if self._is_placeholder(stripped):
+                return value
             stats.add("sensitive_field", 1)
+            if self.config.redact_mode == "tagged":
+                return self._format_tagged(value, "sensitive_field")
             return self.placeholder
         model_fields = self._model_fields(value)
         if model_fields is not None:
@@ -1449,6 +1749,9 @@ class SecretRedactor:
                 cursor = pe
             masked_parts.append(value[cursor:])
             scan_text = "".join(masked_parts)
+        # detect-secrets cannot encode a lone surrogate. The stand-in keeps every offset.
+        if not scan_text.isascii():
+            scan_text = _SURROGATES.sub("\ufffd", scan_text)
 
         source = _PromptText(scan_text)
         known_transformers = _uses_builtin_config_transformers(get_transformed_file) and supported()
@@ -1532,139 +1835,145 @@ class SecretRedactor:
                     eager_candidates = eager()
                 found_secrets = scan(eager_candidates)
 
-        for found_secret in found_secrets:
-            secret_value = getattr(found_secret, "secret_value", None)
-            if not secret_value:
-                continue
+        original = value
+        found = dict.fromkeys(
+            (found_secret.type, found_secret.secret_value)
+            for found_secret in found_secrets
+            if found_secret.secret_value
+        )
+        # Replace the longest value first, so that no shorter one breaks it up.
+        for secret_type, secret_value in sorted(found, key=lambda item: -len(item[1])):
             if sentinel_map and nonce in secret_value:
                 for sentinel, original_tag in sentinel_map.items():
                     if sentinel in secret_value:
                         secret_value = secret_value.replace(sentinel, original_tag)
-            if found_secret.type == "GitHub Token" and len(secret_value) < 30:
+            entry = None
+            if secret_type == "Secret Keyword":
+                # An INI transformer reads the body of `if token:` as the value of `token`.
+                if _every_occurrence(
+                    secret_value,
+                    original,
+                    lambda text, start: (
+                        _is_next_statement(text, start) or _is_token_count(text, start)
+                    ),
+                ):
+                    continue
+                entry = _MAPPING_ENTRY.match(secret_value)
+                if entry is not None and not _every_occurrence(
+                    secret_value, original, lambda text, start: _line_above(text, start) is not None
+                ):
+                    entry = None
+            if secret_type == "GitHub Token" and len(secret_value) < 30:
                 continue
-            if found_secret.type == "Artifactory Credentials":
+            if secret_type == "Artifactory Credentials":
                 secret_value = secret_value.lstrip(" \t\r\n=:\"'").rstrip(" \t\r\n\"'")
-            elif found_secret.type == "Azure Storage Account access key":
+            elif secret_type == "Azure Storage Account access key":
                 secret_value = secret_value.strip("\"'")
             if not secret_value:
                 continue
-            rule_name = f"detect_secrets:{found_secret.type}"
-            value, count = self._replace_detected_secret(
-                secret_value,
-                value,
-                rule_name=rule_name,
-                keyword=found_secret.type == "Secret Keyword",
-            )
-            stats.add(rule_name, count)
+            if entry is not None:
+                value, count = self._replace_mapping_value(secret_value, entry, value)
+            else:
+                value, count = self._replace_detected_secret(
+                    secret_value, value, secret_type, original
+                )
+            stats.add(f"detect_secrets:{secret_type}", count)
         return value
 
+    def _replace_mapping_value(
+        self, secret_value: str, entry: re.Match[str], value: str
+    ) -> tuple[str, int]:
+        """Keep the name of a mapping entry that stands under a sensitive label."""
+        item = secret_value[entry.end() :]
+        if (
+            not item
+            or (entry.group(1) in _SCHEMA_KEYWORDS and item.isdigit())
+            or item.lower() in _TYPE_NAMES
+            or self._is_placeholder(item)
+        ):
+            return value, 0
+        spans = [(start + entry.end(), end) for start, end in _occurrences(secret_value, value)]
+        return self._replace_spans(spans, value, "detect_secrets:Secret Keyword")
+
     def _replace_detected_secret(
-        self,
-        secret_value: str,
-        value: str,
-        *,
-        rule_name: str = "detect_secrets:detector",
-        keyword: bool = False,
+        self, secret_value: str, value: str, secret_type: str, original: str
+    ) -> tuple[str, int]:
+        parts = [secret_value]
+        if "," in secret_value:
+            segments = [segment.strip().strip("\"'") for segment in secret_value.split(",")]
+            segments = [segment for segment in segments if segment]
+            parts = [segment for segment in segments if not _is_common_value(segment)]
+            if len(parts) < len(segments):
+                parts.insert(0, secret_value)
+        total = 0
+        saw_placeholder = False
+        for part in parts:
+            if self.config.redact_mode == "tagged" and self._is_tagged_placeholder(part):
+                saw_placeholder = True
+                continue
+            spans = _detected_spans(part, value, secret_type, original)
+            value, count = self._replace_spans(spans, value, f"detect_secrets:{secret_type}")
+            total += count
+        if total or saw_placeholder or secret_value in parts:
+            return value, total
+        spans = _detected_spans(secret_value, value, secret_type, original)
+        return self._replace_spans(spans, value, f"detect_secrets:{secret_type}")
+
+    def _replace_spans(
+        self, spans: list[tuple[int, int]], value: str, rule_name: str
     ) -> tuple[str, int]:
         if self.config.redact_mode == "tagged":
-            if self._is_tagged_placeholder(secret_value):
-                return value, 0
-            if "," not in secret_value:
-                return self._sub_tagged_safe(
-                    re.compile(re.escape(secret_value)),
-                    value,
-                    rule_name,
-                    keyword=keyword,
-                )
-            total = 0
-            saw_tagged_segment = False
-            for segment in secret_value.split(","):
-                candidate = segment.strip().strip("\"'")
-                if not candidate:
-                    continue
-                if self._is_tagged_placeholder(candidate):
-                    saw_tagged_segment = True
-                    continue
-                value, replaced = self._sub_tagged_safe(
-                    re.compile(re.escape(candidate)),
-                    value,
-                    rule_name,
-                    keyword=keyword,
-                )
-                total += replaced
-            if total or saw_tagged_segment:
-                return value, total
-            return self._sub_tagged_safe(
-                re.compile(re.escape(secret_value)),
-                value,
-                rule_name,
-                keyword=keyword,
-            )
-
-        if not keyword and "," not in secret_value:
-            return re.subn(re.escape(secret_value), self._replacement, value)
-
-        total = 0
-
-        def replace(match: re.Match[str]) -> str:
-            nonlocal total
-            start, end = match.start(), match.end()
-            if keyword and _is_code_reference(match.string, start, end):
-                return match.group(0)
-            total += 1
-            return self._replacement(match)
-
-        if "," not in secret_value:
-            value = re.sub(re.escape(secret_value), replace, value)
-            return value, total
-
-        for segment in secret_value.split(","):
-            candidate = segment.strip().strip("\"'")
-            if not candidate:
-                continue
-            value = re.sub(re.escape(candidate), replace, value)
-
-        if total:
-            return value, total
-        value = re.sub(re.escape(secret_value), replace, value)
-        return value, total
+            return self._replace_tagged_spans(spans, value, rule_name)
+        chunks: list[str] = []
+        cursor = 0
+        for start, end in spans:
+            chunks.append(value[cursor:start])
+            chunks.append(self._mask(value[start:end]))
+            cursor = end
+        chunks.append(value[cursor:])
+        return "".join(chunks), len(spans)
 
     def _sub_builtin_pattern(
         self, name: str, pattern: re.Pattern[str], value: str
     ) -> tuple[str, int]:
         if name in {"assigned_secret", "auth_header"}:
             return self._sub_assignment_pattern(pattern, value, rule_name=name)
+        if name in {"private_key", "pgp_private_key"}:
+            # Each BEGIN line past the last END line would scan the rest of the text.
+            ends = _PRIVATE_KEY_END[name].finditer(value)
+            limit = max((match.end() for match in ends), default=0)
+            redacted, count = self._sub_pattern_with_rule(pattern, value[:limit], name)
+            return redacted + value[limit:], count
         if name == "signed_url_query_param":
-            if self.config.redact_mode == "tagged":
-                count = 0
+            tagged = self.config.redact_mode == "tagged"
+            count = 0
 
-                def replace_signed(match: re.Match[str]) -> str:
-                    nonlocal count
-                    if self._is_tagged_placeholder(match.group(2)):
-                        return match.group(0)
-                    count += 1
-                    return f"{match.group(1)}{self._format_tagged(match.group(2), name)}"
+            def replace_signed(match: re.Match[str]) -> str:
+                nonlocal count
+                if self._is_placeholder(match.group(2)):
+                    return match.group(0)
+                count += 1
+                replacement = (
+                    self._format_tagged(match.group(2), name) if tagged else self.placeholder
+                )
+                return f"{match.group(1)}{replacement}"
 
-                return _SIGNED_URL_TAGGED_RE.sub(replace_signed, value), count
-            return pattern.subn(lambda match: f"{match.group(1)}{self.placeholder}", value)
+            return (_SIGNED_URL_TAGGED_RE if tagged else pattern).sub(replace_signed, value), count
         if name == "url_credentials":
-            if self.config.redact_mode == "tagged":
-                count = 0
+            tagged = self.config.redact_mode == "tagged"
+            count = 0
 
-                def replace_url(match: re.Match[str]) -> str:
-                    nonlocal count
-                    if self._is_tagged_placeholder(match.group(2)):
-                        return match.group(0)
-                    count += 1
-                    return (
-                        f"{match.group(1)}{self._format_tagged(match.group(2), name)}"
-                        f"{match.group(3)}"
-                    )
+            def replace_url(match: re.Match[str]) -> str:
+                nonlocal count
+                if self._is_placeholder(match.group(2)):
+                    return match.group(0)
+                count += 1
+                replacement = (
+                    self._format_tagged(match.group(2), name) if tagged else self.placeholder
+                )
+                return f"{match.group(1)}{replacement}{match.group(3)}"
 
-                return pattern.sub(replace_url, value), count
-            return pattern.subn(
-                lambda match: f"{match.group(1)}{self.placeholder}{match.group(3)}", value
-            )
+            return pattern.sub(replace_url, value), count
         return self._sub_pattern_with_rule(pattern, value, name)
 
     def _sub_assignment_pattern(
@@ -1700,6 +2009,8 @@ class SecretRedactor:
                         or "api" in field
                         or "private" in field
                         or "webhook" in field
+                        or "account" in field
+                        or "access" in field
                     ):
                         continue
             else:
@@ -1708,6 +2019,8 @@ class SecretRedactor:
                 while start and value[start - 1].isspace():
                     start -= 1
                 if start and value[start - 1] in "\"'":
+                    start -= 1
+                while start and value[start - 1] == "\\":
                     start -= 1
                 field_end = start
                 while start and value[start - 1] in _ASSIGNMENT_FIELD_CHARS:
@@ -1723,10 +2036,16 @@ class SecretRedactor:
                     continue
                 if _is_code_reference(value, match.start("secret"), match.end("secret")):
                     continue
+                if _is_token_count(value, match.start("secret")):
+                    continue
                 if _CREDENTIAL_PLACEHOLDER.fullmatch(match.group("secret")):
                     continue
-                if self.config.redact_mode == "tagged" and self._is_tagged_placeholder(
-                    match.group("secret")
+                if self._is_placeholder(match.group("secret")):
+                    continue
+                if _is_next_statement(value, match.start("secret")):
+                    continue
+                if not match.group("value_quote") and _is_next_label(
+                    value, match.start(), *match.span("secret")
                 ):
                     continue
                 replacement = (
@@ -1746,11 +2065,15 @@ class SecretRedactor:
         return "".join(chunks), count
 
     def _replacement(self, match: re.Match[str]) -> str:
-        secret = match.group(0)
-        if self.config.redact_mode == "full" or len(secret) <= 12:
+        return self._mask(match.group(0))
+
+    def _mask(self, secret: str) -> str:
+        # Eight visible characters are too much of a shorter secret.
+        if self.config.redact_mode == "full" or len(secret) < 20:
             return self.placeholder
-        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8]
-        return f"{secret[:4]}...{secret[-4:]}:{digest}"
+        # The tag is keyed, so the visible text cannot be used to test guesses.
+        tag = self._keyed_tag(secret)
+        return self.placeholder if tag is None else f"{secret[:4]}...{secret[-4:]}:{tag}"
 
 
 class _PromptText(io.StringIO, NamedIO):

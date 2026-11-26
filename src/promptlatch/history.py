@@ -9,6 +9,7 @@ import os
 import queue
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -165,6 +166,10 @@ _PRICING_CANDIDATE_FIELDS = (
 
 def _stats_path(path: Path) -> Path:
     return path.with_name(path.name + ".stats.sqlite3")
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
 
 
 def _file_bytes(path: Path) -> int:
@@ -399,7 +404,7 @@ class HistoryStore:
         self._warned_counts = (0, 0)
         self._last_warning = float("-inf")
         self._last_error: str | None = None
-        self._writer_lock_fd: int | None = None
+        self._writer_lock_fds: list[int] = []
         self._queued_body_bytes = 0
         self._queue_body_limit = min(32 * 1024 * 1024, max_database_bytes // 8)
         # Reserve both databases plus a full rollback copy of each page. The
@@ -521,10 +526,11 @@ class HistoryStore:
                 self._degraded = True
                 return False
             if body_bytes + self._queued_body_bytes > self._queue_body_limit:
-                record.update(
-                    request_body=None, body_truncated=True, body_omitted_reason="queue_pressure"
-                )
-                record.update(dict.fromkeys(PREVIEW_FIELDS))
+                if kind == "start":
+                    record.update(
+                        request_body=None, body_truncated=True, body_omitted_reason="queue_pressure"
+                    )
+                    record.update(dict.fromkeys(PREVIEW_FIELDS))
                 record["upstream_error"] = None
                 body_bytes = 0
             try:
@@ -590,23 +596,29 @@ class HistoryStore:
             import fcntl
         except ImportError as exc:
             raise RuntimeError("Local history requires POSIX advisory file locks") from exc
-        path = _stats_path(self.database_path)
-        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        # macOS and BSD flock() locks conflict with the fcntl() locks SQLite takes, so a lock
+        # on a database file would block the writer's own connection.
+        paths = [_lock_path(self.database_path)]
+        if sys.platform == "linux":
+            # Releases 0.2.6 to 0.2.11 lock this file. On Linux, the lock types are independent.
+            paths.append(_stats_path(self.database_path))
         try:
-            _validate_file(fd)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for path in paths:
+                flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+                fd = os.open(path, flags, 0o600)
+                self._writer_lock_fds.append(fd)
+                _validate_file(fd)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(fd)
+            self._release_writer_lock()
             raise RuntimeError("Another history writer is already using this database") from None
         except BaseException:
-            os.close(fd)
+            self._release_writer_lock()
             raise
-        self._writer_lock_fd = fd
 
     def _release_writer_lock(self) -> None:
-        if self._writer_lock_fd is not None:
-            os.close(self._writer_lock_fd)
-            self._writer_lock_fd = None
+        while self._writer_lock_fds:
+            os.close(self._writer_lock_fds.pop())
 
     def _startup_pages(self, path: Path) -> int:
         """Inspect SQLite headers without triggering journal recovery or writes."""
@@ -1139,7 +1151,7 @@ class HistoryStore:
         history_limit = self._max_storage_pages - stats_limit
         self._set_page_limits(connection, stats_limit, history_limit)
 
-    def _prune(self, connection: sqlite3.Connection, needed: int) -> None:
+    def _prune(self, connection: sqlite3.Connection, needed: int, request_id: str) -> None:
         while True:
             pages = connection.execute("PRAGMA history.page_count").fetchone()[0]
             free = connection.execute("PRAGMA history.freelist_count").fetchone()[0]
@@ -1147,7 +1159,9 @@ class HistoryStore:
                 return
             cursor = connection.execute(
                 "DELETE FROM history.requests WHERE request_id IN "
-                "(SELECT request_id FROM history.requests ORDER BY started_at,request_id LIMIT 32)"
+                "(SELECT request_id FROM history.requests WHERE request_id<>? "
+                "ORDER BY started_at,request_id LIMIT 32)",
+                (request_id,),
             )
             if not cursor.rowcount:
                 return
@@ -1171,7 +1185,7 @@ class HistoryStore:
             body = None
             encoded = _encode(metadata)
             needed = len(encoded.encode("utf-8")) + 5 * _PAGE_SIZE
-        self._prune(connection, needed)
+        self._prune(connection, needed, record["request_id"])
         if needed > self._detail_target:
             return
         connection.execute(
@@ -1207,6 +1221,9 @@ class HistoryReader:
             info = os.fstat(fd)
             db_id = (int(info.st_dev), int(info.st_ino))
             _validate_directory(path.parent)
+            if not info.st_size:
+                # A writer creates files before tables; an empty file holds no history.
+                return None
         finally:
             os.close(fd)
         connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)

@@ -209,8 +209,9 @@ async def test_dashboard_history_routes_and_pagination(database: Path) -> None:
         assert detail.json()["request_wire_bytes"] == 12 * 1024 * 1024
         assert detail.json()["request_compression"] == "gzip"
         assert detail.json()["request_compression_ms"] == 1.25
-        for query in ("limit=0", "limit=101", "offset=-1"):
-            assert (await client.get(f"/api/requests?{query}")).status_code == 422
+        for query in ("limit=0", "limit=101", "offset=-1", f"offset={2**63}"):
+            for endpoint in ("/api/requests", "/api/threads"):
+                assert (await client.get(f"{endpoint}?{query}")).status_code == 422
         assert (await client.get("/api/summary?days=0")).status_code == 422
 
 
@@ -245,7 +246,7 @@ async def test_dashboard_thread_tree_pagination_privacy_and_limits(database: Pat
         assert newest_page["items"][0]["ordinal"] == 1
         assert newest_page["items"][0]["parent_request_id"] is None
         assert (await client.get("/api/threads/missing/requests")).json()["items"] == []
-        for query in ("limit=0", "limit=101", "offset=-1", "order=sideways"):
+        for query in ("limit=0", "limit=101", "offset=-1", f"offset={2**63}", "order=sideways"):
             assert (await client.get(f"/api/threads/thread-a/requests?{query}")).status_code == 422
         assert (await client.get(f"/api/threads/{'a' * 257}/requests")).status_code == 422
 

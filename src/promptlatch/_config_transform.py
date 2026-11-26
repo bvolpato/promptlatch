@@ -9,7 +9,8 @@ from importlib.metadata import version
 from detect_secrets.custom_types import NamedIO
 from detect_secrets.transformers import config as native
 
-_SUPPORTED_VERSION = version("bc-detect-secrets") == "1.5.50"
+# transformers/config.py is identical in these releases.
+_SUPPORTED_VERSION = version("bc-detect-secrets") in {"1.5.50", "1.5.51", "1.5.52"}
 _NATIVE_FUNCTIONS = (
     native.ConfigFileTransformer.parse_file,
     native.EagerConfigFileTransformer.parse_file,

@@ -149,6 +149,7 @@ tbody tr:hover { background: var(--accent-soft); }
 .status-badge.unknown { color: var(--muted); background: var(--raised); }
 .status-badge.unknown::before { content: "?"; }
 .content-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 15px; }
+#request-view { overflow-y: auto; }
 .request-heading { flex-shrink: 0; }
 .request-breadcrumb { display: flex; align-items: center; gap: 8px; min-height: 46px; padding: 9px 16px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .request-label { color: var(--ink); font-size: 13px; font-weight: 600; }
@@ -200,7 +201,7 @@ tbody tr:hover { background: var(--accent-soft); }
 .tabbar button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
 .tab-count { display: inline-block; margin-left: 4px; font-size: 11px; padding: 0 5px; border-radius: 8px; background: var(--raised); color: var(--muted); }
 .tab-count:empty { display: none; }
-.inspector-panel { flex: 1; min-height: 0; overflow: auto; padding: 15px 17px 22px; scrollbar-width: thin; outline-offset: -3px; }
+.inspector-panel { flex: 1; min-height: 200px; overflow: auto; padding: 15px 17px 22px; scrollbar-width: thin; outline-offset: -3px; }
 .inspector-panel .notice { margin-bottom: 12px; border: 1px solid var(--line); border-radius: 5px; }
 .message { border: 1px solid var(--line); border-radius: 5px; margin-bottom: 9px; overflow: hidden; background: var(--surface); border-left: 3px solid var(--line); box-shadow: 0 1px 1px #18223008; }
 .message.assistant { border-left-color: var(--green); }

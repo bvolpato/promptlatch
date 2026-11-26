@@ -269,6 +269,35 @@ async def test_e2e_allowlist_rejects_path_traversal() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/%2e%2e/admin",
+        "/v1/..%2fadmin",
+        "/v1/%252e%252e/admin",
+        "/v1/../admin/..%2fv1/keys",
+        "/v1/../admin/..%252fv1/keys",
+        "/v1/../admin/keys%23%2f..%2f..%2fv1",
+        "/v1/..%5cadmin/..%5cv1/keys",
+    ],
+)
+async def test_e2e_allowlist_rejects_encoded_path_traversal(path: str) -> None:
+    settings = Settings(
+        target=TargetConfig(
+            default_base_url="https://allowed.example/v1",
+            allowed_base_urls=["https://allowed.example/v1"],
+            block_private_targets=False,
+        )
+    )
+
+    async with httpx.AsyncClient(transport=_transport(settings), base_url="http://proxy") as client:
+        response = await client.post(path, json={"input": "hello"})
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "target URL not allowed"
+
+
+@pytest.mark.asyncio
 async def test_e2e_invalid_redaction_rules_header_is_rejected() -> None:
     settings = Settings(
         target=TargetConfig(

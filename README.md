@@ -11,7 +11,7 @@ Coding agents read your `.env`, your logs, and your configs, then send them to a
 
 [![A prompt with credentials on your machine, and the same prompt with the credentials redacted at the provider](https://raw.githubusercontent.com/bvolpato/promptlatch/main/site/hero.png)](https://bvolpato.github.io/promptlatch/)
 
-- **Use it as a proxy** for Claude Code, Codex, Gemini CLI, OpenCode, or any client with a custom base URL.
+- **Use it as a proxy** for Claude Code, Codex, Antigravity CLI, OpenCode, or any client with a custom base URL.
 - **Use it as a Python library** to redact text, messages, or payloads before an SDK call.
 - **It stays local.** Rules are deterministic, with no model calls and no telemetry. The proxy downloads a public price list once a day for cost estimates and sends no data about you. To turn this off, set `observability.pricing_enabled: false`.
 
@@ -36,9 +36,10 @@ In another terminal, use the wrapper for your agent:
 | --- | --- |
 | `claude` | `claude-latch` |
 | `codex` | `codex-latch` |
-| `gemini` | `gemini-latch` |
 
-The wrappers keep your login and do not edit your agent's config files. If the proxy is down or redaction is off, they stop instead of sending unredacted prompts. For OpenCode, OpenRouter, and manual setup, see the [agent guide](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md).
+The wrappers keep your login and do not edit your agent's config files. If the proxy is down or redaction is off, they stop instead of sending unredacted prompts.
+
+Antigravity CLI (`agy`) works in API-key mode. Its account sign-in does not use the proxy. See [Antigravity CLI](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md#antigravity-cli). For OpenCode, OpenRouter, Gemini CLI, and manual setup, see the [agent guide](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md).
 
 ### Any API client
 
@@ -184,7 +185,7 @@ To let a coding agent do the setup, give it [PROMPT.md](https://github.com/bvolp
 
 ## Documentation
 
-- [Coding agents](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md): wrappers, Claude Code, Codex, OpenCode
+- [Coding agents](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md): wrappers, Claude Code, Codex, Antigravity CLI, OpenCode
 - [Providers and routes](https://github.com/bvolpato/promptlatch/blob/main/docs/providers.md): per-request targets, auth headers, streaming
 - [Python library](https://github.com/bvolpato/promptlatch/blob/main/docs/library.md): helpers, SDK examples, custom rules
 - [Configuration](https://github.com/bvolpato/promptlatch/blob/main/docs/configuration.md): settings, environment variables, redaction modes, compression, rule encryption

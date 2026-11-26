@@ -36,10 +36,9 @@ In another terminal, use the wrapper for your agent:
 | --- | --- |
 | `claude` | `claude-latch` |
 | `codex` | `codex-latch` |
+| `agy` | `agy-latch` |
 
-The wrappers keep your login and do not edit your agent's config files. If the proxy is down or redaction is off, they stop instead of sending unredacted prompts.
-
-Antigravity CLI (`agy`) works in API-key mode. Its account sign-in does not use the proxy. See [Antigravity CLI](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md#antigravity-cli). For OpenCode, OpenRouter, Gemini CLI, and manual setup, see the [agent guide](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md).
+`claude-latch` and `codex-latch` keep your login. `agy-latch` needs `GEMINI_API_KEY`, because Antigravity account sign-in does not use the proxy. The wrappers do not edit your agent's config files. If the proxy is down or redaction is off, they stop instead of sending unredacted prompts. For OpenCode, OpenRouter, and manual setup, see the [agent guide](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md).
 
 ### Any API client
 

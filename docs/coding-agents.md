@@ -2,7 +2,7 @@
 
 Run Codex, Claude Code, Antigravity CLI, or OpenCode through a local PromptLatch proxy.
 
-- [Wrapper commands](#wrapper-commands) for Codex, Claude Code, and Gemini CLI
+- [Wrapper commands](#wrapper-commands) for Codex, Claude Code, and Antigravity CLI
 - [Antigravity CLI](#antigravity-cli)
 - [Claude Code manual configuration](#claude-code-manual-configuration)
 - [Codex with OpenRouter](#codex-with-openrouter)
@@ -10,7 +10,7 @@ Run Codex, Claude Code, Antigravity CLI, or OpenCode through a local PromptLatch
 
 ## Wrapper commands
 
-Run Codex, Claude Code, and Gemini CLI through one local PromptLatch server, using
+Run Codex, Claude Code, and Antigravity CLI through one local PromptLatch server, using
 their own provider credentials and the official upstream endpoints:
 
 ```bash
@@ -25,11 +25,12 @@ In another terminal, run one of the wrappers:
 ```bash
 codex-latch
 claude-latch
-gemini-latch
+agy-latch
 ```
 
-Install and sign in to the original CLIs first (`codex login`, `claude auth login`,
-`gemini`). Requires Codex 0.162.1+, Claude Code 2.1.220+, and Gemini CLI 0.34.0+.
+Install the original CLIs first. Sign in to Codex and Claude Code (`codex login`,
+`claude auth login`), and set `GEMINI_API_KEY` for Antigravity CLI. Requires Codex 0.162.1+,
+Claude Code 2.1.220+, and Antigravity CLI 1.5.8+.
 These versions support the configuration checks and provider settings used to keep
 requests on the proxy. The shims preserve client credentials and configuration files.
 The example binds to loopback, enables client-auth forwarding, restricts targets to
@@ -37,38 +38,27 @@ the official endpoints below, and enables the inspector at `http://127.0.0.1:800
 Use your existing server instead if it has equivalent authentication and native
 Responses settings. Do not start a second server on an occupied port.
 
-Google replaced Gemini CLI with Antigravity CLI. Its
-[announcement](https://developers.googleblog.com/en/an-important-update-transitioning-gemini-cli-to-antigravity-cli/)
-ends Gemini CLI for free, Pro, and Ultra accounts on June 18, 2026. Gemini CLI remains
-available with paid API keys and with Gemini Code Assist Standard or Enterprise licenses, and
-`gemini-latch` is for those users. It does not support `agy`. See
-[Antigravity CLI](#antigravity-cli).
-
 | Command / authentication | Upstream |
 | --- | --- |
 | `codex-latch`, saved ChatGPT login | `https://chatgpt.com/backend-api/codex` |
 | `codex-latch`, OpenAI API key | `https://api.openai.com/v1` |
 | `claude-latch`, Claude login or Anthropic API key | `https://api.anthropic.com` |
-| `gemini-latch`, Google OAuth login (`oauth-personal`) | `https://cloudcode-pa.googleapis.com` |
-| `gemini-latch`, Gemini API key (`GEMINI_API_KEY`) | `https://generativelanguage.googleapis.com` |
+| `agy-latch`, Gemini API key (`GEMINI_API_KEY`) | `https://generativelanguage.googleapis.com` |
 
 Codex detects the saved login mode using `codex login status`; its output is never
 printed by the shim. Set `PROMPTLATCH_CODEX_AUTH=chatgpt` or `api-key` to select
 explicitly. API-key mode uses `OPENAI_API_KEY` when set, otherwise Codex's saved
 API-key login. Claude keeps its normal authentication precedence, including
-`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and its saved login. Gemini inspects
-`settings.json` (`security.auth.selectedType`), `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
-and saved Google OAuth credentials; set `PROMPTLATCH_GEMINI_AUTH=oauth` or `api-key`
-to require a specific mode.
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and its saved login.
 
 ```bash
 codex-latch exec "Review this repository"
 PROMPTLATCH_CODEX_AUTH=api-key codex-latch
 PROMPTLATCH_PROXY_URL=http://127.0.0.1:8001 claude-latch
-gemini-latch -p "Summarize recent changes"
+agy-latch -p "Summarize recent changes"
 codex-latch --latch-help
 claude-latch --latch-help
-gemini-latch --latch-help
+agy-latch --latch-help
 ```
 
 The shims check proxy readiness and redaction before launching. They stop if the
@@ -76,19 +66,16 @@ proxy is unavailable, redaction is disabled, or native client authentication can
 be forwarded. This mode requires no `server.api_key` or `target.api_key`; keep the
 listener local. Normal keyed-proxy configuration remains available for other clients.
 `PROMPTLATCH_PROXY_URL` accepts loopback addresses only. Use
-`PROMPTLATCH_CODEX_BIN`, `PROMPTLATCH_CLAUDE_BIN`, or `PROMPTLATCH_GEMINI_BIN` to
-select a CLI executable explicitly. Do not set `PROMPTLATCH_GEMINI_BIN` to `agy`.
-Antigravity CLI ignores the settings that keep Gemini CLI on the proxy.
+`PROMPTLATCH_CODEX_BIN`, `PROMPTLATCH_CLAUDE_BIN`, or `PROMPTLATCH_AGY_BIN` to
+select a CLI executable explicitly.
 
 Codex's effective provider configuration is checked before launch. Conflicting
 provider settings, managed routing requirements, and Codex Cloud commands stop with
 an error. Profiles work unless they redefine the reserved `promptlatch-official`
 provider. Claude's host-managed provider setting prevents settings files from
-replacing the proxy route. Gemini rejects Vertex AI, Compute ADC, external auth, and
-local Gemma router settings that would bypass the proxy, and disables Gemini CLI
-telemetry for the invocation.
+replacing the proxy route. For Antigravity CLI, see [Antigravity CLI](#antigravity-cli).
 
-Codex uses a local process and HTTP Responses streaming. Both shims disable request
+Codex uses a local process and HTTP Responses streaming. `codex-latch` and `claude-latch` disable request
 compression so request bodies remain scannable. Claude's nonessential traffic is
 disabled for the invocation. These wrappers cover model-provider requests, including
 conversation history and tool outputs sent back to the model. Login, MCP servers,
@@ -101,37 +88,37 @@ Configuration references: [Codex gateway authentication](https://learn.chatgpt.c
 
 ## Antigravity CLI
 
-Antigravity CLI (`agy`) sends model requests to a custom URL only in
-[API-key mode](https://antigravity.google/docs/install?tab=cli). Account sign-in ignores that
-URL, so its requests do not pass through PromptLatch.
-
-`agy` cannot name a target for each request, so make the Gemini API the default target:
-
-```bash
-PROMPTLATCH_TARGET_BASE_URL=https://generativelanguage.googleapis.com \
-  promptlatch serve --config agents.yaml
-```
-
-`codex-latch` and `claude-latch` name their own target, so they can use the same proxy.
-
-In another terminal, start `agy` with a Gemini API key:
+Google replaced Gemini CLI with Antigravity CLI (`agy`). Start the proxy as in
+[Wrapper commands](#wrapper-commands). Then run the wrapper with a Gemini API key:
 
 ```bash
 export GEMINI_API_KEY="<gemini-api-key>"
-export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:8000"
-agy --settings '{"modelProvider":"gemini"}'
+agy-latch
 ```
 
-`--settings` applies to one session and saves nothing. To make it permanent, set
-`modelProvider` to `gemini` in `~/.gemini/antigravity-cli/settings.json`. Without this
-setting, `agy` ignores both variables and asks you to sign in.
+Account sign-in is not supported, because `agy` documents no way to send those requests to a
+proxy.
+`agy-latch` uses the [gateway variables](https://docs.cloud.google.com/gemini/enterprise/docs/ai-developer-tools/connect-enterprise-gateway)
+of Antigravity CLI and applies only to one run. It changes no settings file:
 
-There is no wrapper that checks this setup. Before you rely on it, run
-`promptlatch tail --follow`, send a prompt, and make sure that the request appears.
-If it does not appear, the request did not pass through PromptLatch.
+- `AGY_LLM_GATEWAY_URL` points to the proxy, and `AGY_LLM_GATEWAY_HEADERS` names the Gemini API
+  as the target and carries the API key.
+- `--settings` clears `modelProvider`, because a saved `gemini` provider sends requests straight
+  to Google.
+- `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL`, and other variables that select a different route
+  are removed from the environment of `agy`.
 
-Do not set `AGY_ADC_AUTH`. Remote agents, MCP servers, tool subprocesses, and updates use
-separate connections that PromptLatch does not scan.
+`agy-latch` stops with an error if any of these could bypass the proxy:
+
+- The proxy is down, or redaction is off.
+- The arguments contain `--settings`, `--remote-agent`, `--remote-control`, `acp`, or
+  `remote-control`.
+- `AGY_ADC_AUTH` is on, or `AGY_LLM_GATEWAY_URL` names another gateway.
+- The managed `admin_settings.json` file or `~/.antigravity/settings.json` has `gateway` or
+  `proxy` settings.
+
+Web page reads, MCP servers, tool subprocesses, and updates use separate connections that
+PromptLatch does not scan.
 
 ## Claude Code manual configuration
 

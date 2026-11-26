@@ -122,8 +122,8 @@ Turn on JavaScript to run the demo.</textarea
         <div class="section-head">
           <h2 id="setup-title">Works with the agent you already run</h2>
           <p>
-            Start one local proxy, then launch your agent through it. The wrappers keep your login
-            and do not edit your agent's config files.
+            Start one local proxy, then launch your agent through it. The wrappers use your own
+            credentials and do not edit your agent's config files.
           </p>
         </div>
         <div class="tabs">
@@ -183,24 +183,20 @@ codex-latch exec "Review this repository"</code></pre>
 
           <div class="panel" role="tabpanel" id="panel-antigravity" aria-labelledby="tab-antigravity" tabindex="0">
             <article>
-              <h3>Start the proxy for the Gemini API</h3>
+              <h3>Start the proxy once</h3>
               <pre><code data-lang="bash">uv tool install promptlatch
 curl -fsSO https://bvolpato.github.io/promptlatch/agents.yaml
-PROMPTLATCH_TARGET_BASE_URL=https://generativelanguage.googleapis.com \
-  promptlatch serve --config agents.yaml</code></pre>
-              <p>
-                <code>claude-latch</code> and <code>codex-latch</code> can use the same proxy. Still on
-                Gemini CLI? Run <code>gemini-latch</code>.
-              </p>
+promptlatch serve --config agents.yaml</code></pre>
+              <p>It listens on <code>127.0.0.1:8000</code> and allows the official provider endpoints only.</p>
             </article>
             <article>
               <h3>Run Antigravity CLI through it</h3>
               <pre><code data-lang="bash">export GEMINI_API_KEY="&lt;gemini-api-key&gt;"
-export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:8000"
-agy --settings '{"modelProvider":"gemini"}'</code></pre>
+agy-latch
+agy-latch -p "Summarize recent changes"</code></pre>
               <p>
-                Needs a Gemini API key. Account sign-in ignores the proxy, and no wrapper checks this.
-                Run <code>promptlatch tail --follow</code> and confirm that your first request appears.
+                Needs a Gemini API key, because account sign-in does not use the proxy. If the proxy is down
+                or a setting would bypass it, the wrapper stops instead of sending unredacted prompts.
               </p>
             </article>
           </div>

@@ -91,13 +91,6 @@ async def test_official_clients_share_proxy_and_keep_native_auth():
             {"x-goog-api-key": "fixture-gemini-key"},
             {"contents": [{"role": "user", "parts": [{"text": OPENAI_FAKE}]}]},
         ),
-        (
-            "https://cloudcode-pa.googleapis.com",
-            "/v1internal:streamGenerateContent",
-            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            {"authorization": "Bearer fixture-gemini-oauth"},
-            {"request": {"contents": [{"role": "user", "parts": [{"text": OPENAI_FAKE}]}]}},
-        ),
     ]
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://proxy"

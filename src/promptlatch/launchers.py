@@ -24,67 +24,64 @@ _PROXY_HEALTH_TIMEOUT = 0.8
 _CODEX_PROVIDER = "promptlatch-official"
 _CODEX_MINIMUM_VERSION = (0, 162, 1)
 _CLAUDE_MINIMUM_VERSION = (2, 1, 220)
-_GEMINI_MINIMUM_VERSION = (0, 34, 0)
+_AGY_MINIMUM_VERSION = (1, 5, 8)
 _CLI_VERSION_TIMEOUT = 3.0
 _VERSION_PROBE_ENV = "PROMPTLATCH_VERSION_PROBE"
 _VERSION_PROBE_RECURSION = "promptlatch: version probe reached the shim again"
 _CODEX_CONFIG_TIMEOUT = 5.0
 _CODEX_CONFIG_OUTPUT_LIMIT = 1024 * 1024
-_GEMINI_SETTINGS_LIMIT = 1024 * 1024
+_AGY_SETTINGS_LIMIT = 1024 * 1024
 _CODEX_CHATGPT_TARGET = "https://chatgpt.com/backend-api/codex"
 _CODEX_API_TARGET = "https://api.openai.com/v1"
 _CLAUDE_TARGET = "https://api.anthropic.com"
-_GEMINI_API_TARGET = "https://generativelanguage.googleapis.com"
-_GEMINI_OAUTH_TARGET = "https://cloudcode-pa.googleapis.com"
+_AGY_TARGET = "https://generativelanguage.googleapis.com"
 _LOCAL_NO_PROXY = ("localhost", "127.0.0.1", "::1")
-_GEMINI_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _RESERVED_CLAUDE_HEADERS = ("x-target-", "x-redact-")
 _JS_WHITESPACE = (
     " \t\n\r\x0b\x0c\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
     "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 )
-_HEADER_TOKEN_RE = re.compile(r"\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
-_GEMINI_CUSTOM_HEADER_SPLIT = re.compile(r",(?=[" + re.escape(_JS_WHITESPACE) + r"]*[^,:]+:)")
 _JSONC_COMMENT_RE = re.compile(r'"(?:\\.|[^"\\])*"|(//[^\r\n]*|/\*[\s\S]*?\*/)')
 _JSONC_TRAILING_COMMA_RE = re.compile(r'"(?:\\.|[^"\\])*"|,\s*(?=[}\]])')
-_GEMINI_AUTH_TYPES = {
-    "oauth-personal": "oauth",
-    "gemini-api-key": "api-key",
-}
-_GEMINI_PROXY_ENV_VARS = (
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "GRPC_PROXY",
-    "grpc_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-)
-_GEMINI_LONG_VALUE_OPTIONS = frozenset(
+# The gateway header list is separated by commas and line breaks.
+_AGY_API_KEY_RE = re.compile(r"[A-Za-z0-9._~+/=-]{1,512}")
+# An empty provider keeps saved settings from sending requests straight to the Gemini API.
+_AGY_SESSION_SETTINGS = '{"modelProvider":""}'
+_AGY_BYPASS_COMMANDS = frozenset({"acp", "remote-control"})
+_AGY_BYPASS_OPTIONS = frozenset({"remote-agent", "remote-control"})
+_AGY_VALUE_OPTIONS = frozenset(
     {
-        "--model",
-        "--prompt",
-        "--prompt-interactive",
-        "--approval-mode",
-        "--policy",
-        "--admin-policy",
-        "--allowed-mcp-server-names",
-        "--allowed-tools",
-        "--extensions",
-        "--resume",
-        "--session-id",
-        "--delete-session",
-        "--include-directories",
-        "--output-format",
-        "--worktree",
-        "--fake-responses",
-        "--record-responses",
+        "add-dir",
+        "agent",
+        "conversation",
+        "effort",
+        "i",
+        "input-format",
+        "json-schema",
+        "log-file",
+        "mode",
+        "model",
+        "output-format",
+        "p",
+        "print",
+        "print-timeout",
+        "project",
+        "prompt",
+        "prompt-interactive",
+        "r",
+        "resume",
     }
 )
-_GEMINI_OPTIONAL_VALUE_OPTIONS = frozenset({"--resume", "--worktree"})
-_GEMINI_SHORT_VALUE_CHARS = frozenset({"m", "p", "i", "e", "r", "o", "w"})
-_GEMINI_OPTIONAL_SHORT_VALUE_CHARS = frozenset({"r", "w"})
+_AGY_DROPPED_VARIABLES = (
+    "AGY_ADC_AUTH",
+    "AGY_LLM_GATEWAY_PROXY_URL",
+    "CLOUD_CODE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GEMINI_BASE_URL",
+    "GOOGLE_GENAI_USE_ENTERPRISE",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+)
 _ROUTING_CONFIG_KEYS = {"model_provider", "model_providers", "openai_base_url"}
 _BYPASS_FLAGS = ("--oss", "--local-provider", "--remote")
 _CODEX_OPTIONS_WITH_VALUES = {
@@ -131,8 +128,8 @@ def claude_main() -> NoReturn:
     _main("claude", sys.argv[1:])
 
 
-def gemini_main() -> NoReturn:
-    _main("gemini", sys.argv[1:])
+def agy_main() -> NoReturn:
+    _main("agy", sys.argv[1:])
 
 
 def _main(client: str, arguments: list[str]) -> NoReturn:
@@ -155,10 +152,9 @@ def _main(client: str, arguments: list[str]) -> NoReturn:
             _reject_codex_routing_overrides(arguments)
             _reject_codex_unproxied_commands(arguments)
             _require_supported_cli_version(client, executable, environment, probed)
-        elif client == "gemini":
-            _reject_unsupported_gemini_proxy_url(proxy)
-            _reject_gemini_unproxied_commands(arguments)
-            _reject_alternate_gemini_providers(environment)
+        elif client == "agy":
+            _reject_agy_unproxied_arguments(arguments)
+            _reject_agy_alternate_routes(environment, proxy)
             _require_supported_cli_version(client, executable, environment, probed)
         else:
             _reject_alternate_claude_providers(environment)
@@ -170,9 +166,9 @@ def _main(client: str, arguments: list[str]) -> NoReturn:
                 executable, arguments, environment, proxy
             )
             _verify_codex_configuration(executable, arguments, environment, provider)
-        elif client == "gemini":
-            environment = _gemini_environment(environment, proxy)
-            cli_arguments = arguments
+        elif client == "agy":
+            environment = _agy_environment(environment, proxy)
+            cli_arguments = ["--settings", _AGY_SESSION_SETTINGS, *arguments]
         else:
             environment = _claude_environment(environment, proxy)
             cli_arguments = arguments
@@ -203,14 +199,14 @@ def _print_help(program: str, client: str) -> None:
                 "Run codex-latch --latch-help to see this message without contacting the proxy.",
             ]
         )
-    elif client == "gemini":
+    elif client == "agy":
         lines.extend(
             [
-                "  PROMPTLATCH_GEMINI_AUTH auto, oauth, or api-key (default: auto)",
-                "  PROMPTLATCH_GEMINI_BIN  Gemini executable override",
+                "  GEMINI_API_KEY          Gemini API key (required)",
+                "  PROMPTLATCH_AGY_BIN     Antigravity CLI executable override",
                 "",
-                "Auto mode honors saved Gemini CLI auth settings, OAuth login, or GEMINI_API_KEY.",
-                "Run gemini-latch --latch-help to see this message without contacting the proxy.",
+                "Account sign-in does not pass through PromptLatch, so an API key is required.",
+                "Run agy-latch --latch-help to see this message without contacting the proxy.",
             ]
         )
     else:
@@ -408,9 +404,9 @@ def _require_supported_cli_version(
     if client == "codex":
         minimum = _CODEX_MINIMUM_VERSION
         label = "Codex"
-    elif client == "gemini":
-        minimum = _GEMINI_MINIMUM_VERSION
-        label = "Gemini"
+    elif client == "agy":
+        minimum = _AGY_MINIMUM_VERSION
+        label = "Antigravity"
     else:
         minimum = _CLAUDE_MINIMUM_VERSION
         label = "Claude Code"
@@ -1024,110 +1020,65 @@ def _is_reserved_claude_header(line: str) -> bool:
     )
 
 
-def _reject_unsupported_gemini_proxy_url(proxy: ProxyAddress) -> None:
-    if proxy.origin.startswith("http://") and proxy.hostname not in _GEMINI_HTTP_HOSTS:
-        raise LauncherError(
-            "Gemini CLI only permits HTTP base URLs on localhost, 127.0.0.1, or [::1]"
-        )
-
-
-def _reject_gemini_unproxied_commands(arguments: list[str]) -> None:
+def _reject_agy_unproxied_arguments(arguments: list[str]) -> None:
+    # agy reads options anywhere on the command line, with one dash or two.
+    for argument in arguments:
+        if not argument.startswith("-"):
+            continue
+        name = argument.lstrip("-").partition("=")[0]
+        if name == "settings":
+            raise LauncherError("agy-latch sets --settings for this session; remove it")
+        if name in _AGY_BYPASS_OPTIONS:
+            raise LauncherError(f"Antigravity --{name} runs outside PromptLatch; remove it")
     index = 0
     while index < len(arguments):
         argument = arguments[index]
-        if argument == "--":
+        if not argument.startswith("-"):
+            if argument in _AGY_BYPASS_COMMANDS:
+                raise LauncherError(
+                    f"agy {argument} bypasses PromptLatch; run it without agy-latch"
+                )
             return
-        if argument == "gemma":
+        name, separator, _ = argument.lstrip("-").partition("=")
+        index += 2 if name in _AGY_VALUE_OPTIONS and not separator else 1
+
+
+def _reject_agy_alternate_routes(environment: dict[str, str], proxy: ProxyAddress) -> None:
+    if environment.get("AGY_ADC_AUTH", "").strip().lower() in _TRUE_VALUES:
+        raise LauncherError(
+            "Antigravity Application Default Credentials bypass PromptLatch; unset AGY_ADC_AUTH"
+        )
+    gateway = environment.get("AGY_LLM_GATEWAY_URL", "").strip()
+    if gateway and gateway.rstrip("/") != proxy.origin:
+        raise LauncherError("AGY_LLM_GATEWAY_URL names another gateway; unset it to use agy-latch")
+    for path in _agy_gateway_settings_paths(environment):
+        settings = _load_agy_gateway_settings(path)
+        if "gateway" in settings or "proxy" in settings:
             raise LauncherError(
-                "Gemini local Gemma routing bypasses PromptLatch; "
-                "run gemma commands without gemini-latch"
+                f"gateway or proxy settings in {path} can route around PromptLatch; remove them"
             )
-        if argument.startswith("--"):
-            option, separator, _ = argument.partition("=")
-            if option == "--sandbox":
-                raise LauncherError(
-                    "Gemini CLI sandbox mode drops PromptLatch routing variables; "
-                    "disable --sandbox when using gemini-latch"
-                )
-            if option in {"--acp", "--experimental-acp"}:
-                raise LauncherError(
-                    "Gemini CLI ACP mode permits runtime base URL overrides; "
-                    "run ACP mode without gemini-latch"
-                )
-            if option in _GEMINI_LONG_VALUE_OPTIONS:
-                if separator:
-                    index += 1
-                elif (
-                    index + 1 < len(arguments)
-                    and not arguments[index + 1].startswith("-")
-                    and not (
-                        option in _GEMINI_OPTIONAL_VALUE_OPTIONS and arguments[index + 1] == "gemma"
-                    )
-                ):
-                    index += 2
-                else:
-                    index += 1
-                continue
-            index += 1
-            continue
-        if argument.startswith("-") and len(argument) > 1:
-            cluster_flags, separator, _ = argument[1:].partition("=")
-            consumed_next = False
-            for pos, ch in enumerate(cluster_flags):
-                if ch == "s":
-                    raise LauncherError(
-                        "Gemini CLI sandbox mode drops PromptLatch routing variables; "
-                        "disable -s when using gemini-latch"
-                    )
-                if ch in _GEMINI_SHORT_VALUE_CHARS:
-                    if (
-                        not separator
-                        and pos == len(cluster_flags) - 1
-                        and index + 1 < len(arguments)
-                        and not arguments[index + 1].startswith("-")
-                        and not (
-                            ch in _GEMINI_OPTIONAL_SHORT_VALUE_CHARS
-                            and arguments[index + 1] == "gemma"
-                        )
-                    ):
-                        consumed_next = True
-                    break
-            index += 2 if consumed_next else 1
-            continue
-        return
 
 
-def _reject_alternate_gemini_providers(environment: dict[str, str]) -> None:
-    switches = (
-        "GOOGLE_GENAI_USE_VERTEXAI",
-        "GEMINI_CLI_USE_COMPUTE_ADC",
-        "CLOUD_SHELL",
-    )
-    active = [
-        name for name in switches if environment.get(name, "").strip().lower() in _TRUE_VALUES
-    ]
-    if active:
-        raise LauncherError(
-            "Gemini CLI Vertex AI or Compute ADC mode bypasses PromptLatch; unset "
-            + ", ".join(active)
-        )
-    active_proxies = [name for name in _GEMINI_PROXY_ENV_VARS if environment.get(name, "").strip()]
-    if active_proxies:
-        raise LauncherError(
-            "Gemini CLI external proxy variables bypass local PromptLatch; unset "
-            + ", ".join(active_proxies)
-        )
-    sandbox_env = environment.get("GEMINI_SANDBOX", "").strip().lower()
-    if sandbox_env not in {"", "0", "false"}:
-        raise LauncherError(
-            "Gemini CLI sandbox mode drops PromptLatch routing variables; unset GEMINI_SANDBOX"
-        )
-    default_auth = environment.get("GEMINI_DEFAULT_AUTH_TYPE", "").strip()
-    if default_auth and default_auth not in _GEMINI_AUTH_TYPES:
-        raise LauncherError(
-            "GEMINI_DEFAULT_AUTH_TYPE routes outside PromptLatch; "
-            "use oauth-personal or gemini-api-key"
-        )
+def _agy_gateway_settings_paths(environment: dict[str, str]) -> tuple[Path, Path]:
+    home = environment.get("USERPROFILE" if os.name == "nt" else "HOME") or Path.home()
+    if sys.platform == "darwin":
+        managed = Path("/Library/Application Support/Antigravity")
+    elif os.name == "nt":
+        managed = Path(environment.get("ProgramData") or r"C:\ProgramData") / "Antigravity"
+    else:
+        managed = Path("/etc/antigravity")
+    return managed / "admin_settings.json", Path(home) / ".antigravity" / "settings.json"
+
+
+def _load_agy_gateway_settings(path: Path) -> dict[str, object]:
+    try:
+        if path.stat().st_size > _AGY_SETTINGS_LIMIT:
+            raise LauncherError("Antigravity settings file is too large to verify safely")
+        return _loads_jsonc(path.read_text(encoding="utf-8-sig"))
+    except (FileNotFoundError, NotADirectoryError):
+        return {}
+    except (OSError, ValueError, RecursionError):
+        raise LauncherError("could not verify Antigravity settings safely") from None
 
 
 def _loads_jsonc(raw: str) -> dict[str, object]:
@@ -1144,281 +1095,28 @@ def _loads_jsonc(raw: str) -> dict[str, object]:
     return parsed
 
 
-def _load_gemini_settings_layer(path: Path) -> dict[str, object]:
-    try:
-        try:
-            info = path.stat()
-        except FileNotFoundError:
-            return {}
-        if info.st_size > _GEMINI_SETTINGS_LIMIT:
-            raise LauncherError("Gemini CLI settings file is too large to verify safely")
-        return _loads_jsonc(path.read_text(encoding="utf-8-sig"))
-    except LauncherError:
-        raise
-    except (OSError, UnicodeDecodeError, ValueError):
-        raise LauncherError("could not verify Gemini CLI settings safely") from None
-
-
-def _gemini_system_settings_path(environment: dict[str, str]) -> Path:
-    override = environment.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH")
-    if override:
-        return Path(override).expanduser()
-    if sys.platform == "darwin":
-        return Path("/Library/Application Support/GeminiCli/settings.json")
-    if sys.platform == "win32":
-        return Path(r"C:\ProgramData\gemini-cli\settings.json")
-    return Path("/etc/gemini-cli/settings.json")
-
-
-def _gemini_auth_field(layer: dict[str, object], field: str) -> object:
-    security = layer.get("security")
-    if security is None:
-        return None
-    if not isinstance(security, dict):
-        raise LauncherError("could not verify Gemini CLI settings safely")
-    auth = security.get("auth")
-    if auth is None:
-        return None
-    if not isinstance(auth, dict):
-        raise LauncherError("could not verify Gemini CLI settings safely")
-    return auth.get(field)
-
-
-def _normalize_gemini_auth_setting(raw: object) -> str | None:
-    if raw is None or raw == "":
-        return None
-    if not isinstance(raw, str):
-        raise LauncherError("could not verify Gemini CLI settings safely")
-    mapped = _GEMINI_AUTH_TYPES.get(raw)
-    if mapped is None:
+def _agy_environment(environment: dict[str, str], proxy: ProxyAddress) -> dict[str, str]:
+    api_key = environment.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
         raise LauncherError(
-            "Gemini CLI auth setting routes outside PromptLatch; "
-            "use oauth-personal or gemini-api-key"
+            "agy-latch requires GEMINI_API_KEY; Antigravity account sign-in does not pass "
+            "through PromptLatch"
         )
-    return mapped
-
-
-def _inspect_gemini_settings(
-    environment: dict[str, str],
-) -> tuple[Path, str | None, str | None]:
-    try:
-        cwd = Path.cwd().resolve()
-        system_override = environment.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH")
-        if system_override:
-            system_path = Path(system_override).expanduser().resolve()
-            environment["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] = str(system_path)
-        else:
-            system_path = _gemini_system_settings_path(environment)
-        defaults_override = environment.get("GEMINI_CLI_SYSTEM_DEFAULTS_PATH")
-        if defaults_override:
-            system_defaults_path = Path(defaults_override).expanduser().resolve()
-            environment["GEMINI_CLI_SYSTEM_DEFAULTS_PATH"] = str(system_defaults_path)
-        else:
-            system_defaults_path = system_path.with_name("system-defaults.json")
-        env_home = environment.get("GEMINI_CLI_HOME")
-        if env_home:
-            resolved_home = Path(env_home).expanduser().resolve()
-            environment["GEMINI_CLI_HOME"] = str(resolved_home)
-            home_dir = resolved_home
-        else:
-            home_dir = Path.home()
-            resolved_home = home_dir.resolve()
-    except OSError:
-        raise LauncherError("Gemini working directory could not be verified") from None
-
-    user_path = home_dir / ".gemini" / "settings.json"
-
-    system_defaults = _load_gemini_settings_layer(system_defaults_path)
-    user_layer = _load_gemini_settings_layer(user_path)
-    workspace_layer = (
-        _load_gemini_settings_layer(cwd / ".gemini" / "settings.json")
-        if cwd != resolved_home
-        else {}
+    if _AGY_API_KEY_RE.fullmatch(api_key) is None:
+        raise LauncherError("GEMINI_API_KEY contains characters that a header cannot carry")
+    for name in _AGY_DROPPED_VARIABLES:
+        environment.pop(name, None)
+    environment["AGY_LLM_GATEWAY_URL"] = proxy.origin
+    # The proxy removes this placeholder and adds the API key from the target header.
+    environment["AGY_LLM_GATEWAY_API_KEY"] = "promptlatch"
+    environment["AGY_LLM_GATEWAY_WIRE_PROTOCOL"] = "genai"
+    environment["AGY_LLM_GATEWAY_HEADERS"] = ", ".join(
+        (
+            f"X-Target-Base-URL: {_AGY_TARGET}",
+            f"X-Target-API-Key: {api_key}",
+            "X-Target-API-Key-Header: x-goog-api-key",
+        )
     )
-    system_layer = _load_gemini_settings_layer(system_path)
-
-    all_layers = (system_defaults, user_layer, workspace_layer, system_layer)
-    for layer in all_layers:
-        experimental = layer.get("experimental")
-        if experimental is not None and not isinstance(experimental, dict):
-            raise LauncherError("could not verify Gemini CLI settings safely")
-        if isinstance(experimental, dict):
-            gemma = experimental.get("gemmaModelRouter")
-            if gemma is not None and not isinstance(gemma, dict):
-                raise LauncherError("could not verify Gemini CLI settings safely")
-            if isinstance(gemma, dict):
-                gemma_enabled = gemma.get("enabled")
-                if gemma_enabled is True:
-                    raise LauncherError(
-                        "Gemini local Gemma model router bypasses PromptLatch; "
-                        "disable experimental.gemmaModelRouter.enabled"
-                    )
-                if gemma_enabled is not None and gemma_enabled is not False:
-                    raise LauncherError("could not verify Gemini CLI settings safely")
-        tools_cfg = layer.get("tools")
-        if tools_cfg is not None and not isinstance(tools_cfg, dict):
-            raise LauncherError("could not verify Gemini CLI settings safely")
-        if isinstance(tools_cfg, dict):
-            sandbox_cfg = tools_cfg.get("sandbox")
-            if sandbox_cfg is not None and sandbox_cfg is not False and sandbox_cfg != "":
-                raise LauncherError(
-                    "Gemini CLI tools.sandbox setting drops PromptLatch routing variables; "
-                    "disable tools.sandbox"
-                )
-        use_external = _gemini_auth_field(layer, "useExternal")
-        if use_external is True:
-            raise LauncherError("Gemini external auth mode cannot be verified with gemini-latch")
-        if use_external is not None and use_external is not False:
-            raise LauncherError("could not verify Gemini CLI settings safely")
-
-    def resolve_field(layers: tuple[dict[str, object], ...], field: str) -> str | None:
-        resolved: str | None = None
-        for item in layers:
-            raw = _gemini_auth_field(item, field)
-            if raw is not None:
-                resolved = _normalize_gemini_auth_setting(raw)
-        return resolved
-
-    without_workspace = (system_defaults, user_layer, system_layer)
-    selected_base = resolve_field(without_workspace, "selectedType")
-    selected_ws = resolve_field(all_layers, "selectedType")
-    if selected_base != selected_ws:
-        raise LauncherError(
-            "workspace .gemini/settings.json overrides security.auth.selectedType; "
-            "align workspace and user auth settings before using gemini-latch"
-        )
-    enforced_base = resolve_field(without_workspace, "enforcedType")
-    enforced_ws = resolve_field(all_layers, "enforcedType")
-    if enforced_base != enforced_ws:
-        raise LauncherError(
-            "workspace .gemini/settings.json overrides security.auth.enforcedType; "
-            "align workspace and user auth settings before using gemini-latch"
-        )
-    return home_dir, selected_ws, enforced_ws
-
-
-def _gemini_environment(environment: dict[str, str], proxy: ProxyAddress) -> dict[str, str]:
-    requested_mode = environment.get("PROMPTLATCH_GEMINI_AUTH", "auto").strip().lower()
-    if requested_mode not in {"auto", "oauth", "api-key"}:
-        raise LauncherError("PROMPTLATCH_GEMINI_AUTH must be auto, oauth, or api-key")
-
-    home_dir, configured_mode, enforced_mode = _inspect_gemini_settings(environment)
-    default_auth_raw = environment.get("GEMINI_DEFAULT_AUTH_TYPE", "").strip()
-    default_auth_mode = _GEMINI_AUTH_TYPES.get(default_auth_raw) if default_auth_raw else None
-    if default_auth_raw and default_auth_mode is None:
-        raise LauncherError(
-            "GEMINI_DEFAULT_AUTH_TYPE routes outside PromptLatch; "
-            "use oauth-personal or gemini-api-key"
-        )
-    if (
-        configured_mode is not None
-        and enforced_mode is not None
-        and configured_mode != enforced_mode
-    ):
-        raise LauncherError(
-            "Gemini CLI security.auth.selectedType conflicts with security.auth.enforcedType"
-        )
-    if requested_mode != "auto":
-        if configured_mode is not None and requested_mode != configured_mode:
-            raise LauncherError(
-                f"PROMPTLATCH_GEMINI_AUTH={requested_mode} conflicts with Gemini CLI "
-                "security.auth.selectedType; update settings.json or PROMPTLATCH_GEMINI_AUTH"
-            )
-        if enforced_mode is not None and requested_mode != enforced_mode:
-            raise LauncherError(
-                f"PROMPTLATCH_GEMINI_AUTH={requested_mode} conflicts with Gemini CLI "
-                "security.auth.enforcedType"
-            )
-        if default_auth_mode is not None and requested_mode != default_auth_mode:
-            raise LauncherError(
-                f"PROMPTLATCH_GEMINI_AUTH={requested_mode} conflicts with GEMINI_DEFAULT_AUTH_TYPE"
-            )
-
-    use_gca = environment.get("GOOGLE_GENAI_USE_GCA", "").strip().lower() in _TRUE_VALUES
-    gemini_key = environment.get("GEMINI_API_KEY", "").strip()
-    google_key = environment.get("GOOGLE_API_KEY", "").strip()
-    has_api_key = bool(gemini_key or google_key)
-    has_saved_oauth = (home_dir / ".gemini" / "oauth_creds.json").is_file() or (
-        home_dir / ".gemini" / "google_accounts.json"
-    ).is_file()
-
-    if requested_mode != "auto":
-        mode = requested_mode
-    elif configured_mode is not None:
-        mode = configured_mode
-    elif enforced_mode is not None:
-        mode = enforced_mode
-    elif use_gca:
-        mode = "oauth"
-    elif has_api_key:
-        mode = "api-key"
-    elif has_saved_oauth:
-        mode = "oauth"
-    elif default_auth_mode is not None:
-        mode = default_auth_mode
-    else:
-        raise LauncherError(
-            "Gemini CLI has no configured auth or API key; run `gemini` to sign in, "
-            "set GEMINI_API_KEY, or set PROMPTLATCH_GEMINI_AUTH"
-        )
-
-    if mode == "api-key" and configured_mode != "api-key" and not has_api_key:
-        raise LauncherError(
-            "api-key mode requires GEMINI_API_KEY, GOOGLE_API_KEY, or "
-            "security.auth.selectedType set to gemini-api-key"
-        )
-
-    existing_headers = environment.get("GEMINI_CLI_CUSTOM_HEADERS", "")
-    if any(
-        (ord(ch) < 0x20 and ch != "\t") or ord(ch) == 0x7F or ch in {"\u2028", "\u2029"}
-        for ch in existing_headers
-    ):
-        raise LauncherError("GEMINI_CLI_CUSTOM_HEADERS must not contain control characters")
-    kept_headers: list[str] = []
-    for raw_entry in _GEMINI_CUSTOM_HEADER_SPLIT.split(existing_headers):
-        entry = raw_entry.strip(_JS_WHITESPACE)
-        if not entry or ":" not in entry:
-            continue
-        raw_name, _, raw_val = entry.partition(":")
-        clean_name = raw_name.strip(_JS_WHITESPACE)
-        clean_val = raw_val.strip(_JS_WHITESPACE)
-        if _is_reserved_claude_header(f"{clean_name}: {clean_val}"):
-            continue
-        if not _HEADER_TOKEN_RE.fullmatch(clean_name):
-            raise LauncherError("GEMINI_CLI_CUSTOM_HEADERS contains an invalid HTTP header name")
-        kept_headers.append(f"{clean_name}: {clean_val}")
-    target = _GEMINI_OAUTH_TARGET if mode == "oauth" else _GEMINI_API_TARGET
-    kept_headers.append(f"X-Target-Base-URL: {target}")
-
-    environment["GOOGLE_GEMINI_BASE_URL"] = proxy.origin
-    environment["CODE_ASSIST_ENDPOINT"] = proxy.origin
-    environment["GOOGLE_VERTEX_BASE_URL"] = proxy.origin
-    environment["GEMINI_CLI_CUSTOM_HEADERS"] = ", ".join(kept_headers)
-    environment["GOOGLE_GENAI_USE_VERTEXAI"] = "false"
-    environment["GEMINI_CLI_USE_COMPUTE_ADC"] = "false"
-    environment["CLOUD_SHELL"] = "false"
-    environment["GEMINI_SANDBOX"] = "false"
-    environment["GEMINI_TELEMETRY_ENABLED"] = "false"
-    environment["GEMINI_TELEMETRY_LOG_PROMPTS"] = "false"
-    environment["GEMINI_DEFAULT_AUTH_TYPE"] = (
-        "oauth-personal" if mode == "oauth" else "gemini-api-key"
-    )
-    for proxy_var in _GEMINI_PROXY_ENV_VARS:
-        environment[proxy_var] = ""
-    if mode == "oauth":
-        environment["GOOGLE_GENAI_USE_GCA"] = "true"
-        environment["GEMINI_API_KEY"] = ""
-        environment["GOOGLE_API_KEY"] = ""
-    else:
-        environment["GOOGLE_GENAI_USE_GCA"] = "false"
-        environment["GEMINI_API_KEY_AUTH_MECHANISM"] = "x-goog-api-key"
-        if gemini_key:
-            environment["GEMINI_API_KEY"] = gemini_key
-        elif google_key:
-            environment["GEMINI_API_KEY"] = google_key
-        else:
-            environment.pop("GEMINI_API_KEY", None)
-            environment.pop("GOOGLE_API_KEY", None)
     return environment
 
 

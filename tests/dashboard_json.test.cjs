@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { jsonPresentation, renderJSON, fraction, tokenTotal, cost, uploadPresentation, uploadTotalsPresentation } = require("../src/promptlatch/dashboard_assets/app.js");
+const { jsonPresentation, renderJSON, fraction, tokenTotal, cost, uploadPresentation, uploadTotalsPresentation, visibleMessage, bodyNotices } = require("../src/promptlatch/dashboard_assets/app.js");
 
 test("usage summaries preserve unknown values and mark partial totals", () => {
   assert.equal(fraction(3, 4), 0.75);
@@ -66,6 +66,24 @@ test("upload totals show sample coverage and keep historical unknowns explicit",
     avg_request_compression_ms: 1500,
     request_compression_ms_known_requests: 1,
   })[2][1], "1.5 s · 1/1 requests");
+});
+
+test("conversation keeps readable reasoning summaries and omits encrypted-only reasoning", () => {
+  const summary = [{ type: "summary_text", text: "Compared both options." }];
+  for (const content of [undefined, null, []]) {
+    assert.equal(visibleMessage({ type: "reasoning", summary, content, encrypted_content: "x" }), true);
+    assert.equal(visibleMessage({ type: "reasoning", summary: [], content, encrypted_content: "x" }), false);
+  }
+  assert.equal(visibleMessage({ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "ok" }] }), true);
+});
+
+test("body notices do not call an omitted body a partial capture", (t) => {
+  global.document = { createElement: (tagName) => new FakeNode(tagName) };
+  t.after(() => { delete global.document; });
+  const notices = (item) => bodyNotices(item).map((node) => node.textContent);
+  assert.deepEqual(notices({ request_body: null, body_truncated: true, body_omitted_reason: "storage_budget" }), ["Request body omitted: storage_budget"]);
+  assert.match(notices({ request_body: "{", body_truncated: true })[0], /partial capture/);
+  assert.deepEqual(notices({ request_body: "{}", body_truncated: false }), []);
 });
 
 function presented(value, truncated = false) {

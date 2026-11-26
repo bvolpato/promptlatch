@@ -24,6 +24,7 @@ _HOST = re.compile(r"(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]*)(?::([0-9]{1,
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _SESSION_COOKIE = "promptlatch_dashboard_session"
 _SESSION_SECONDS = 30 * 24 * 60 * 60
+_MAX_OFFSET = 2**63 - 1  # Larger integers cannot be bound to a SQLite query.
 _SESSION = re.compile(r"v1\.([0-9]{1,12})\.([0-9]{1,12})\.([A-Za-z0-9_-]{43})\.([a-f0-9]{64})\Z")
 _HEADERS = {
     "Cache-Control": "no-store",
@@ -249,7 +250,7 @@ def create_dashboard_app(
     @app.get("/api/threads", dependencies=protected)
     async def threads(
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
-        offset: Annotated[int, Query(ge=0)] = 0,
+        offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
         traffic: Annotated[Literal["all", "inference"], Query()] = "all",
     ) -> Any:
         return await run_in_threadpool(reader.threads, limit=limit, offset=offset, traffic=traffic)
@@ -258,7 +259,7 @@ def create_dashboard_app(
     async def requests(
         thread_id: Annotated[str | None, Query(max_length=256)] = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
-        offset: Annotated[int, Query(ge=0)] = 0,
+        offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
         traffic: Annotated[Literal["all", "inference"], Query()] = "all",
     ) -> Any:
         return await run_in_threadpool(
@@ -269,7 +270,7 @@ def create_dashboard_app(
     async def thread_requests(
         thread_id: Annotated[str, PathParam(max_length=256)],
         limit: Annotated[int, Query(ge=1, le=100)] = 100,
-        offset: Annotated[int, Query(ge=0)] = 0,
+        offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
         order: Annotated[Literal["asc", "desc"], Query()] = "asc",
         traffic: Annotated[Literal["all", "inference"], Query()] = "all",
     ) -> Any:

@@ -185,6 +185,7 @@ class ResponseMetrics:
         self._event_name = ""
         self._skip_event = False
         self._protocol: str | None = None
+        self._sse_expected = False
         self._llm_stream = False
         self._json_stream = False
         self._probe = bytearray()
@@ -199,8 +200,7 @@ class ResponseMetrics:
         self._http_error = status_code >= 400
         fields = {key.lower(): value for key, value in headers.items()}
         self._encoding = fields.get("content-encoding", "").strip().lower()
-        if "text/event-stream" in fields.get("content-type", "").lower():
-            self._protocol = "sse"
+        self._sse_expected = "text/event-stream" in fields.get("content-type", "").lower()
         cost = fields.get("x-litellm-response-cost")
         if cost is not None:
             try:
@@ -232,8 +232,10 @@ class ResponseMetrics:
                 prefix = bytes(self._probe).removeprefix(b"\xef\xbb\xbf").lstrip()
                 if prefix.startswith(_SSE_PREFIXES):
                     self._protocol = "sse"
-                elif prefix.startswith((b"{", b"[")) or len(self._probe) >= 32:
+                elif prefix.startswith((b"{", b"[")):
                     self._protocol = "json"
+                elif (prefix and self._sse_expected) or len(self._probe) >= 32:
+                    self._protocol = "sse" if self._sse_expected else "json"
                 else:
                     continue
                 part = bytes(self._probe)
@@ -289,6 +291,8 @@ class ResponseMetrics:
     def finish_response(self, *, complete: bool = True) -> None:
         if self._finished:
             return
+        if self._protocol is None and self._sse_expected:
+            self._protocol = "sse"
         if self._protocol == "sse":
             self.finish_stream(complete=complete)
             return
@@ -576,7 +580,10 @@ class ResponseMetrics:
         if self._event_name == "error":
             self._outcome = "stream_error"
             self._error_details.setdefault("event", "error")
-        if self._event_data and not self._skip_event:
+        if self._skip_event:
+            # An oversized payload is unreadable, but its event name still reports completion.
+            self._terminal |= self._event_name == "response.completed"
+        elif self._event_data:
             data = bytes(self._event_data[:-1])
             self._observe_event_data(data)
         self._event_data.clear()
@@ -713,8 +720,8 @@ class ResponseMetrics:
             block = payload.get("content_block")
             if isinstance(block, dict):
                 meaningful |= _has_text(block.get("text")) or _has_text(block.get("thinking"))
-        if event_type == "message_delta":
-            delta = payload.get("delta")
+        if event_type in {"message", "message_delta"}:
+            delta = payload.get("delta") if event_type == "message_delta" else payload
             stop = delta.get("stop_reason") if isinstance(delta, dict) else None
             if (
                 isinstance(stop, str)
@@ -723,7 +730,7 @@ class ResponseMetrics:
             ):
                 self._outcome = "incomplete"
                 self._capture_incomplete(
-                    "message_delta", "max_output_tokens" if stop == "max_tokens" else stop
+                    event_type, "max_output_tokens" if stop == "max_tokens" else stop
                 )
         if streaming and meaningful:
             self._saw_output = True
@@ -997,6 +1004,24 @@ class ResponseMetrics:
                         self._unsupported_costs = True
 
     def _merge_usage(self, usage: dict[str, Any], *, anthropic: bool) -> None:
+        # Providers send null for counters they do not supply.
+        usage = _without_nulls(usage)
+        # Fast mode and US inference have their own rates. Totals leave out compaction.
+        iterations = usage.get("iterations")
+        if (
+            usage.get("speed", "standard") != "standard"
+            or usage.get("inference_geo") == "us"
+            or (
+                isinstance(iterations, list)
+                and any(
+                    isinstance(item, dict) and item.get("type") != "message" for item in iterations
+                )
+            )
+        ):
+            self._unsupported_costs = True
+        tier = usage.get("service_tier")
+        if isinstance(tier, str) and 0 < len(tier) <= 64:
+            self._service_tier = tier
         for key in (
             "input_tokens_details",
             "prompt_tokens_details",
@@ -1006,6 +1031,7 @@ class ResponseMetrics:
         ):
             details = usage.get(key)
             if isinstance(details, dict):
+                details = usage[key] = _without_nulls(details)
                 for name, value in details.items():
                     if ("audio" in name or name.endswith("_requests")) and value != 0:
                         self._unsupported_costs = True
@@ -1038,6 +1064,7 @@ class ResponseMetrics:
                 self._usage_source = "upstream"
         for key, target, source in (
             ("input_tokens_details", "cache_write_tokens", "cache_write_tokens"),
+            ("prompt_tokens_details", "cache_write_tokens", "cache_write_tokens"),
             ("output_tokens_details", "reasoning_tokens", "reasoning_tokens"),
             ("completion_tokens_details", "reasoning_tokens", "reasoning_tokens"),
         ):
@@ -1099,6 +1126,10 @@ class ResponseMetrics:
 
 def _has_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _without_nulls(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if item is not None}
 
 
 def _bounded_error_source(value: str) -> str:

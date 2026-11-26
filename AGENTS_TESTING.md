@@ -2,7 +2,8 @@
 
 Run from repository root. Never use real credentials in tests or logs.
 
-CI and CodeQL use `ubuntu-22.04`. CI tests Python 3.12, 3.13, and 3.14.
+CI and CodeQL use `ubuntu-22.04`. CI tests Python 3.12, 3.13, and 3.14, plus
+Python 3.14 on `macos-15`, where file locks and paths differ from Linux.
 Packaging and audit tooling use Python 3.14. `pip-audit` dependencies do not yet
 support Python 3.15.
 

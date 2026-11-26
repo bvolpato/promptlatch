@@ -82,6 +82,11 @@ def test_literal_transform_matches_randomized_native_iteration() -> None:
             )
 
 
+def test_adapter_supports_installed_version() -> None:
+    # When this fails after an upgrade, compare transformers/config.py before adding the version.
+    assert _config_transform.supported()
+
+
 def test_adapter_is_disabled_when_native_parser_changes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(native.IniFileParser, "_get_value_and_line_offset", lambda *_args: [])
     assert not _config_transform.supported()

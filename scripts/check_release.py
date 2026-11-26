@@ -61,6 +61,8 @@ def required_release_references(version: str) -> dict[str, tuple[Path, str]]:
         "README PyPI library": (ROOT / "README.md", "uv add promptlatch"),
         "README Helm chart": (ROOT / "README.md", chart),
         "README container": (ROOT / "README.md", image),
+        "deployment guide Helm chart": (ROOT / "docs" / "deployment.md", chart),
+        "deployment guide container": (ROOT / "docs" / "deployment.md", image),
         "PROMPT PyPI tool": (ROOT / "PROMPT.md", "uv tool install promptlatch"),
         "PROMPT PyPI library": (ROOT / "PROMPT.md", "uv add promptlatch"),
         "PROMPT container": (ROOT / "PROMPT.md", image),

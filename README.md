@@ -1,145 +1,48 @@
 # PromptLatch
 
 [![CI](https://github.com/bvolpato/promptlatch/actions/workflows/ci.yml/badge.svg)](https://github.com/bvolpato/promptlatch/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/bvolpato/promptlatch/actions/workflows/codeql.yml/badge.svg)](https://github.com/bvolpato/promptlatch/actions/workflows/codeql.yml)
-[![Release](https://img.shields.io/github/v/release/bvolpato/promptlatch)](https://github.com/bvolpato/promptlatch/releases)
-[![License: MIT](https://img.shields.io/github/license/bvolpato/promptlatch)](https://github.com/bvolpato/promptlatch/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/promptlatch)](https://pypi.org/project/promptlatch/)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776ab)](https://github.com/bvolpato/promptlatch/blob/main/pyproject.toml)
-[![Docker](https://img.shields.io/badge/GHCR-promptlatch-54d6a0)](https://github.com/bvolpato/promptlatch/pkgs/container/promptlatch)
+[![License: MIT](https://img.shields.io/github/license/bvolpato/promptlatch)](https://github.com/bvolpato/promptlatch/blob/main/LICENSE)
 
-**Redact secrets before prompts reach an LLM provider.**
+**Send the prompt. Keep the keys.**
 
-PromptLatch is a local proxy and a Python redaction library. Use the proxy for
-coding agents and clients that support a custom base URL. Use the library to redact
-prompt text, message arrays, SDK parameters, and structured request payloads before
-your application calls an LLM SDK.
+Coding agents read your `.env`, your logs, and your configs, then send them to a model. PromptLatch runs on your machine and redacts the credentials before the request leaves.
 
-Scanning and monitoring stay local. PromptLatch sends no telemetry. Server mode
-downloads public LiteLLM pricing metadata for cost estimates; disable this with
-`observability.pricing_enabled: false`.
+[![A prompt with credentials on your machine, and the same prompt with the credentials redacted at the provider](https://raw.githubusercontent.com/bvolpato/promptlatch/main/site/hero.png)](https://bvolpato.github.io/promptlatch/)
 
-![PromptLatch site preview](https://raw.githubusercontent.com/bvolpato/promptlatch/main/site/hero.png)
+- **Use it as a proxy** for Claude Code, Codex, Gemini CLI, OpenCode, or any client with a custom base URL.
+- **Use it as a Python library** to redact text, messages, or payloads before an SDK call.
+- **It stays local.** Rules are deterministic, with no model calls and no telemetry.
 
-Website: `https://bvolpato.github.io/promptlatch/`
+[Try the live demo](https://bvolpato.github.io/promptlatch/) or start below.
 
-Agent integration prompt: [`PROMPT.md`](https://github.com/bvolpato/promptlatch/blob/main/PROMPT.md)
+## Quick start
 
-## Choose a mode
+### Coding agents
 
-| Need | Use |
-| --- | --- |
-| Protect coding agents and IDEs | Run `promptlatch serve` and point OpenAI-compatible clients at `http://127.0.0.1:8000/v1`. |
-| Inspect proxy traffic and usage | Run `promptlatch serve --dashboard`, then open `http://127.0.0.1:8000/`. Monitoring works without the web app. |
-| Protect SDK calls in Python | Import `redact_text`, `redact_messages`, `redact_params`, or `redact_payload` and pass each returned value to the SDK. |
-
-## Coverage
-
-Default rules cover provider keys, personal access tokens, passwords, JWTs,
-signed URLs, URL credentials, PEM/PGP private keys, and common secret fields such
-as `api_key`, `token`, `authorization`, `password`, `signed_url`, and
-`credentials`.
-
-Detection uses deterministic provider rules plus your exact-tail or regex rules.
-Entropy-only matching is disabled to avoid unpredictable false positives.
-
-## Security boundary
-
-- Request bodies and query parameters are scanned before they leave your machine.
-- Audit logs record redaction counts and rule names without storing secret values.
-- Local request history stores redacted bodies and metrics. Redacted prompts can
-  still contain private information; use metadata-only storage when needed.
-- When request history is enabled, it can also retain a small allowlist of upstream
-  error fields after full redaction. Full upstream response bodies and raw headers
-  are not stored.
-- PromptLatch strips cookies and secret-named client headers. Provider credentials are
-  added from config or dedicated `X-Target-*` headers after that filtering step.
-- Unknown private token formats need a custom exact-tail or regex rule.
-
-See [SECURITY.md](SECURITY.md) for deployment defaults and remaining limits.
-
-## Install
-
-Python package: [promptlatch on PyPI](https://pypi.org/project/promptlatch/).
-
-Homebrew:
-
-```bash
-brew tap bvolpato/tap
-brew install promptlatch
-promptlatch version
-```
-
-uv:
+Install PromptLatch and start the proxy:
 
 ```bash
 uv tool install promptlatch
-promptlatch doctor
+curl -fsSL -o agents.yaml \
+  https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/promptlatch-agents.config.yaml
+promptlatch serve --config agents.yaml
 ```
 
-Python library:
+In another terminal, use the wrapper for your agent:
 
-```bash
-uv add promptlatch
-# or
-python -m pip install promptlatch
-```
+| Instead of | Run |
+| --- | --- |
+| `claude` | `claude-latch` |
+| `codex` | `codex-latch` |
+| `gemini` | `gemini-latch` |
 
-Source:
+The wrappers keep your login and do not edit your agent's config files. If the proxy is down or redaction is off, they stop instead of sending unredacted prompts. For OpenCode, OpenRouter, and manual setup, see the [agent guide](https://github.com/bvolpato/promptlatch/blob/main/docs/agents.md).
 
-```bash
-git clone https://github.com/bvolpato/promptlatch.git
-cd promptlatch
-uv sync --extra dev --locked
-uv run promptlatch doctor
-```
+### Any API client
 
-Install this checkout and the `codex-latch` / `claude-latch` / `gemini-latch` commands:
-
-```bash
-./install.sh
-```
-
-Requires `uv`. Installs into uv's tool bin directory without editing Codex, Claude
-Code, Gemini CLI, shell startup files, or proxy configuration. See [coding-agent shims](#coding-agent-shims)
-for server setup.
-
-ASGI servers can load `promptlatch.asgi:app` directly. Importing CLI or proxy
-helpers does not load user config until a command or app requests it.
-
-### Upgrading from PromptCloak
-
-Version 0.2 renamed package, command, environment variables, config directory,
-container image, and Helm chart. Old Python imports, environment variables, and default
-config path remain compatible through 0.2.x and emit migration warnings.
-
-Remove old uv tool so stale `promptcloak` command cannot shadow new install:
-
-```bash
-uv tool uninstall promptcloak
-```
-
-Move local config before switching services:
-
-```bash
-mv ~/.config/promptcloak ~/.config/promptlatch
-```
-
-Existing Helm releases can upgrade in place without changing immutable selectors or
-rotating chart-managed proxy key:
-
-```bash
-helm upgrade <existing-release-name> ./charts/promptlatch \
-  --set migration.preserveLegacyNames=true
-```
-
-Keep migration flag on later upgrades for that release. Fresh installs should omit it
-and use release name `promptlatch`. Existing external Secrets may keep
-`PROMPTCLOAK_SERVER_API_KEY` for this upgrade, then rename key to
-`PROMPTLATCH_SERVER_API_KEY`.
-
-## Run proxy
-
-Configure an upstream, keep its key in your shell, and start PromptLatch:
+Set an upstream provider, keep its key in your shell, and start the proxy:
 
 ```bash
 promptlatch init --target-base-url https://api.openai.com/v1
@@ -147,1045 +50,148 @@ export OPENAI_API_KEY="<openai-upstream-key>"
 promptlatch serve
 ```
 
-Health checks at `GET /healthz` and `GET /v1/health` return local status with
-`"service": "promptlatch"`. They do not contact an upstream provider or enter
-request history.
-
-Point clients at `http://127.0.0.1:8000/v1`. For example:
+Then point your client at `http://127.0.0.1:8000/v1`:
 
 ```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:8000/v1/responses \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-6-sol",
-    "messages": [{
-      "role": "user",
-      "content": "Here is my .env: OPENAI_API_KEY=<api-key-like-value>"
-    }]
-  }'
+  -d '{"model":"gpt-6-sol","input":"Read my .env: GITHUB_TOKEN=example-value-123456"}'
 ```
 
-Provider receives `OPENAI_API_KEY=[REDACTED_SECRET]` in request content.
+The provider receives `GITHUB_TOKEN=[REDACTED_SECRET]`. OpenAI, Anthropic, Gemini, OpenRouter, and local Ollama or vLLM endpoints work. See [providers and routes](https://github.com/bvolpato/promptlatch/blob/main/docs/providers.md).
 
-## Verify redaction
+### Python
 
-A model reply cannot verify the forwarded request. Send a fixture token to an echo
-endpoint and inspect the echoed body:
+No proxy needed:
 
 ```bash
-FAKE_GEMINI_KEY="AI""zaSyFixtureToken000000000000000000000"
+uv add promptlatch
+```
+
+```python
+from openai import OpenAI
+from promptlatch import redact_params
+
+client = OpenAI()
+response = client.responses.create(
+    **redact_params(
+        model="gpt-6-sol",
+        input="Read this: GITHUB_TOKEN=example-value-123456",
+    )
+)
+```
+
+`redact_text`, `redact_messages`, `redact_params`, and `redact_payload` each return a redacted copy. Pass the returned value to the SDK. See the [library guide](https://github.com/bvolpato/promptlatch/blob/main/docs/library.md) for Anthropic, LiteLLM, LangChain, and custom rules.
+
+## Check that it works
+
+Test a string without starting anything:
+
+```bash
+promptlatch scan 'DATABASE_URL=postgres://app:example-password@db/prod'
+# DATABASE_URL=postgres://app:[REDACTED_SECRET]@db/prod
+```
+
+A model's reply cannot prove what the proxy sent. To check a running proxy, send a fake key to an echo server and read what arrived:
+
+```bash
+FAKE_KEY="AI""zaSyFixtureToken000000000000000000000"
 
 curl --compressed -fsS http://127.0.0.1:8000/post \
   -H "X-Target-Base-URL: https://postman-echo.com" \
   -H "Content-Type: application/json" \
-  --data "$(jq -nc --arg key "$FAKE_GEMINI_KEY" \
-    '{messages:[{role:"user",content:("GEMINI_API_KEY=" + $key)}]}')" \
+  -d '{"messages":[{"content":"GEMINI_API_KEY='"$FAKE_KEY"'"}]}' \
   | jq -r '.data.messages[0].content'
+# GEMINI_API_KEY=[REDACTED_SECRET]
 ```
 
-Expected output:
+This needs a config without a target allowlist, such as the one from `promptlatch init`. The agent config above allows the official provider endpoints only.
 
-```text
-GEMINI_API_KEY=[REDACTED_SECRET]
-```
+## What it redacts
 
-Audit logs omit matched values and include counts and rule names. Test rules
-directly from the terminal or in pre-commit scripts without starting the proxy:
-
-```bash
-promptlatch scan --file .env.example --mode tagged
-git diff --cached | promptlatch scan --check --quiet
-promptlatch doctor --strict
-```
-
-`scan` accepts an inline string, `--file`, or piped stdin (`-`), supports
-`--mode full|partial|tagged`, and exits with code `1` under `--check` when a
-secret is matched. `doctor` inspects configuration, read-only SQLite storage,
-and any loopback proxy `/healthz` endpoint (including running-version drift);
-`--strict` exits `1` if redaction, storage, or the local proxy is unhealthy.
-
-Homebrew users can run PromptLatch as a background service after configuring its
-environment:
-
-```bash
-brew services start bvolpato/tap/promptlatch
-```
-
-## Use as a Python library
-
-Use PromptLatch without starting the proxy. Redact each prompt or request value in
-the same process, immediately before passing it to your SDK or HTTP client. Install
-the SDK you use separately; PromptLatch has no OpenAI, LiteLLM, LangChain, Anthropic,
-or LlamaIndex SDK dependency.
-
-Choose a helper for the shape of the value you send:
-
-| Input | Helper | Result |
-| --- | --- | --- |
-| One prompt or text field | `redact_text(text)` | Redacted string |
-| Chat messages, including nested tool data | `redact_messages(messages)` | Redacted message list |
-| SDK keyword arguments | `redact_params(**params)` | Redacted dictionary ready to unpack into an SDK call |
-| Raw mapping/list request body | `redact_payload(payload)` | Redacted structure with its shape preserved |
-
-All four helpers are exported from `promptlatch`. They return the safe value. They do
-not send the request or change an SDK client for you. **Pass the returned value to the
-SDK call; never pass the original value after redaction.** If redaction raises an
-error, do not retry by sending the original input.
-
-### Redact a standalone prompt
-
-Use `redact_text` when the prompt is assembled as a string, before passing it as
-`input`, `prompt`, or another SDK field:
-
-```python
-from openai import OpenAI
-from promptlatch import redact_text
-
-client = OpenAI()
-prompt = "Inspect this config: OPENAI_API_KEY=example-secret-value-123456"
-
-response = client.responses.create(
-    model="gpt-6-sol",
-    input=redact_text(prompt),
-)
-```
-
-### Redact a message array
-
-Use `redact_messages` for chat-style `messages` arrays. It supports mapping-based
-messages, `(role, content)` tuples, Pydantic/OpenAI message models, and LangChain
-message objects:
-
-```python
-from openai import OpenAI
-from promptlatch import redact_messages
-
-client = OpenAI()
-messages = [
-    {"role": "system", "content": "Summarize the user's log."},
-    {"role": "user", "content": "Authorization: Bearer FixtureToken000000000000000000000"},
-]
-
-safe_messages = redact_messages(messages)
-response = client.chat.completions.create(
-    model="gpt-6-sol",
-    messages=safe_messages,
-)
-```
-
-For non-Pydantic message objects, PromptLatch copies the object and redacts its
-`content` field. For Pydantic messages, it recursively redacts fields, including
-tool calls, and preserves the model type. Inputs are left unchanged.
-
-### Redact SDK parameters or structured payloads
-
-Use `redact_params` when assembling SDK keyword arguments. It returns a dictionary
-you can unpack directly into the SDK call. A `messages` argument is treated as a
-message array; other values, including `input`, `tools`, and nested parameter
-objects, are scanned recursively.
-
-```python
-from openai import OpenAI
-from promptlatch import redact_params
-
-client = OpenAI()
-safe_params = redact_params(
-    model="gpt-6-sol",
-    input="Summarize this: GITHUB_TOKEN=example-token-value-123456",
-)
-response = client.responses.create(**safe_params)
-```
-
-For raw JSON-compatible bodies, use `redact_payload` and pass its result to the
-transport. It recursively scans strings in mappings and lists without reshaping the
-request schema:
-
-```python
-import os
-import httpx
-from promptlatch import redact_payload
-
-payload = {
-    "model": "gpt-6-sol",
-    "input": [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": "OPENAI_API_KEY=example-secret-value-123456",
-                }
-            ],
-        }
-    ],
-    "metadata": {"job": "support-triage"},
-}
-response = httpx.post(
-    "https://api.openai.com/v1/responses",
-    headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-    json=redact_payload(payload),
-)
-```
-
-### Use with other SDKs
-
-Call the same helpers at each SDK boundary. Keep provider authentication in the
-SDK's normal environment/configuration; PromptLatch redacts prompt and payload
-content, not credentials held in the SDK's transport configuration.
-
-LiteLLM:
-
-```python
-from litellm import completion
-from promptlatch import redact_params
-
-response = completion(
-    **redact_params(
-        model="openai/gpt-6-sol",
-        messages=[{"role": "user", "content": "GEMINI_API_KEY=example-key-value-123456"}],
-    )
-)
-```
-
-Anthropic:
-
-```python
-from anthropic import Anthropic
-from promptlatch import redact_messages
-
-client = Anthropic()
-response = client.messages.create(
-    model="claude-opus-4-8",
-    max_tokens=1024,
-    messages=redact_messages([{"role": "user", "content": "token=example-token-value-123456"}]),
-)
-```
-
-LangChain:
-
-```python
-from langchain_openai import ChatOpenAI
-from promptlatch import redact_messages
-
-llm = ChatOpenAI(model="gpt-6-sol")
-response = llm.invoke(
-    redact_messages(
-        [
-            ("human", "Here is my token: example-token-value-123456"),
-        ]
-    )
-)
-```
-
-### Inspect redaction results
-
-`scan_text`, `scan_messages`, `scan_params`, and `scan_payload` return a
-`RedactionResult` with `.value` and `.stats`. Use `.value` for the SDK call, and use
-`.stats.redactions` or `.stats.rule_hits` for counts by rule. Stats do not contain
-matched secret values.
-
-```python
-from promptlatch import scan_text
-
-result = scan_text("OPENAI_API_KEY=example-secret-value-123456")
-print(result.stats.redactions)
-safe_text = result.value
-```
-
-### Configure custom rules
-
-The default helpers use the default `RedactionConfig`. For per-application rules,
-create a `PromptLatch` instance. Exact rules of 16 characters or fewer match a
-secret tail inside a longer value. Prefer storing only that tail in config.
-
-```python
-from promptlatch import PromptLatch
-from promptlatch.config import RedactionConfig, RuleConfig
-
-latch = PromptLatch(
-    RedactionConfig(
-        rules=[
-            RuleConfig(type="exact", value="abcd1234", name="internal-token"),
-        ]
-    )
-)
-safe_prompt = latch.text("internal token: private-abcd1234")
-```
-
-Redaction copies mappings, lists, tuples, and Pydantic models rather than mutating
-caller-owned values. A detected secret in a Pydantic model's extra field name or
-mapping-key collision raises `ValueError`; fail closed and do not send the original
-input. Unknown private token formats need a custom exact-tail or regex rule.
-
-## Configuration
-
-Default config: `~/.config/promptlatch/config.yaml`
-
-```yaml
-server:
-  host: 127.0.0.1
-  port: 8000
-  api_key: null
-  max_request_body_bytes: 0
-  max_decompressed_request_body_bytes: 67108864
-
-target:
-  default_base_url: https://api.openai.com/v1
-  api_key: ${OPENAI_API_KEY}
-  api_key_header: authorization
-  forward_client_authorization: false
-  timeout_seconds: 180
-  allowed_base_urls: []
-  block_private_targets: true
-  request_compression:
-    enabled: true
-    min_bytes: 16384
-    endpoints: {}
-
-redaction:
-  enabled: true
-  engine: detect-secrets
-  redact_mode: full
-  encrypted: false
-  max_extra_rules: 20
-  max_extra_rule_chars: 1024
-  allow_extra_regex_rules: false
-  rules:
-    - type: exact
-      value: abcd1234
-      name: tail-only-example
-    - type: regex
-      value: sk-[A-Za-z0-9_-]{20,}
-      name: openai-style-token
-
-observability:
-  enabled: true
-  max_database_bytes: 1073741824
-  max_body_bytes: 262144
-  store_request_bodies: true
-  pricing_enabled: true
-  dashboard_enabled: false
-```
-
-Store only key tails in exact rules. Full masking (`[REDACTED_SECRET]`) is default;
-`redact_mode: tagged` emits consistent HMAC-keyed placeholders
-(`[REDACTED:<rule>#<8-hex-hmac>]`) so multi-turn prompts and agent traces can
-distinguish identical vs distinct credentials without exposing secret characters
-(keyed per process by default, or deterministically via `redaction.tag_key` /
-`PROMPTLATCH_REDACTION_TAG_KEY` with at least 16 characters); partial masking is
-available through `redact_mode: partial`.
-
-Request size is unlimited by default (`0`), including inline base64 images and
-conversation history. Set `server.max_request_body_bytes` or
-`PROMPTLATCH_MAX_REQUEST_BODY_BYTES` to a positive byte count to impose a limit.
-Decompressed `gzip` and `zstd` client request bodies are capped at 64 MiB by
-default (`server.max_decompressed_request_body_bytes` or
-`PROMPTLATCH_MAX_DECOMPRESSED_REQUEST_BODY_BYTES`; set to `0` to disable).
-Existing configs retain their explicit limit; set it to `0` to remove it. Requests
-are buffered for redaction, so available memory and upstream provider limits still
-apply. History capture remains capped at 256 KiB per request and SQLite storage at
-1 GiB.
-
-### Upload compression
-
-Large JSON POST requests use fast zstd compression for these exact upstream endpoints:
-
-- `https://api.openai.com/v1/responses`
-- `https://chatgpt.com/backend-api/codex/responses`
-
-Compression runs after redaction and any Responses-to-Chat conversion. Unknown
-endpoints receive uncompressed requests. Small requests and compression results
-that would increase the upload size also remain uncompressed. Request compression
-does not change response compression negotiation or native SSE streaming.
-
-Configure gzip or zstd for another endpoint only after verifying provider support.
-Use `identity` to disable compression for one endpoint:
-
-```yaml
-target:
-  request_compression:
-    enabled: true
-    min_bytes: 16384
-    endpoints:
-      https://provider.example/v1/responses: gzip
-      https://api.openai.com/v1/responses: identity
-```
-
-Endpoint overrides match the exact scheme, host, port, and path. Set
-`PROMPTLATCH_REQUEST_COMPRESSION_ENABLED=false` to disable upload compression, or
-`PROMPTLATCH_REQUEST_COMPRESSION_MIN_BYTES` to change the size threshold.
-
-Request history records the redacted body size before compression, encoded body
-size, codec, and compression time. Byte counts describe the prepared HTTP body.
-Compression failures fall back to uncompressed bytes
-before sending; failed upstream POSTs are never replayed automatically. Incoming
-`gzip` and `zstd` client request bodies are decompressed in bounded chunks before
-redaction and re-compressed for configured upstream endpoints when eligible.
-
-Provider token and decompressed-body limits still apply. For the public OpenAI
-Responses endpoint, PromptLatch skips zstd when it would exceed the documented
-100:1 expansion ratio. See [OpenAI's request compression limits](https://developers.openai.com/api/docs/guides/production-best-practices#compress-request-bodies).
-
-## Local monitoring
-
-Server mode records request metrics automatically. Python library calls do not
-create monitoring databases. Inspect usage, cost estimates, redaction counts, and
-live traffic from the terminal without opening a browser:
-
-```bash
-promptlatch stats --days 7
-promptlatch tail --limit 20 --traffic inference
-promptlatch tail --follow --errors
-```
-
-`stats` and `tail` open the history databases read-only, never create state
-files, and support `--json` (`tail --json` emits metadata-only JSON Lines
-without request bodies, upstream error text, or prompt previews).
-
-Enable the optional dashboard on the same server:
-
-```bash
-promptlatch serve --dashboard --config ~/.config/promptlatch/config.yaml
-```
-
-Open `http://127.0.0.1:8000/`. The command prints the path of a private dashboard
-token file. Enter that file's token in the app. This token is separate from the
-proxy API key, is not printed in logs, and is never added to a URL. Set
-`observability.dashboard_enabled: true` to enable it through config. The dashboard
-shares the proxy's bind address and port. Keep the default loopback binding for
-local use; remote access requires a protected transport such as an HTTPS reverse
-proxy or SSH tunnel.
-
-Signing in creates a browser session that expires 30 days after authentication.
-The session uses an HttpOnly cookie and survives page reloads, browser restarts,
-and server restarts. Activity does not extend its expiry. The app does not retain
-the file token in browser storage. Lock removes the browser session cookie.
-Changing the file token and restarting the server invalidates all sessions;
-otherwise, a copied session cookie remains valid until its expiry.
-Cookies belong to one hostname and browser profile. Keep using the same address;
-`localhost` and `127.0.0.1` have separate cookies. Signing in clears a stale
-root-path dashboard cookie that could otherwise collide with the current cookie.
-
-When enabled, `/` serves the app and `/_promptlatch/` is reserved for its assets
-and authenticated monitoring API. These requests are not proxied or included in
-request history. Provider routes continue on their existing paths.
-The monitoring namespace remains local when the dashboard is disabled, so stale
-browser tabs cannot forward their access token upstream. With the dashboard
-enabled, forwarded responses receive a browser sandbox policy that prevents
-upstream HTML or scripts from accessing its origin. API response bodies are unchanged.
-
-The dashboard opens a compact request inspector with a session tree in the sidebar.
-Sessions show status, model, combined request time, estimated API cost, and message
-previews. Combined request time sums retained request durations, including overlaps.
-Token totals show a `+` when some retained requests have unknown usage.
-Requests and captured conversation history appear newest first. Search and
-status/provider/model filters apply to loaded sessions.
-Each selected request has a `#request=<request-id>` deep link. Copy link copies
-that address; opening it restores the request after sign-in, including older
-session and iteration pages. Evicted requests show an unavailable notice.
-Session and turn rows include the beginning of the user request. Each iteration
-also previews the latest user text and previous assistant answer from its captured
-request history. Previews are redacted, capped at 200 characters each, and evicted
-with request details; they are not part of long-lived usage statistics. A positive
-body capture limit allows previews even when the body is truncated. Setting
-`max_body_bytes: 0` disables both. Incremental requests may omit the previous
-answer from their context.
-Expand a session to browse user turns and request iterations, then select an
-iteration to inspect its conversation history, raw payload, metrics, and
-redactions in the main pane. User-turn groups are inferred from submitted
-history; tool-result iterations stay under the preceding user turn. Incremental
-Responses requests expose retained parent links when available. Older records
-without turn metadata remain ungrouped iterations. Stats is global, independent
-of the selected request and sidebar filters. Active requests enter statistics
-when they finish. It shows token totals, latency, estimated cost, and redaction
-counts by rule. All time uses preserved lifetime
-totals; daily, model, and rule breakdowns cover retained aggregate history.
-The request tree defaults to inference calls. Select **All HTTP traffic** to
-inspect ancillary GETs and other proxy calls. Their records remain retained;
-deep links to those requests open the matching traffic view automatically.
-Conversation omits entries without readable content, including encrypted-only
-reasoning and tool metadata declarations. Payload preserves the captured data,
-with JSON formatting, syntax highlighting, line wrapping, and a copy control.
-The capture badge distinguishes complete, partial, and unavailable request bodies.
-
-Counts describe matches, not unique leaked credentials. Request details contain
-the redacted payload, capped at 256 KiB by default, without secret samples, raw
-headers, or response bodies.
-Bodies are omitted when redaction is disabled, partial masking is selected, or
-content is binary or encoded.
-
-Request details can retain allowlisted upstream error `event`, `type`, `code`,
-`message`, and `param` fields. These fields are always fully redacted, regardless
-of request redaction settings. `message` is capped at 2 KiB; `event` at 128 bytes;
-and `type`, `code`, and `param` at 256 bytes each, with all error fields under
-4 KiB total. Capture is disabled when `store_request_bodies: false` or
-`max_body_bytes: 0`. Error fields are stored with request details, evicted with
-them, and excluded from long-lived aggregates. Full upstream response bodies and
-raw headers are never retained.
-Transport failures, including TLS and socket errors, retain the exception type,
-safe reason, first failed transport phase and elapsed milliseconds, socket cause
-and errno when available, request body size, and observed response byte count.
-Diagnostics identify connection setup as `new`. For HTTP/1, they infer `reused`
-when request headers start without a connect phase. Known TLS reason constants
-are retained; arbitrary exception text is excluded. These fields help investigate
-connection failures; they do not establish the cause or eliminate resets.
-Selected provider request IDs and
-Cloudflare ray IDs are bounded, validated, and fully redacted before storage.
-Raw exception text, URLs, and trace payloads are never retained or included in
-proxy-generated 502 responses. Recognized LLM streams that end without a completion
-event show `stream_incomplete` when no more specific
-provider or transport error is available. Provider-declared incomplete generations
-retain known stop reasons, including output limits and content filtering, without
-being classified as connection failures. Older records cannot recover these details.
-
-Native Responses requests preserve recognized encrypted reasoning and compaction
-envelopes unchanged. Typed image parts in OpenAI Responses and canonical `inlineData`
-image blobs in Google Gemini `generateContent` requests also preserve canonical PNG,
-JPEG, GIF, and WebP payloads with matching binary signatures. Typed canonical Fernet
-encrypted content parts in `agent_message.content` and tool outputs are preserved
-unchanged on forwarding. Readable text parts, summaries, prompts, and other fields
-still pass through redaction. The stored troubleshooting copy can apply
-additional credential masking; it is never reused as the forwarded request.
-An `invalid_encrypted_content` error identifies rejected encrypted conversation
-state, rather than a connection timeout. Existing corrupted history cannot be
-repaired from a truncated or redacted capture.
-
-Streams close upstream connections on client disconnect, including cancellation
-during cleanup. Native response bytes and upstream errors remain unchanged;
-PromptLatch does not replay partially delivered generations or invent a
-successful completion event. `target.timeout_seconds` limits upstream read
-inactivity, not the total generation time.
-
-- **TTFT:** elapsed time from request start to first generated output, rather than
-  upstream response headers. Nonstreaming responses do not provide TTFT.
-- **TPS after first output:** `(output_tokens - 1) / (last_output - first_output)`.
-  Stream chunks can contain multiple tokens, so this is approximate. Missing
-  usage or fewer than two timed output events leaves TPS unknown.
-- **Usage:** provider-reported input, output, and total tokens. Missing usage stays
-  unknown; PromptLatch does not substitute character counts. Reasoning, cached
-  input, and cache-write tokens appear when supplied. Response parsing recognizes
-  JSON and SSE even when the content type is missing or incorrect. Requests show
-  why metrics are unavailable; old captures cannot recover unrecorded usage.
-- **Cost:** estimates from a bundled [LiteLLM pricing catalog](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)
-  snapshot and its public pricing map for supported exact model matches. The
-  LiteLLM SDK is not required. Catalog version and checksum identify offline rates.
-  Unknown models, usage, or unsupported pricing remain unknown. Estimates
-  are not invoices. The map refreshes in the background daily; no prompts, keys,
-  model selections, or usage are sent to the pricing source.
-  ChatGPT subscription calls use equivalent OpenAI API token rates, labelled
-  **API-price equivalent**. These estimates compare API usage costs; they are
-  not subscription charges. Non-LLM requests do not count as missing LLM usage
-  or pricing.
-  Retained subscription requests with complete usage can also receive estimates
-  in background batches. Request details and aggregate costs update together;
-  missing usage remains unknown. Historical comparisons use current standard
-  API text-token rates, excluding extra media and hosted-tool charges. They do
-  not reconstruct an earlier bill or service tier.
-
-For reliable grouping, send `X-PromptLatch-Thread-ID` with a stable conversation
-identifier. PromptLatch strips this header before forwarding. Thread identifiers
-are HMAC-hashed locally. Metadata thread/conversation/session IDs and Responses
-`previous_response_id` links also group related requests. Without those, matching
-first-user-message and preceding system content provides best-effort grouping,
-labelled as inferred. Requests without usable history remain ungrouped.
-
-Storage defaults to `$XDG_STATE_HOME/promptlatch/requests.sqlite3`, or
-`~/.local/state/promptlatch/requests.sqlite3` when `XDG_STATE_HOME` is unset.
-Set `observability.database_path` to choose another location. Both the request
-database and `<database_path>.stats.sqlite3` share the configured physical cap,
-1 GiB by default, including rollback journals. SQLite page limits reserve journal
-headroom, leaving roughly half the budget for database pages. Oldest request
-details are evicted first, then oldest daily/model aggregates if needed. Lifetime
-request, token, cost, latency, and redaction totals survive eviction. The dashboard
-shows combined storage and pruning counts. Startup checks existing files and
-installs page limits before writing. Legacy files without room for safe journal
-copies are refused without growth and require offline compaction; startup does
-not create a temporary `VACUUM` copy. A bounded background writer keeps
-SQLite work off the request event loop; dropped records are reported when
-storage cannot keep up. Graceful shutdown drains queued events. Abrupt process
-termination can lose events that have not reached SQLite.
-
-One server process can write to each history database. Use separate database paths
-for multiple proxy workers; starting a second writer against the same path fails.
-
-Redaction is not anonymization. Stored prompts can retain source code, personal
-information, and unrecognized credentials. Set
-`observability.store_request_bodies: false` for metadata-only monitoring, or
-`observability.enabled: false` to disable recording. These settings affect future
-requests; existing history remains on disk. Keep the state directory private.
-
-Additional settings: `queue_size` (default 1024), `pricing_refresh_hours` (24), and
-`pricing_file` for a local LiteLLM-format JSON price map. Environment overrides use
-`PROMPTLATCH_OBSERVABILITY_` followed by the uppercase setting name; the dashboard
-override is `PROMPTLATCH_DASHBOARD_ENABLED`.
-
-For containers, mount a persistent writable volume and set `XDG_STATE_HOME` or
-`PROMPTLATCH_OBSERVABILITY_DATABASE_PATH` inside it. Enable the dashboard on that
-server when needed; it uses the same history and listening port.
-
-## Supported routes
-
-PromptLatch forwards any path, with first-class tests for:
-
-- `/v1/chat/completions`
-- `/v1/responses`
-- `/v1/completions`
-- `/v1/models` and `/v1beta/models`
-- `/v1/messages` for Claude-compatible gateways
-- `/v1beta/models/{model}:generateContent` and `:streamGenerateContent` for Google Gemini
-
-Tests cover streaming responses, tool payloads, and vision payloads. PromptLatch
-redacts recursively without reshaping JSON request schemas.
-
-## Provider targets
-
-Set default backend in config, or choose one per request:
-
-```bash
-curl http://127.0.0.1:8000/v1/responses \
-  -H "X-Target-Base-URL: https://api.openai.com/v1" \
-  -H "X-Target-API-Key: $OPENAI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-6-sol","input":"scan this <api-key-like-value>"}'
-```
-
-Set `X-Target-API-Key-Header: x-api-key` for Anthropic-style upstream authentication,
-or `X-Target-API-Key-Header: x-goog-api-key` for Google Gemini API keys (do not pass
-API keys in `?key=` query parameters, as PromptLatch redacts query-string secrets).
-
-Configured target keys are bound to `target.default_base_url`. A dynamic target that
-requires authentication must receive its key through `X-Target-API-Key` or
-`X-Target-Authorization`; PromptLatch never reuses configured key for another host.
-
-An empty `target.allowed_base_urls` permits any public target. Add URLs to restrict
-dynamic routing. Set `block_private_targets: false` only for trusted local targets.
-
-Per-request rules are exact matches by default. Regex rules remain available in trusted config.
-Set `redaction.allow_extra_regex_rules: true` only for authenticated clients you trust.
-
-PromptLatch forwards routes without reshaping provider payloads.
-
-| Target | Base URL | Auth header | Notes |
-| --- | --- | --- | --- |
-| OpenAI | `https://api.openai.com/v1` | `authorization` | Native Chat Completions, Responses API, models, tools, streaming. |
-| OpenRouter | `https://openrouter.ai/api/v1` | `authorization` | Native Chat Completions and Responses. Use provider-prefixed model names. |
-| Anthropic / Claude-compatible | `https://api.anthropic.com` | `x-api-key` | Forward `/v1/messages`; PromptLatch does not translate OpenAI JSON into Anthropic JSON. |
-| Google Gemini | `https://generativelanguage.googleapis.com` | `x-goog-api-key` | Forward `/v1beta/models/{model}:generateContent` and `:streamGenerateContent` (`?alt=sse`). |
-| Local Ollama or vLLM | `http://127.0.0.1:11434/v1` or another local `/v1` endpoint | provider-specific | Set `block_private_targets: false` only for local-only configs. |
-
-OpenRouter per request:
-
-```yaml
-target:
-  allowed_base_urls:
-    - https://openrouter.ai/api/v1
-```
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "X-Target-Base-URL: https://openrouter.ai/api/v1" \
-  -H "X-Target-API-Key: $OPENROUTER_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"openai/gpt-oss-120b","messages":[{"role":"user","content":"scan this <api-key-like-value>"}]}'
-```
-
-Anthropic-compatible target:
-
-```bash
-curl http://127.0.0.1:8000/v1/messages \
-  -H "X-Target-Base-URL: https://api.anthropic.com" \
-  -H "X-Target-API-Key: $ANTHROPIC_API_KEY" \
-  -H "X-Target-API-Key-Header: x-api-key" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-opus-4-8","max_tokens":256,"messages":[{"role":"user","content":"scan this <api-key-like-value>"}]}'
-```
-
-Google Gemini target:
-
-```bash
-curl http://127.0.0.1:8000/v1beta/models/gemini-2.5-pro:generateContent \
-  -H "X-Target-Base-URL: https://generativelanguage.googleapis.com" \
-  -H "X-Target-API-Key: $GEMINI_API_KEY" \
-  -H "X-Target-API-Key-Header: x-goog-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"contents":[{"role":"user","parts":[{"text":"scan this <api-key-like-value>"}]}]}'
-```
-
-Local OpenAI-compatible target:
-
-```yaml
-target:
-  default_base_url: http://127.0.0.1:11434/v1
-  api_key: null
-  allowed_base_urls:
-    - http://127.0.0.1:11434/v1
-  block_private_targets: false
-```
-
-## Codex with OpenRouter
-
-OpenRouter accepts native Responses requests, so no compatibility bridge is needed.
-Keep OpenRouter key in environment and send it through PromptLatch's dedicated target
-header. Generic client `Authorization` is not forwarded.
-
-Start PromptLatch:
-
-```bash
-mkdir -p ~/.config/promptlatch
-cp examples/promptlatch-openrouter.config.yaml ~/.config/promptlatch/config.yaml
-export OPENROUTER_API_KEY="<openrouter-upstream-key>"
-promptlatch serve
-```
-
-The checked-in PromptLatch config restricts dynamic routing to OpenRouter and leaves
-`forward_client_authorization` and `responses_to_chat` disabled.
-
-Install Codex profile:
-
-```bash
-mkdir -p ~/.codex
-cp examples/codex-openrouter-promptlatch.config.toml \
-  ~/.codex/openrouter-promptlatch.config.toml
-```
-
-Profile contents:
-
-```toml
-model = "openai/gpt-oss-120b"
-model_provider = "promptlatch-openrouter"
-
-[model_providers.promptlatch-openrouter]
-name = "PromptLatch OpenRouter"
-base_url = "http://127.0.0.1:8000/v1"
-wire_api = "responses"
-env_http_headers = { "X-Target-API-Key" = "OPENROUTER_API_KEY" }
-http_headers = { "X-Target-Base-URL" = "https://openrouter.ai/api/v1" }
-request_max_retries = 0
-stream_max_retries = 0
-```
-
-Run interactive Codex:
-
-```bash
-codex -p openrouter-promptlatch
-```
-
-Non-interactive smoke test:
-
-```bash
-codex exec -p openrouter-promptlatch --strict-config \
-  --sandbox read-only --ephemeral --cd "$PWD" \
-  "Reply with exactly: promptlatch-openrouter-ok"
-```
-
-Use any OpenRouter Responses-capable model by changing profile `model`. Current Codex
-requests include Responses-only custom tool descriptors, so Codex needs a backend with
-native Responses support. `compat.responses_to_chat` remains available for simpler
-Responses clients limited to text, messages, and standard function tools.
-
-## OpenCode
-
-Current stable OpenCode config supports custom Chat Completions providers through
-`@ai-sdk/openai-compatible`. Copy checked-in example into project, or merge provider
-block into existing `opencode.json`:
-
-```bash
-cp examples/opencode-openrouter-promptlatch.json opencode.json
-export OPENROUTER_API_KEY="<openrouter-upstream-key>"
-```
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "promptlatch-openrouter": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "PromptLatch OpenRouter",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "headers": {
-          "X-Target-Base-URL": "https://openrouter.ai/api/v1",
-          "X-Target-API-Key": "{env:OPENROUTER_API_KEY}"
-        }
-      },
-      "models": {
-        "openai/gpt-oss-120b": {
-          "name": "gpt-oss via PromptLatch"
-        }
-      }
-    }
-  },
-  "model": "promptlatch-openrouter/openai/gpt-oss-120b"
-}
-```
-
-Run:
-
-```bash
-opencode run -m promptlatch-openrouter/openai/gpt-oss-120b \
-  --format json --dir "$PWD" \
-  "Reply with exactly: promptlatch-opencode-ok"
-```
-
-For another Chat Completions target, replace base URL, environment variable, and
-model ID. Use `PROMPTLATCH_TARGET_BASE_URL` and `PROMPTLATCH_TARGET_API_KEY` instead
-when PromptLatch owns one fixed upstream.
-
-## Coding-agent shims
-
-Run Codex, Claude Code, and Gemini CLI through one local PromptLatch server, using
-their own provider credentials and the official upstream endpoints:
-
-```bash
-./install.sh
-promptlatch serve --config examples/promptlatch-agents.config.yaml
-
-# In another terminal:
-codex-latch
-claude-latch
-gemini-latch
-```
-
-Install and sign in to the original CLIs first (`codex login`, `claude auth login`,
-`gemini`). Requires Codex 0.162.1+, Claude Code 2.1.220+, and Gemini CLI 0.34.0+.
-These versions support the configuration checks and provider settings used to keep
-requests on the proxy. The shims preserve client credentials and configuration files.
-The example binds to loopback, enables client-auth forwarding, restricts targets to
-the official endpoints below, and enables the inspector at `http://127.0.0.1:8000/`.
-Use your existing server instead if it has equivalent authentication and native
-Responses settings. Do not start a second server on an occupied port.
-
-| Command / authentication | Upstream |
+| Kind | Examples |
 | --- | --- |
-| `codex-latch`, saved ChatGPT login | `https://chatgpt.com/backend-api/codex` |
-| `codex-latch`, OpenAI API key | `https://api.openai.com/v1` |
-| `claude-latch`, Claude login or Anthropic API key | `https://api.anthropic.com` |
-| `gemini-latch`, Google OAuth login (`oauth-personal`) | `https://cloudcode-pa.googleapis.com` |
-| `gemini-latch`, Gemini API key (`GEMINI_API_KEY`) | `https://generativelanguage.googleapis.com` |
+| AI provider keys | OpenAI, Anthropic, Gemini, OpenRouter, xAI, Groq, Perplexity, Replicate |
+| Developer and cloud tokens | GitHub, GitLab, AWS, Google Cloud, Azure, Slack, Stripe, npm, PyPI, Vault |
+| Structured credentials | JWTs, signed URLs, database URLs, PEM and PGP private keys |
+| Labeled values | `password`, `api_key`, `token`, `authorization`, `client_secret` |
+| Your own formats | Exact-tail or regex rules in config |
 
-Codex detects the saved login mode using `codex login status`; its output is never
-printed by the shim. Set `PROMPTLATCH_CODEX_AUTH=chatgpt` or `api-key` to select
-explicitly. API-key mode uses `OPENAI_API_KEY` when set, otherwise Codex's saved
-API-key login. Claude keeps its normal authentication precedence, including
-`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and its saved login. Gemini inspects
-`settings.json` (`security.auth.selectedType`), `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
-and saved Google OAuth credentials; set `PROMPTLATCH_GEMINI_AUTH=oauth` or `api-key`
-to require a specific mode.
+Matching uses provider patterns and [bc-detect-secrets](https://github.com/bridgecrewio/detect-secrets). Entropy-only matching is off to avoid unpredictable false positives. See [redaction](https://github.com/bvolpato/promptlatch/blob/main/docs/redaction.md) for the full list.
 
-```bash
-codex-latch exec "Review this repository"
-PROMPTLATCH_CODEX_AUTH=api-key codex-latch
-PROMPTLATCH_PROXY_URL=http://127.0.0.1:8001 claude-latch
-gemini-latch -p "Summarize recent changes"
-codex-latch --latch-help
-claude-latch --latch-help
-gemini-latch --latch-help
-```
+## What it does not do
 
-The shims check proxy readiness and redaction before launching. They stop if the
-proxy is unavailable, redaction is disabled, or native client authentication cannot
-be forwarded. This mode requires no `server.api_key` or `target.api_key`; keep the
-listener local. Normal keyed-proxy configuration remains available for other clients.
-`PROMPTLATCH_PROXY_URL` accepts loopback addresses only. Use
-`PROMPTLATCH_CODEX_BIN`, `PROMPTLATCH_CLAUDE_BIN`, or `PROMPTLATCH_GEMINI_BIN` to
-select a CLI executable explicitly.
+- It does not know private token formats that no rule describes. Add a [custom rule](https://github.com/bvolpato/promptlatch/blob/main/docs/configuration.md#custom-rules).
+- It does not scan provider responses, MCP traffic, or tool subprocesses.
+- It does not scan multipart uploads. The proxy rejects them with `415`.
+- It does not anonymize. Names, source code, and other private text pass through.
 
-Codex's effective provider configuration is checked before launch. Conflicting
-provider settings, managed routing requirements, and Codex Cloud commands stop with
-an error. Profiles work unless they redefine the reserved `promptlatch-official`
-provider. Claude's host-managed provider setting prevents settings files from
-replacing the proxy route. Gemini rejects Vertex AI, Compute ADC, external auth, and
-local Gemma router settings that would bypass the proxy, and disables Gemini CLI
-telemetry for the invocation.
+Read [SECURITY.md](https://github.com/bvolpato/promptlatch/blob/main/SECURITY.md) before you share a proxy or bind it beyond loopback.
 
-Codex uses a local process and HTTP Responses streaming. Both shims disable request
-compression so request bodies remain scannable. Claude's nonessential traffic is
-disabled for the invocation. These wrappers cover model-provider requests, including
-conversation history and tool outputs sent back to the model. Login, MCP servers,
-tool subprocesses, plugins, and other network connections are separate. Files and
-images embedded as binary or encoded content retain the limits in [SECURITY.md](SECURITY.md).
+## See what was sent
 
-Configuration references: [Codex gateway authentication](https://learn.chatgpt.com/docs/enterprise/sign-in-with-chatgpt-through-a-gateway),
-[Claude Code gateways](https://code.claude.com/docs/en/llm-gateway), and
-[Claude Code networking](https://code.claude.com/docs/en/corporate-proxy).
-
-## Claude Code manual configuration
-
-Claude Code sends Anthropic Messages requests. Configure provider key on PromptLatch,
-then use separate local bearer token for proxy authentication:
+The proxy keeps a local history of redacted requests, token usage, latency, and cost estimates:
 
 ```bash
-export ANTHROPIC_UPSTREAM_API_KEY="<anthropic-upstream-key>"
-export PROMPTLATCH_TARGET_BASE_URL="https://api.anthropic.com"
-export PROMPTLATCH_TARGET_API_KEY="$ANTHROPIC_UPSTREAM_API_KEY"
-export PROMPTLATCH_TARGET_API_KEY_HEADER="x-api-key"
-export PROMPTLATCH_SERVER_API_KEY="<local-proxy-key>"
-
-promptlatch serve
-
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
-export ANTHROPIC_AUTH_TOKEN="$PROMPTLATCH_SERVER_API_KEY"
-export DISABLE_TELEMETRY=1
-export DO_NOT_TRACK=1
-claude
+promptlatch stats --days 7        # usage, cost, and redactions by rule
+promptlatch tail --follow         # live requests
+promptlatch serve --dashboard     # web inspector at http://127.0.0.1:8000/
 ```
 
-PromptLatch validates local bearer token, removes it, then adds upstream `x-api-key`.
-It forwards `/v1/messages` without translating between OpenAI and Anthropic schemas.
+![PromptLatch dashboard with a captured conversation in which credentials appear as REDACTED_SECRET](https://raw.githubusercontent.com/bvolpato/promptlatch/main/site/dashboard.png)
 
-## Redaction engine
+Stored prompts are redacted but can still hold private text. To keep metadata only, set `observability.store_request_bodies: false`. See [local monitoring](https://github.com/bvolpato/promptlatch/blob/main/docs/monitoring.md).
 
-PromptLatch uses `bc-detect-secrets`, provider token patterns, and user-defined
-exact-tail or regex matches. It does not load or call a model.
+## Commands
 
-Coverage includes fixture-shaped examples for:
+| Command | Purpose |
+| --- | --- |
+| `promptlatch serve` | Run the proxy. |
+| `promptlatch init` | Create a config file. |
+| `promptlatch scan` | Redact text, a file, or stdin. `--check` exits `1` when it finds a secret. |
+| `promptlatch doctor` | Check config, storage, and the running proxy. `--strict` exits `1` on a problem. |
+| `promptlatch stats` | Summarize usage, cost, and redactions. |
+| `promptlatch tail` | List or follow recent requests. |
+| `promptlatch encrypt-rules` | Encrypt custom rules at rest. |
 
-- AI provider keys: OpenAI/Codex, Anthropic, Gemini, OpenRouter, Z.AI,
-  MiniMax, DeepSeek, xAI/Grok, Fireworks, Groq, Perplexity, Cerebras, Replicate,
-  and Tavily.
-- Developer and cloud credentials: GitHub, GitLab, Atlassian, AWS,
-  Cloudflare, Slack, Stripe, Google Cloud, Azure, Supabase, Tailscale, Grafana,
-  Postman, PlanetScale, Neon, Vercel, npm, PyPI, and other common service tokens.
-- Structured credentials: JWTs, signed URLs, URL/DSN userinfo (HTTP, Postgres,
-  MySQL, MariaDB, MongoDB, Redis, AMQP, ClickHouse, and `+driver` schemes), PEM
-  keys, encrypted PEM keys, and PGP private keys.
-- Labeled values and JSON fields such as `password`, `token`, `api_key`,
-  `authorization`, `credentials`, `signed_url`, and `sas_token`.
-- User-defined exact-tail and regex rules for private formats.
+To block secrets in commits, add `git diff --cached | promptlatch scan --check --quiet` to a pre-commit hook.
 
-JSON, query parameters, and URL-encoded form fields are scanned structurally.
-Other unencoded text bodies are scanned without changing unrelated bytes.
-Multipart uploads are rejected with `415` while redaction is enabled: raw byte
-scanning cannot reliably protect attachment contents or form fields. Incoming
-`gzip` and `zstd` request bodies are decompressed with bounded expansion checks
-before scanning; unsupported or stacked `Content-Encoding` values are rejected
-with `415`.
+## Other ways to install
 
-Every scan runs locally without an LLM. Entropy-only matching is disabled; use
-custom rules for opaque internal formats.
+| Method | Command |
+| --- | --- |
+| Homebrew | `brew install bvolpato/tap/promptlatch` |
+| pip | `python -m pip install promptlatch` |
+| Docker | `docker pull ghcr.io/bvolpato/promptlatch:0.2.11` |
+| Helm | `helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.11/promptlatch-0.2.11.tgz` |
+| Source | `git clone https://github.com/bvolpato/promptlatch.git && cd promptlatch && ./install.sh` |
 
-Scan results are cached per string in a bounded, in-memory record. Repeated text,
-such as conversation history, is scanned once per process. The record is keyed by
-digest and holds redacted output only, never the original input. One redactor is
-safe to share between threads.
+If Homebrew refuses an untrusted tap, run `brew trust bvolpato/tap` first.
 
-## Encrypt rules at rest
+See [deployment](https://github.com/bvolpato/promptlatch/blob/main/docs/deployment.md) for Docker, Compose, Helm, background service, and PromptCloak upgrade steps.
 
-```bash
-uv run promptlatch encrypt-rules
-```
+To let a coding agent do the setup, give it [PROMPT.md](https://github.com/bvolpato/promptlatch/blob/main/PROMPT.md).
 
-This creates `~/.config/promptlatch/key` with mode `0600`, encrypts
-`redaction.rules` with AES-GCM, writes `redaction.encrypted_rules`, and clears
-plain rules.
+## Documentation
 
-You can also provide key material through:
-
-```bash
-export PROMPTLATCH_CONFIG_KEY="base64-url-safe-32-byte-key"
-```
-
-## Docker
-
-Published image:
-
-```bash
-# ~/.config/promptlatch/provider.env, mode 0600
-PROMPTLATCH_TARGET_BASE_URL=https://api.openai.com/v1
-PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
-```
-
-```bash
-docker run -d --name promptlatch --rm \
-  -p 127.0.0.1:8000:8000 \
-  --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.11
-
-curl --retry 10 --retry-connrefused --retry-delay 1 \
-  -fsS http://127.0.0.1:8000/healthz
-docker stop promptlatch
-```
-
-Build current checkout:
-
-```bash
-docker build -t promptlatch:local .
-```
-
-Compose:
-
-```bash
-export OPENAI_API_KEY="<openai-upstream-key>"
-docker compose up --build
-```
-
-## Helm
-
-Local chart:
-
-```bash
-kubectl create secret generic promptlatch-env \
-  --from-env-file="$HOME/.config/promptlatch/kubernetes.env"
-
-helm install promptlatch ./charts/promptlatch \
-  --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
-  --set existingSecret=promptlatch-env
-
-kubectl wait deployment/promptlatch --for=condition=Available --timeout=90s
-export PROMPTLATCH_SERVER_API_KEY="$(
-  kubectl get secret promptlatch-env \
-    -o jsonpath='{.data.PROMPTLATCH_SERVER_API_KEY}' | base64 --decode
-)"
-kubectl port-forward svc/promptlatch 8000:8000
-```
-
-In another shell:
-
-```bash
-curl -fsS http://127.0.0.1:8000/healthz
-helm uninstall promptlatch
-```
-
-Release asset:
-
-```bash
-helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.11/promptlatch-0.2.11.tgz
-helm install promptlatch ./promptlatch-0.2.11.tgz \
-  --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
-  --set existingSecret=promptlatch-env
-```
-
-`kubernetes.env` must contain `PROMPTLATCH_TARGET_API_KEY` and
-`PROMPTLATCH_SERVER_API_KEY`; keep file outside repository with mode `0600`.
-Without `existingSecret`, chart generates proxy key and stores `secretEnv` values in
-chart-managed Secret. Send `Authorization: Bearer $PROMPTLATCH_SERVER_API_KEY` on
-proxied requests. Health probes remain unauthenticated.
-
-Services route only to pods from their own release. Connected Helm upgrades preserve
-the existing Deployment selector. For offline upgrades of charts through 0.2.2, set
-`migration.preserveSelector=true` and retain it on later offline upgrades. Omit it on
-fresh installs. Old Deployments keep their broad immutable selectors; replacing them
-is required for controller isolation, even though Service routing is isolated.
-
-## Emergency request tracing
-
-`promptlatch serve --debug-requests` logs raw request bodies before redaction. Restrict it to local fixture data and cases where an echo target is insufficient. Auth, target-key, and redaction-rule headers are masked; body text is visible.
-
-Uvicorn access logs are disabled in both normal and debug mode to avoid logging query-string secrets.
+- [Coding agents](https://github.com/bvolpato/promptlatch/blob/main/docs/agents.md): wrappers, Claude Code, Codex, OpenCode
+- [Providers and routes](https://github.com/bvolpato/promptlatch/blob/main/docs/providers.md): per-request targets, auth headers, streaming
+- [Python library](https://github.com/bvolpato/promptlatch/blob/main/docs/library.md): helpers, SDK examples, custom rules
+- [Configuration](https://github.com/bvolpato/promptlatch/blob/main/docs/configuration.md): all settings, redaction modes, compression, rule encryption
+- [Redaction](https://github.com/bvolpato/promptlatch/blob/main/docs/redaction.md): coverage, body handling, verification
+- [Local monitoring](https://github.com/bvolpato/promptlatch/blob/main/docs/monitoring.md): dashboard, metrics, storage
+- [Deployment](https://github.com/bvolpato/promptlatch/blob/main/docs/deployment.md): Docker, Helm, health checks, upgrades
+- [Security policy](https://github.com/bvolpato/promptlatch/blob/main/SECURITY.md) and [contributing](https://github.com/bvolpato/promptlatch/blob/main/CONTRIBUTING.md)
 
 ## Development
 
 ```bash
-uv sync --extra dev
-uv run scripts/audit_secrets.py
+uv sync --extra dev --locked
 uv run pytest
 uv run ruff check .
-uv build
-uv run promptlatch scan 'OPENAI_API_KEY=<api-key-like-value>'
+uv run scripts/audit_secrets.py
 ```
 
-Fixtures are split in source so no real or contiguous fake keys are committed.
-Release and test commands live in [CONTRIBUTING.md](CONTRIBUTING.md). Report
-security problems through the private path in [SECURITY.md](SECURITY.md), without
-posting real secrets.
+Report security problems through the private path in [SECURITY.md](https://github.com/bvolpato/promptlatch/blob/main/SECURITY.md). Never post real secrets.
+
+MIT licensed.

@@ -27,5 +27,5 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 127
 fi
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 uv tool install --reinstall "$script_dir"

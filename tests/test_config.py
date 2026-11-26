@@ -214,6 +214,14 @@ def test_observability_default_path_uses_state_home(monkeypatch, tmp_path) -> No
     assert settings.observability.max_database_bytes == 1024**3
 
 
+def test_audit_file_expands_home(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = tmp_path / "config.yaml"
+    config.write_text("audit:\n  file: ~/logs/audit.log\n", encoding="utf-8")
+
+    assert load_settings(config).audit.file == tmp_path / "logs" / "audit.log"
+
+
 def test_observability_environment_overrides(monkeypatch, tmp_path) -> None:
     values = {
         "ENABLED": "false",

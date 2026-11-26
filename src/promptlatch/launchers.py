@@ -26,6 +26,8 @@ _CODEX_MINIMUM_VERSION = (0, 162, 1)
 _CLAUDE_MINIMUM_VERSION = (2, 1, 220)
 _GEMINI_MINIMUM_VERSION = (0, 34, 0)
 _CLI_VERSION_TIMEOUT = 3.0
+_VERSION_PROBE_ENV = "PROMPTLATCH_VERSION_PROBE"
+_VERSION_PROBE_RECURSION = "promptlatch: version probe reached the shim again"
 _CODEX_CONFIG_TIMEOUT = 5.0
 _CODEX_CONFIG_OUTPUT_LIMIT = 1024 * 1024
 _GEMINI_SETTINGS_LIMIT = 1024 * 1024
@@ -138,6 +140,10 @@ def _main(client: str, arguments: list[str]) -> NoReturn:
     if _requests_latch_help(arguments):
         _print_help(program, client)
         raise SystemExit(0)
+    if os.environ.get(_VERSION_PROBE_ENV) == client:
+        # The resolved CLI is this shim, or a wrapper around it. Stop before it recurses.
+        print(_VERSION_PROBE_RECURSION)
+        raise SystemExit(1)
 
     try:
         environment = os.environ.copy()
@@ -419,11 +425,16 @@ def _require_supported_cli_version(
             errors="replace",
             timeout=_CLI_VERSION_TIMEOUT,
             check=False,
-            env=environment,
+            env=environment | {_VERSION_PROBE_ENV: client},
         )
     except (OSError, subprocess.SubprocessError):
         result = None
 
+    if result is not None and _VERSION_PROBE_RECURSION in result.stdout:
+        raise LauncherError(
+            f"{executable} runs {client}-latch instead of the {client} CLI; "
+            f"set PROMPTLATCH_{client.upper()}_BIN to the original executable"
+        )
     matches = (
         re.findall(r"\b(\d+)\.(\d+)\.(\d+)\b", result.stdout)
         if result is not None and result.returncode == 0

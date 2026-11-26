@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -585,6 +587,31 @@ def test_claude_version_below_supported_minimum_fails_closed(
     )
     with pytest.raises(launchers.LauncherError, match="2.1.220 or newer"):
         launchers._require_supported_cli_version("claude", "/opt/bin/claude", {})
+
+
+def test_version_probe_stops_when_cli_resolves_to_the_shim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_launcher_environment(monkeypatch)
+    calls = tmp_path / "calls"
+    wrapper = tmp_path / "claude"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'echo call >> "{calls}"\n'
+        f'[ "$(wc -l < "{calls}")" -gt 3 ] && exit 99\n'
+        f'exec "{sys.executable}" -c '
+        "'import promptlatch.launchers as l; l._CLI_VERSION_TIMEOUT = 120; l.claude_main()' "
+        '"$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    monkeypatch.setattr(launchers, "_CLI_VERSION_TIMEOUT", 120)
+
+    with pytest.raises(launchers.LauncherError, match="runs claude-latch instead"):
+        launchers._require_supported_cli_version("claude", str(wrapper), dict(os.environ))
+
+    assert calls.read_text(encoding="utf-8").splitlines() == ["call"]
 
 
 def test_claude_launcher_preserves_native_auth_and_filters_routing_headers(

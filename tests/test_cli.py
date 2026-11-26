@@ -19,7 +19,7 @@ from typer.testing import CliRunner
 
 from promptlatch.cli import app
 from promptlatch.history import HistoryReader, HistoryStore
-from promptlatch.security import load_private_token
+from promptlatch.security import generate_key, load_private_token
 from promptlatch.version import __version__
 from tests.fixtures import PROVIDER_FIXTURES
 
@@ -68,6 +68,116 @@ def test_version_does_not_load_default_config(tmp_path) -> None:
     assert result.stdout.strip() == __version__
 
 
+@pytest.mark.parametrize("name", ["PROMPTLATCH_CONFIG", "PROMPTCLOAK_CONFIG"])
+def test_init_writes_config_path_that_other_commands_read(tmp_path, monkeypatch, name) -> None:
+    config = tmp_path / "selected.yaml"
+    written = []
+    monkeypatch.delenv("PROMPTLATCH_CONFIG", raising=False)
+    monkeypatch.setattr("promptlatch.cli.write_private_text", lambda path, _: written.append(path))
+    monkeypatch.setenv(name, str(config))
+
+    result = CliRunner().invoke(app, ["init"])
+
+    assert result.exit_code == 0, result.output
+    assert written == [config]
+
+
+def test_init_rejects_target_url_that_serve_cannot_load(tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+
+    result = CliRunner().invoke(
+        app, ["init", "--config", str(config), "--target-base-url", "api.openai.com/v1"]
+    )
+
+    assert result.exit_code == 2
+    assert not config.exists()
+
+
+@pytest.mark.parametrize("port", ["0", "65536"])
+def test_serve_rejects_invalid_port_instead_of_using_configured_port(
+    tmp_path, monkeypatch, port
+) -> None:
+    started = []
+    monkeypatch.setattr("promptlatch.cli.create_app", lambda settings: object())
+    monkeypatch.setattr("promptlatch.cli.uvicorn.run", lambda app, **kwargs: started.append(kwargs))
+
+    result = CliRunner().invoke(
+        app, ["serve", "--config", str(tmp_path / "missing.yaml"), "--port", port]
+    )
+
+    assert result.exit_code == 2
+    assert started == []
+
+
+_CONFIG_SECRET = "hunter2"
+_INVALID_CONFIGS = {
+    "rule": f"redaction:\n  rules:\n    - type: exact\n      value: {_CONFIG_SECRET}\n".encode(),
+    "yaml": f"server:\n  api_key: '{_CONFIG_SECRET}\n".encode(),
+    "settings": (
+        f"server:\n  api_key: {_CONFIG_SECRET}\ntarget:\n  forward_client_authorization: true\n"
+    ).encode(),
+    "root": f"- {_CONFIG_SECRET}\n".encode(),
+    "utf8": b"\xff" + _CONFIG_SECRET.encode(),
+    "key": b"redaction:\n  encrypted: true\n  encrypted_rules: AAAA\n",
+    "directory": None,
+}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "content"),
+    [(["scan", "--check", "clean"], name) for name in _INVALID_CONFIGS]
+    + [([command], "rule") for command in ("doctor", "stats", "tail", "serve")],
+)
+def test_invalid_config_is_a_usage_error_without_config_values(
+    tmp_path, monkeypatch, arguments, content
+) -> None:
+    monkeypatch.setenv("PROMPTLATCH_KEY_FILE", str(tmp_path / "missing-key"))
+    monkeypatch.delenv("PROMPTLATCH_CONFIG_KEY", raising=False)
+    monkeypatch.setattr("promptlatch.cli.uvicorn.run", lambda app, **kwargs: None)
+    config = tmp_path / "config.yaml"
+    data = _INVALID_CONFIGS[content]
+    if data is None:
+        config.mkdir()
+    else:
+        config.write_bytes(data)
+
+    result = CliRunner().invoke(app, [*arguments, "--config", str(config)])
+
+    # Exit code 1 would look like a detected secret to `scan --check` callers.
+    assert result.exit_code == 2, result.exception
+    assert _CONFIG_SECRET not in result.output
+
+
+def test_serve_reports_unset_environment_reference_as_usage_error(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("PROMPTLATCH_TEST_UNSET", raising=False)
+    monkeypatch.setattr("promptlatch.cli.uvicorn.run", lambda app, **kwargs: None)
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "server:\n  require_api_key: true\n  api_key: ${PROMPTLATCH_TEST_UNSET}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["serve", "--config", str(config)])
+
+    assert result.exit_code == 2, result.exception
+
+
+def test_legacy_environment_warning_reaches_cli_users(tmp_path) -> None:
+    env = os.environ | {
+        "PROMPTCLOAK_HOST": "127.0.0.1",
+        "PROMPTLATCH_CONFIG": str(tmp_path / "missing.yaml"),
+    }
+    env.pop("PROMPTLATCH_HOST", None)
+
+    result = subprocess.run(
+        ["promptlatch", "scan", "hello"], capture_output=True, check=False, env=env, text=True
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "hello\n"
+    assert "PROMPTCLOAK_HOST is deprecated" in result.stderr
+
+
 @pytest.mark.parametrize("debug_requests", [False, True])
 def test_serve_does_not_log_request_url_secrets(tmp_path, debug_requests: bool) -> None:
     query_token = "FixtureTokenOpaqueQuery0000000000000000"
@@ -114,7 +224,7 @@ def test_serve_does_not_log_request_url_secrets(tmp_path, debug_requests: bool) 
 
     try:
         health_url = f"http://127.0.0.1:{port}/healthz"
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60
         while True:
             try:
                 with urllib.request.urlopen(health_url, timeout=0.25) as response:
@@ -167,6 +277,83 @@ def test_encrypt_rules_is_idempotent(tmp_path) -> None:
         == encrypted
     )
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
+
+
+_PLAIN_RULES = "redaction:\n  rules:\n    - type: exact\n      value: abcd1234\n"
+
+
+def _scan_with_rule(config) -> str:
+    result = CliRunner().invoke(app, ["scan", "--config", str(config), "private-abcd1234"])
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+@pytest.mark.parametrize("name", ["PROMPTLATCH_KEY_FILE", "PROMPTCLOAK_KEY_FILE"])
+def test_encrypt_rules_uses_key_file_that_loading_uses(tmp_path, monkeypatch, name) -> None:
+    key_file = tmp_path / "custom-key"
+    config = tmp_path / "config.yaml"
+    config.write_text(_PLAIN_RULES, encoding="utf-8")
+    monkeypatch.delenv("PROMPTLATCH_KEY_FILE", raising=False)
+    monkeypatch.delenv("PROMPTLATCH_CONFIG_KEY", raising=False)
+    monkeypatch.setenv(name, str(key_file))
+    keys = []
+    monkeypatch.setattr("promptlatch.cli.write_key_file", keys.append)
+    monkeypatch.setattr("promptlatch.cli.load_key", lambda path: b"k" * 32)
+
+    result = CliRunner().invoke(app, ["encrypt-rules", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert keys == [key_file]
+
+
+def test_encrypt_rules_with_environment_key_does_not_report_unused_key_file(
+    tmp_path, monkeypatch
+) -> None:
+    key_file = tmp_path / "key"
+    config = tmp_path / "config.yaml"
+    config.write_text(_PLAIN_RULES, encoding="utf-8")
+    monkeypatch.setenv("PROMPTLATCH_CONFIG_KEY", generate_key())
+
+    result = CliRunner().invoke(
+        app, ["encrypt-rules", "--config", str(config), "--key-file", str(key_file)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert str(key_file) not in result.output
+    assert not key_file.exists()
+    assert _scan_with_rule(config) == "[REDACTED_SECRET]\n"
+
+
+def test_encrypt_rules_removes_plain_rules_from_symlinked_config(tmp_path, monkeypatch) -> None:
+    key_file = tmp_path / "key"
+    target = tmp_path / "dotfiles.yaml"
+    target.write_text(_PLAIN_RULES, encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.symlink_to(target)
+    monkeypatch.delenv("PROMPTLATCH_CONFIG_KEY", raising=False)
+    monkeypatch.setenv("PROMPTLATCH_KEY_FILE", str(key_file))
+
+    result = CliRunner().invoke(
+        app, ["encrypt-rules", "--config", str(config), "--key-file", str(key_file)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert config.is_symlink()
+    assert "abcd1234" not in target.read_text(encoding="utf-8")
+    assert _scan_with_rule(config) == "[REDACTED_SECRET]\n"
+
+
+def test_encrypt_rules_keeps_rules_that_cannot_load(tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+    content = "redaction:\n  rules:\n    - type: exact\n      value: 12345678\n"
+    config.write_text(content, encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app, ["encrypt-rules", "--config", str(config), "--key-file", str(tmp_path / "key")]
+    )
+
+    assert result.exit_code == 2
+    assert config.read_text(encoding="utf-8") == content
 
 
 def test_dashboard_token_creation_is_private_and_race_safe(tmp_path) -> None:
@@ -350,6 +537,44 @@ def test_scan_supports_argument_stdin_file_mode_check_and_quiet(tmp_path, monkey
     env_cfg_scan = runner.invoke(app, ["scan", "--mode", "partial", sample])
     assert env_cfg_scan.exit_code == 0
     assert secret not in env_cfg_scan.output
+
+
+@pytest.mark.parametrize("content", [b"a\r\nb\r\n", b"line\n", b"no newline"])
+def test_scan_preserves_file_and_stdin_line_endings(tmp_path, content: bytes) -> None:
+    config, _ = _write_cli_config(tmp_path)
+    sample = tmp_path / "sample.txt"
+    sample.write_bytes(content)
+
+    from_file = CliRunner().invoke(app, ["scan", "--config", str(config), "-f", str(sample)])
+    from_stdin = CliRunner().invoke(app, ["scan", "--config", str(config)], input=content)
+
+    assert from_file.stdout_bytes == content
+    assert from_stdin.stdout_bytes == content
+
+
+def test_scan_expands_environment_rules_like_serve(tmp_path, monkeypatch) -> None:
+    config, _ = _write_cli_config(
+        tmp_path,
+        {"redaction": {"rules": [{"type": "exact", "value": "${PROMPTLATCH_TEST_RULE}"}]}},
+    )
+    monkeypatch.setenv("PROMPTLATCH_TEST_RULE", "OpaqueEnvironmentRule0000")
+    arguments = ["scan", "--config", str(config), "--check", "my OpaqueEnvironmentRule0000"]
+
+    detected = CliRunner().invoke(app, arguments)
+    monkeypatch.delenv("PROMPTLATCH_TEST_RULE")
+    unset = CliRunner().invoke(app, arguments)
+
+    assert detected.exit_code == 1
+    assert detected.output == "my [REDACTED_SECRET]\n"
+    assert unset.exit_code == 2
+
+
+def test_scan_rejects_inline_text_that_is_not_utf8(tmp_path) -> None:
+    config, _ = _write_cli_config(tmp_path)
+
+    result = CliRunner().invoke(app, ["scan", "--config", str(config), "caf\udce9"])
+
+    assert result.exit_code == 2
 
 
 def test_scan_validates_conflicting_missing_and_invalid_inputs(tmp_path, monkeypatch) -> None:

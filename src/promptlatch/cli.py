@@ -3,10 +3,12 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -16,12 +18,16 @@ import httpx
 import typer
 import uvicorn
 import yaml
+from cryptography.exceptions import InvalidTag
+from pydantic import ValidationError
 
 from promptlatch.config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_KEY_PATH,
+    RedactionConfig,
     Settings,
     config_template,
+    expand_env_values,
     load_settings,
     resolve_config_path,
 )
@@ -73,11 +79,45 @@ def main(
     """Run PromptLatch."""
 
 
+@contextmanager
+def _config_errors() -> Iterator[None]:
+    """Report config failures as usage errors. Messages never include config values."""
+    try:
+        yield
+    except ValidationError as exc:
+        details = [
+            ": ".join(filter(None, (".".join(map(str, error["loc"])), error["msg"])))
+            for error in exc.errors(include_url=False, include_context=False, include_input=False)
+        ]
+        raise typer.BadParameter(
+            "Invalid PromptLatch config or PROMPTLATCH_* environment: " + "; ".join(details)
+        ) from None
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise typer.BadParameter(f"PromptLatch config is not valid YAML{location}.") from None
+    except InvalidTag:
+        raise typer.BadParameter(
+            "Cannot decrypt redaction rules: the key does not match encrypted_rules."
+        ) from None
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        path = exc.filename2 or exc.filename or "config files"
+        raise typer.BadParameter(f"Cannot access {path}: {reason}") from None
+    except ValueError as exc:
+        raise typer.BadParameter(f"Invalid PromptLatch config: {exc}") from None
+
+
+def _load_settings(config: Path | None) -> Settings:
+    with _config_errors():
+        return load_settings(config)
+
+
 @app.command()
 def serve(
     config: Annotated[Path | None, typer.Option("--config", "-c", help="Config file path.")] = None,
     host: Annotated[str | None, typer.Option(help="Override bind host.")] = None,
-    port: Annotated[int | None, typer.Option(help="Override bind port.")] = None,
+    port: Annotated[int | None, typer.Option(min=1, max=65535, help="Override bind port.")] = None,
     debug_requests: Annotated[
         bool,
         typer.Option(
@@ -95,7 +135,7 @@ def serve(
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("promptlatch").setLevel(logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    settings = load_settings(config)
+    settings = _load_settings(config)
     if host:
         settings.server.host = host
     if port:
@@ -104,7 +144,8 @@ def serve(
         settings.server.debug_requests = True
     if dashboard:
         settings.observability.dashboard_enabled = True
-    application = create_app(settings)
+    with _config_errors():
+        application = create_app(settings)
     if settings.observability.dashboard_enabled:
         token_file = settings.observability.database_path.with_name(
             settings.observability.database_path.name + ".dashboard-token"
@@ -132,7 +173,13 @@ def version() -> None:
 @app.command()
 def init(
     config: Annotated[
-        Path, typer.Option("--config", "-c", help="Config file to create.")
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            envvar=["PROMPTLATCH_CONFIG", "PROMPTCLOAK_CONFIG"],
+            help="Config file to create.",
+        ),
     ] = DEFAULT_CONFIG_PATH,
     target_base_url: Annotated[
         str,
@@ -147,7 +194,10 @@ def init(
     resolved = config.expanduser()
     if resolved.exists() and not force:
         raise typer.BadParameter(f"{resolved} already exists")
-    write_private_text(resolved, config_template(target_base_url, target_api_key_env))
+    content = config_template(target_base_url, target_api_key_env)
+    with _config_errors():
+        Settings.model_validate(yaml.safe_load(content))
+        write_private_text(resolved, content)
     typer.echo(f"created {resolved}")
 
 
@@ -156,13 +206,19 @@ def encrypt_rules(
     config: Annotated[
         Path | None, typer.Option("--config", "-c", help="Config file to update.")
     ] = None,
-    key_file: Annotated[Path, typer.Option(help="AES-GCM key file.")] = DEFAULT_KEY_PATH,
+    key_file: Annotated[
+        Path,
+        typer.Option(
+            envvar=["PROMPTLATCH_KEY_FILE", "PROMPTCLOAK_KEY_FILE"], help="AES-GCM key file."
+        ),
+    ] = DEFAULT_KEY_PATH,
 ) -> None:
     resolved_config = resolve_config_path(config)
     resolved_key_file = key_file.expanduser()
     if not resolved_config.exists():
         raise typer.BadParameter(f"{resolved_config} does not exist")
-    data = yaml.safe_load(resolved_config.read_text(encoding="utf-8")) or {}
+    with _config_errors():
+        data = yaml.safe_load(resolved_config.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise typer.BadParameter("PromptLatch config root must be a mapping")
     redaction = data.setdefault("redaction", {})
@@ -174,15 +230,25 @@ def encrypt_rules(
             raise typer.BadParameter("config contains both plain and encrypted redaction rules")
         typer.echo(f"redaction rules already encrypted in {resolved_config}")
         return
-    if not resolved_key_file.exists():
-        write_key_file(resolved_key_file)
-    encrypted = encrypt_text(yaml.safe_dump(rules, sort_keys=False), load_key(resolved_key_file))
-    redaction["encrypted"] = True
-    redaction["encrypted_rules"] = encrypted
-    redaction["rules"] = []
-    write_private_text(resolved_config, yaml.safe_dump(data, sort_keys=False))
+    # load_key prefers key material from the environment over the key file.
+    environment_key = os.environ.get(
+        "PROMPTLATCH_CONFIG_KEY", os.environ.get("PROMPTCLOAK_CONFIG_KEY")
+    )
+    with _config_errors():
+        # Encrypted rules cannot be edited, so reject rules that would not load.
+        RedactionConfig.model_validate({"rules": rules or []})
+        if not environment_key and not resolved_key_file.exists():
+            write_key_file(resolved_key_file)
+        encrypted = encrypt_text(
+            yaml.safe_dump(rules, sort_keys=False), load_key(resolved_key_file)
+        )
+        redaction["encrypted"] = True
+        redaction["encrypted_rules"] = encrypted
+        redaction["rules"] = []
+        # Resolve symlinks so plain rules do not stay in the linked file.
+        write_private_text(resolved_config.resolve(), yaml.safe_dump(data, sort_keys=False))
     typer.echo(f"encrypted redaction rules in {resolved_config}")
-    typer.echo(f"key file {resolved_key_file}")
+    typer.echo("key from environment" if environment_key else f"key file {resolved_key_file}")
 
 
 def _read_stdin_text() -> str:
@@ -205,7 +271,8 @@ def _read_scan_input(text: str | None, file: Path | None) -> str:
             return _read_stdin_text()
         expanded = file.expanduser()
         try:
-            return expanded.read_text(encoding="utf-8")
+            # read_text would turn CRLF line endings into LF.
+            return expanded.read_bytes().decode("utf-8")
         except UnicodeDecodeError:
             raise typer.BadParameter(f"{file} is not valid UTF-8 text.") from None
         except OSError as exc:
@@ -214,6 +281,10 @@ def _read_scan_input(text: str | None, file: Path | None) -> str:
     if text == "-":
         return _read_stdin_text()
     if text is not None:
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise typer.BadParameter("TEXT is not valid UTF-8 text.") from None
         return text
     if not sys.stdin.isatty():
         return _read_stdin_text()
@@ -250,18 +321,25 @@ def scan(
     if file is not None and text is not None:
         raise typer.BadParameter("Pass either TEXT or --file, not both.")
     raw_text = _read_scan_input(text, file)
-    redaction_config = load_settings(config).redaction
-    if mode is not None:
-        redaction_config = redaction_config.model_copy(update={"redact_mode": mode.value})
+    settings = _load_settings(config)
+    with _config_errors():
+        # Match serve, which expands ${VAR} references before redacting.
+        redaction_config = RedactionConfig.model_validate(
+            expand_env_values(settings.redaction.model_dump())
+        )
+        if mode is not None:
+            redaction_config = redaction_config.model_copy(update={"redact_mode": mode.value})
+        redactor = SecretRedactor(redaction_config)
     if check and not redaction_config.enabled:
         raise typer.BadParameter("Cannot run --check when redaction is disabled.")
-    result = SecretRedactor(redaction_config).redact_text(raw_text)
+    result = redactor.redact_text(raw_text)
     if json_output:
         typer.echo(
             json.dumps({"text": result.value, "stats": result.stats.__dict__}, sort_keys=True)
         )
     elif not quiet:
-        typer.echo(result.value)
+        # Only inline TEXT needs a newline. Files and stdin keep their own line endings.
+        typer.echo(result.value, nl=text is not None and text != "-")
     if check and result.stats.redactions > 0:
         raise typer.Exit(code=1)
 
@@ -459,7 +537,7 @@ def doctor(
     ] = False,
 ) -> None:
     resolved_config = resolve_config_path(config)
-    settings = load_settings(resolved_config)
+    settings = _load_settings(resolved_config)
     proxy_info = _probe_local_proxy(settings.server.host, settings.server.port)
     storage_info = _inspect_storage(settings.observability.database_path)
     checks = {
@@ -632,7 +710,7 @@ def stats(
     ] = 30,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
-    settings = load_settings(config)
+    settings = _load_settings(config)
     database_path = settings.observability.database_path.expanduser()
     try:
         summary = HistoryReader(database_path).summary(days=days)
@@ -767,7 +845,7 @@ def tail(
         typer.Option("--json", help="Emit one JSON object per line."),
     ] = False,
 ) -> None:
-    settings = load_settings(config)
+    settings = _load_settings(config)
     reader = HistoryReader(settings.observability.database_path)
     try:
         snapshot = reader.tail(

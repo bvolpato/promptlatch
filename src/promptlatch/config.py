@@ -175,6 +175,11 @@ class AuditConfig(BaseModel):
     enabled: bool = True
     file: Path | None = None
 
+    @field_validator("file")
+    @classmethod
+    def expand_path(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
+
 
 class CompatConfig(BaseModel):
     responses_to_chat: bool = False

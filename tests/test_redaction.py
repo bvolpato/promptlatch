@@ -1,5 +1,6 @@
 import base64
 import binascii
+import hashlib
 import json
 import re
 import struct
@@ -1443,3 +1444,610 @@ def test_tagged_mode_derivation_cap_degrades_safely_without_poisoning_cache(
     assert partial.redact_payload({"password": "my-long-secret-password"}).value == {
         "password": "[REDACTED_SECRET]"
     }
+
+
+_ALNUM = "Ab1Cd2Ef3Gh4"
+_TRUNCATED_TOKENS = {
+    "stripe": "sk" + "_live_" + _ALNUM * 8,
+    "discord": "M" + "a1B2" * 6 + "." + "Ab3dEf" + "." + "x1Y2" * 9 + "zz",
+    "slack": "xox" + "b-123456789012-" + _ALNUM * 2 + "-" + _ALNUM,
+    "twilio": "SK" + "a1b2c3d4" * 6,
+}
+
+
+@pytest.mark.parametrize("token", _TRUNCATED_TOKENS.values(), ids=_TRUNCATED_TOKENS.keys())
+def test_plugin_match_extends_to_the_whole_token(token: str) -> None:
+    text = f"here is my key {token} ok"
+    full = SecretRedactor(RedactionConfig()).redact_text(text)
+    tagged = SecretRedactor(RedactionConfig(redact_mode="tagged")).redact_text(text)
+    partial = SecretRedactor(RedactionConfig(redact_mode="partial")).redact_text(text)
+
+    assert full.value == "here is my key [REDACTED_SECRET] ok"
+    assert re.fullmatch(r"here is my key \[REDACTED:[a-z_]+#[0-9a-f]{8}\] ok", tagged.value), (
+        tagged.value
+    )
+    assert re.fullmatch(r"here is my key \S{4}\.\.\.\S{4}:[0-9a-f]{8} ok", partial.value)
+
+
+@pytest.mark.parametrize("field", ["NPM_TOKEN", "sl_api_key"])
+def test_labeled_plugin_match_extends_to_the_whole_value(field: str) -> None:
+    secret = "abcdef0123456789" * 5
+    result = SecretRedactor(RedactionConfig()).redact_text(f"prose line\n{field}={secret}")
+
+    assert result.value == f"prose line\n{field}=[REDACTED_SECRET]"
+
+
+@pytest.mark.parametrize("mode", ["full", "tagged"])
+def test_aws_session_token_is_not_redacted_in_part(mode: Literal["full", "tagged"]) -> None:
+    token = "Ab1" * 13 + "c/" + "Zy9x" * 40 + "/" + "Qw3e" * 20 + "=="
+    redactor = SecretRedactor(RedactionConfig(redact_mode=mode))
+    for text in (
+        json.dumps({"aws_session_token": token}),
+        json.dumps({"token": "other-value", "aws_key": "x", "aws_session_token": token}),
+    ):
+        assert "Zy9x" not in redactor.redact_text(text).value
+
+
+_UNSPACED_CONTEXTS = [
+    "key:\\n{}\\nnext",
+    "tab\\t{}\\r",
+    "double\\\\n{}\\\\n",
+    "\\u0022{}\\u0022",
+    "\x1b[1;31m{}\x1b[0m",
+    "\x1b[01;31m\x1b[K{}\x1b[m\x1b[K",
+    "next%3D{}%22",
+    "\u5bc6\u94a5\u662f{}\u8bf7\u68c0\u67e5",
+]
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize("context", _UNSPACED_CONTEXTS)
+def test_provider_tokens_after_escapes_and_unspaced_text_are_redacted(
+    engine: Literal["basic", "detect-secrets"], context: str
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine=engine))
+    for name, token in {**PROVIDER_FIXTURES, **EXPANDED_PROVIDER_FIXTURES}.items():
+        if name == "cloudflare_api_key":  # Only a label identifies this one.
+            continue
+        result = redactor.redact_text(context.format(token))
+        assert result.value == context.format("[REDACTED_SECRET]"), name
+
+
+def test_json_tool_output_redacts_token_after_escaped_newline() -> None:
+    content = json.dumps({"output": "key:\n" + OPENAI_FAKE + "\ttab\n" + "done"})
+    result = SecretRedactor(RedactionConfig()).redact_payload(
+        {"messages": [{"role": "tool", "content": content}]}
+    )
+
+    assert json.loads(result.value["messages"][0]["content"]) == {
+        "output": "key:\n[REDACTED_SECRET]\ttab\ndone"
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        r"C:\new\tokens\task-list and C:\temp\risk-assessment-framework-for-teams",
+        r"re.compile(r'\bsk-[a-z]+\n|\tghp_[A-Za-z0-9]{36}')",
+        "/blog/risk-assessment-framework-for-teams/desk-organization-tips",
+        "påsk-erbjudande-for-hela-familjen",
+    ],
+)
+def test_token_boundaries_do_not_match_inside_paths_and_words(text: str) -> None:
+    result = SecretRedactor(RedactionConfig()).redact_text(text)
+
+    assert result.value == text
+    assert result.stats.redactions == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("key " + "AI" + "za" + "B" * 34 + "- ok", "key [REDACTED_SECRET] ok"),
+        ("key 123456:A" + "b" * 33 + "- ok", "key [REDACTED_SECRET] ok"),
+        (
+            "https://api.telegram.org/bot" + "123456:A" + "b" * 34 + "/getMe",
+            "https://api.telegram.org/bot[REDACTED_SECRET]/getMe",
+        ),
+        ("use hv" + "b." + "Ab1-" * 100 + "x ok", "use [REDACTED_SECRET] ok"),
+        ("use sn" + "trys_eyJ" + "a" * 60 + "_" + "B" * 43 + " ok", "use [REDACTED_SECRET] ok"),
+        ("use sn" + "trys_eyJ" + "a" * 60 + "==_" + "B" * 43 + " ok", "use [REDACTED_SECRET] ok"),
+        ("ATATT" + "3xFfGF0" + "Ab1_" * 40 + "=1A2B3C4D ok", "[REDACTED_SECRET] ok"),
+        ("glp" + "at-" + "Ab1_" * 8 + ".0a1b2c3d4 ok", "[REDACTED_SECRET] ok"),
+    ],
+)
+def test_provider_rules_cover_the_whole_token(text: str, expected: str) -> None:
+    assert SecretRedactor(RedactionConfig(engine="basic")).redact_text(text).value == expected
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize("prefix", ["", "\u5bc6\u7801 "])
+def test_labels_in_nested_json_strings_are_redacted(
+    engine: Literal["basic", "detect-secrets"], prefix: str
+) -> None:
+    inner = json.dumps({"password": "Opaque-Fixture-1", "Authorization": "Bearer OpaqueFixture22"})
+    text = prefix + json.dumps({"cmd": f"curl -d '{inner}'"}, ensure_ascii=False)
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(text)
+
+    assert json.loads(json.loads(result.value.removeprefix(prefix))["cmd"][9:-1]) == {
+        "password": "[REDACTED_SECRET]",
+        "Authorization": "Bearer [REDACTED_SECRET]",
+    }
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("REDIS_URL=redis://:", "@cache:6379/0"),
+        ("rediss://:", "@cache:6379/0"),
+        ("amqp://:", "@mq:5672"),
+        ('{"log": "x\\nredis://:', '@cache:6379/0"}'),
+    ],
+)
+@pytest.mark.parametrize("password", ["FixturePassw0rd", "p@ssW0rd!", "pa:ss$W0rd"])
+def test_dsn_without_username_redacts_password(
+    engine: Literal["basic", "detect-secrets"], before: str, after: str, password: str
+) -> None:
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(before + password + after)
+
+    assert result.value == f"{before}[REDACTED_SECRET]{after}"
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+def test_dsn_password_with_raw_delimiters_is_fully_redacted(
+    engine: Literal["basic", "detect-secrets"],
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine=engine))
+    for password in ("p@ss@w0rd", "pa/ss!w0rd"):
+        result = redactor.redact_text(f"postgres://user:{password}@db.internal/app?x=a@b.c")
+        assert result.value == "postgres://user:[REDACTED_SECRET]@db.internal/app?x=a@b.c"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "http://localhost:5173/@vite/client",
+        "https://registry.internal:4873/@scope/pkg",
+        "postgres://localhost:5432/app@v2",
+        '{"url":"http://localhost:3000","email":"bob@example.com"}',
+    ],
+)
+def test_url_port_is_not_a_password(text: str) -> None:
+    result = SecretRedactor(RedactionConfig()).redact_text(text)
+
+    assert result.value == text
+
+
+@pytest.mark.parametrize("mode", ["full", "tagged"])
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ('{"url": "https://blob.example/o?sv=1&{}=', '"}'),
+        ('{"url": "https://blob.example/o?sv=1\\u0026{}=', '\\u0026se=2"}'),
+        ('<a href="https://blob.example/o?sv=1&amp;{}=', '">link</a>'),
+        ("[link](https://blob.example/o?{}=", ") and more"),
+        ("`https://blob.example/o?{}=", "`"),
+    ],
+)
+def test_signed_url_redaction_keeps_the_surrounding_syntax(
+    mode: Literal["full", "tagged"], before: str, after: str
+) -> None:
+    before = before.replace("{}", "si" + "g")
+    result = SecretRedactor(RedactionConfig(redact_mode=mode)).redact_text(
+        before + "Opaque%2FFixture%3D" + after
+    )
+
+    tag = r"\[REDACTED(?:_SECRET|:signed_url_query_param#[0-9a-f]{8})\]"
+    assert re.fullmatch(re.escape(before) + tag + re.escape(after), result.value), result.value
+
+
+@pytest.mark.parametrize("mode", ["full", "tagged"])
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            'password = "test"\nrun pytest on test_foo.py; the latest test',
+            'password = "{}"\nrun pytest on test_foo.py; the latest test',
+        ),
+        (
+            'tokens = "a, b, if"\nfor a in b: if a: pass',
+            'tokens = "{}"\nfor a in b: if a: pass',
+        ),
+        (
+            "DATABASE_URL=postgres://postgres:postgres@localhost/postgres\nrun postgres first",
+            "DATABASE_URL=postgres://postgres:{}@localhost/postgres\nrun postgres first",
+        ),
+        (
+            "see ftp://admin:password@db.internal/x then password=OpaqueFixture1",
+            "see ftp://admin:{}@db.internal/x then password={}",
+        ),
+        (
+            '{"grant_token": "password", "password": "OpaqueFixture1"}',
+            '{"grant_token": "{}", "password": "{}"}',
+        ),
+        (
+            'token_hint: "refresh_token"\nrefresh_token=OpaqueFixture1',
+            'token_hint: "{}"\nrefresh_token={}',
+        ),
+    ],
+)
+def test_common_word_value_is_redacted_only_where_it_is_a_value(
+    mode: Literal["full", "tagged"], text: str, expected: str
+) -> None:
+    result = SecretRedactor(RedactionConfig(redact_mode=mode)).redact_text(text)
+
+    tag = r"\[REDACTED(?:_SECRET|:[a-z_]+#[0-9a-f]{8})\]"
+    pattern = tag.join(re.escape(part) for part in expected.split("{}"))
+    assert re.fullmatch(pattern, result.value), result.value
+
+
+def test_distinctive_labeled_value_is_still_redacted_everywhere() -> None:
+    text = 'password = "Opaque Fixture 1"\nthe login is xOpaque Fixture 1x'
+    result = SecretRedactor(RedactionConfig()).redact_text(text)
+
+    assert "Opaque" not in result.value
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "token: int",
+        "    password: str",
+        "max_tokens=4096,temperature=0.7",
+        '{"total_tokens": 12345678}',
+        "services:\n  api:\n    environment:\n      API_KEY: ${OPENAI_API_KEY}",
+        "if not token:\n    raw_rules = load_rules()",
+        "if api_key:\n        set_target_api_key(headers, api_key)",
+        "if not token:\n        continue\nreturn token",
+        "credentials:\n  username:\n",
+        "access_key:\nhostname: db.internal.example",
+        "accessKey: process.env.S3_ACCESS_KEY,",
+        "access_key=self.access_key",
+        "access_key: Optional",
+        "access_key=get_s3_access_key_value(x)",
+        "for x in tokens:\n    process_everything(x)",
+        '{"a":"redis://h:6379"},{"b":"x@y"}',
+        '{"r":{"a":"redis://h:6379"},"b":"x@y"}',
+        "a: 1\npassword:\n  type: string\n  minLength: 8\n",
+    ],
+)
+def test_code_and_config_that_name_a_field_are_unchanged(
+    engine: Literal["basic", "detect-secrets"], text: str
+) -> None:
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(text)
+
+    assert result.value == text
+    assert result.stats.redactions == 0
+
+
+@pytest.mark.parametrize("mode", ["full", "tagged"])
+@pytest.mark.parametrize(
+    ("label", "entry"),
+    [
+        ("passwords", "admin: {}"),
+        ("password", "value: {}"),
+        ("token", "value: {}"),
+        ("secrets", "db-main: {}"),
+        ("api_key", "prod = {}"),
+        ("if you need the password", "{}"),
+        ("for staging use this password", "admin: {}"),
+        ("with this token", "value: {}"),
+        ("for staging use this password", "admin = {}"),
+        ("passwords", "type: {}"),
+        ("secrets", "format: {}"),
+    ],
+)
+def test_mapping_under_a_sensitive_label_is_redacted(
+    mode: Literal["full", "tagged"], label: str, entry: str
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(redact_mode=mode))
+    before, after = f"host: db.internal\n{label}:\n  {entry}\n".split("{}")
+
+    result = redactor.redact_text(f"{before}Opaque-Fixture-1{after}").value
+
+    tag = r"\[REDACTED(?:_SECRET|:[a-z_]+#[0-9a-f]{8})\]"
+    assert re.fullmatch(re.escape(before) + tag + re.escape(after), result), result
+    assert redactor.redact_text(result).value == result
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "access_key:\nsecret_key: {}",
+        "AWS_ACCESS_KEY=\nAWS_SECRET_KEY = {}",
+        "api_key:\nclient_secret: {}",
+    ],
+)
+def test_next_label_is_not_read_as_the_value_of_an_empty_label(
+    engine: Literal["basic", "detect-secrets"], text: str
+) -> None:
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(
+        text.format("OpaqueFixture1")
+    )
+
+    assert result.value == text.format("[REDACTED_SECRET]")
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        ("hunter", 'if password == "{}":'),
+        ("hunter", "mysql --password={} -h db"),
+        ("hunter", "password: {}, user: bob"),
+        ("hunter", "<password>{}</password>"),
+        ("hunter", "DB_PASS={} psql -h db"),
+        ("hunter", "auth_key={} x"),
+        ("hunter", "Authorization: Basic {} x"),
+        ("hunter", "login --password {} -h db"),
+        ("hunter", "password[0] = {} x"),
+        ("hunter", "PASSWORD?={} x"),
+        ("s3cret", "PGPASSWORD={} psql -h db"),
+        ("s3cret", "log in with {} now"),
+        ("my-secret-passphrase", "sshpass -p {}"),
+    ],
+)
+def test_repeated_password_is_redacted(value: str, text: str) -> None:
+    result = SecretRedactor(RedactionConfig()).redact_text(
+        f'password = "{value}"\n{text.format(value)}\n'
+    )
+
+    assert value not in result.value
+
+
+def test_text_between_private_keys_is_kept() -> None:
+    begin, end = ("-----" + word + " PRIVATE KEY-----" for word in ("BEGIN", "END"))
+    text = json.dumps(
+        {
+            "a": f"{begin}{'QUJD' * 12}{end}\n",
+            "name": "keep-me",
+            "b": f"{begin}\nQUJDRA==\n{end}\n",
+        }
+    )
+
+    result = SecretRedactor(RedactionConfig()).redact_text(text)
+
+    assert "keep-me" in result.value
+    assert "QUJD" not in result.value
+
+
+def test_nested_schema_text_under_a_sensitive_name_is_redacted() -> None:
+    secret = "Opaque-Fixture-1"
+    user = {"type": "string", "default": secret, "description": secret}
+    schema = {
+        "type": "object",
+        "properties": {"credentials": {"properties": {"user": user, "list": [secret]}}},
+    }
+
+    result = SecretRedactor(RedactionConfig(engine="basic")).redact_payload(schema).value
+
+    assert secret not in json.dumps(result)
+    assert result["properties"]["credentials"]["properties"]["user"]["type"] == "string"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'postgres://u:Opaque"Fixture1@db/app',
+        'postgres://u:Opaque"}Fixture1@db/app',
+        '{"dsn":"postgres://u:Opaque\\"Fixture1@db/app"}',
+        r"https:\/\/h\/o?X-Amz-Security-" + r"Token=Opaque\/Fixture1+a\u002Bb==&X-Amz-Date=1",
+        "×" + "gh" + "p_" + "Fixture1" + "0" * 30,
+    ],
+)
+def test_value_with_quotes_escapes_or_adjacent_signs_is_redacted(text: str) -> None:
+    result = SecretRedactor(RedactionConfig(engine="basic")).redact_text(text)
+
+    assert result.stats.redactions == 1
+    assert "Fixture1" not in result.value
+
+
+def test_partial_mode_bounds_tag_derivations() -> None:
+    redactor = SecretRedactor(RedactionConfig(redact_mode="partial", engine="basic"))
+    tokens = [f"{'gh'}p_FixtureToken{index:024}" for index in range(80)]
+
+    result = redactor.redact_text(" ".join(tokens)).value.split(" ")
+
+    assert len([item for item in result if item.startswith("ghp_")]) == 64
+    assert result.count("[REDACTED_SECRET]") == 16
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize("value", ["OpaqueFixture1", "Opaque1=abcd", "opaque1fixture: admin"])
+def test_secret_on_the_line_after_its_label_is_redacted(
+    engine: Literal["basic", "detect-secrets"], value: str
+) -> None:
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(f"tokens:\n  {value}")
+
+    assert value.partition(":")[0] not in result.value
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("AccountEndpoint=https://x.documents.azure.com:443/;AccountKey=", ";"),
+        ("DefaultEndpointsProtocol=https;AccountName=x;AccountKey=", ";EndpointSuffix=y"),
+        ("Endpoint=sb://x.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=", ""),
+        ("word " * 1000 + "\nAccountKey=", ";"),
+    ],
+)
+def test_azure_connection_string_keys_are_redacted(
+    engine: Literal["basic", "detect-secrets"], before: str, after: str
+) -> None:
+    key = base64.b64encode(bytes(range(7, 71))).decode()
+    result = SecretRedactor(RedactionConfig(engine=engine)).redact_text(before + key + after)
+
+    assert result.value == f"{before}[REDACTED_SECRET]{after}"
+
+
+@pytest.mark.parametrize("engine", ["basic", "detect-secrets"])
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("Authorization: ApiKey ", ""),
+        ("Authorization: SSWS ", ""),
+        ("Authorization: GenieKey ", ""),
+        ('{"Authorization":["Bearer ', '"]}'),
+        ("map[Authorization:[Bearer ", "]]"),
+    ],
+)
+def test_authorization_schemes_and_header_arrays_are_redacted(
+    engine: Literal["basic", "detect-secrets"], before: str, after: str
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(engine=engine))
+    text = f"log line\n{before}Opaque-Fixture-0001{after}"
+    result = redactor.redact_text(text)
+
+    assert result.value == f"log line\n{before}[REDACTED_SECRET]{after}"
+    assert redactor.redact_text(result.value).value == result.value
+
+
+@pytest.mark.parametrize("container", ["parameters", "input_schema"])
+def test_tool_schema_structure_survives_sensitive_parameter_names(container: str) -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "password": {"type": "string", "minLength": 12},
+            "api_key": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "credentials": {
+                "type": "object",
+                "properties": {"token": {"type": ["string", "null"], "format": "password"}},
+            },
+        },
+        "required": ["password"],
+        "$defs": {"AccessToken": {"type": "string", "enum": ["read-only", "read-write"]}},
+    }
+    payload = {"tools": [{"name": "login", container: schema}]}
+    result = SecretRedactor(RedactionConfig()).redact_payload(payload)
+
+    assert result.value == payload
+    assert result.stats.redactions == 0
+
+
+def test_tool_schema_secrets_are_still_redacted() -> None:
+    payload = {
+        "type": "object",
+        "properties": {
+            "password": {
+                "type": "string",
+                "description": f"use {OPENAI_FAKE}",
+                "anyOf": [{"type": "string", "default": "hunter2"}],
+                "default": "hunter2",
+                "examples": ["hunter2"],
+                "value": "hunter2",
+            },
+            "secret": "hunter2",
+        },
+    }
+    result = SecretRedactor(RedactionConfig()).redact_payload(payload)
+
+    assert result.value["properties"]["password"]["type"] == "string"
+    assert "hunter2" not in json.dumps(result.value)
+    assert OPENAI_FAKE not in json.dumps(result.value)
+    # The same keys outside an object schema are ordinary values.
+    other = {"properties": {"password": {"type": "hunter2"}}}
+    assert "hunter2" not in json.dumps(
+        SecretRedactor(RedactionConfig()).redact_payload(other).value
+    )
+
+
+def test_reasoning_signatures_are_returned_unchanged() -> None:
+    class ThinkingBlock(BaseModel):
+        type: Literal["thinking"] = "thinking"
+        thinking: str
+        signature: str
+
+    signature = base64.b64encode(bytes(range(200))).decode()
+    block = {"type": "thinking", "thinking": "plan", "signature": signature}
+    payload = {
+        "messages": [{"role": "assistant", "content": [block]}],
+        "contents": [{"parts": [{"functionCall": {"name": "f"}, "thoughtSignature": signature}]}],
+        "reasoning_details": [{"type": "reasoning.text", "text": "x", "signature": signature}],
+        "typed": [ThinkingBlock(thinking="plan", signature=signature)],
+    }
+    redactor = SecretRedactor(RedactionConfig())
+
+    for protocol in (None, "gemini-generate-content"):
+        result = redactor.redact_payload(payload, protocol=protocol)
+        assert result.value == payload
+        assert result.stats.redactions == 0
+
+    other = redactor.redact_payload(
+        {
+            "webhook": {"signature": signature},
+            "thinking": {**block, "signature": "Opaque fixture value"},
+        }
+    )
+    assert other.value["webhook"]["signature"] == "[REDACTED_SECRET]"
+    assert other.value["thinking"]["signature"] == "[REDACTED_SECRET]"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Use private-abcd1234. Then stop.", "Use [REDACTED_SECRET]. Then stop."),
+        (
+            json.dumps({"a": "x\nprivate-abcd1234\ny"}),
+            json.dumps({"a": "x\n[REDACTED_SECRET]\ny"}),
+        ),
+        ("C:\\dir\\private-abcd1234", "C:\\dir\\[REDACTED_SECRET]"),
+        ("private-abcd1234.com", "private-abcd1234.com"),
+    ],
+)
+def test_tail_rule_respects_sentence_ends_and_escapes(text: str, expected: str) -> None:
+    rule = RuleConfig(type="exact", value="abcd1234")
+    result = SecretRedactor(RedactionConfig(engine="basic", rules=[rule])).redact_text(text)
+
+    assert result.value == expected
+
+
+@pytest.mark.parametrize("mode", ["full", "partial"])
+def test_redacted_payload_reports_no_new_redactions(mode: Literal["full", "partial"]) -> None:
+    redactor = SecretRedactor(RedactionConfig(redact_mode=mode))
+    first = redactor.redact_payload(
+        {
+            "password": "OpaqueFixture1",
+            "text": "https://u:OpaqueFixture1@host/x https://blob.example/o?si"
+            + "g=OpaqueFixture1",
+        }
+    )
+    second = redactor.redact_payload(first.value)
+
+    assert first.stats.redactions >= 3
+    assert second.value == first.value
+    assert second.stats.redactions == 0
+
+
+@pytest.mark.parametrize("mode", ["full", "partial", "tagged"])
+def test_lone_surrogate_in_labeled_value_is_redacted(
+    mode: Literal["full", "partial", "tagged"],
+) -> None:
+    redactor = SecretRedactor(RedactionConfig(redact_mode=mode))
+    result = redactor.redact_text('password = "Opaque \ud83d fixture value"')
+
+    assert "Opaque \ud83d" not in result.value
+    assert "fixture" not in result.value
+
+
+def test_partial_mode_tag_is_keyed() -> None:
+    secret = "FixturePassword-0123456789"
+    config = RedactionConfig(engine="basic", redact_mode="partial", rules=[
+        RuleConfig(type="regex", value="FixturePassword-[0-9]+", name="fixture")
+    ])  # fmt: skip
+    first, again, other = SecretRedactor(config), SecretRedactor(config), SecretRedactor(config)
+    again._default_tag_secret = first._default_tag_secret
+    tags = [item.redact_text(secret).value.rpartition(":")[2] for item in (first, again, other)]
+
+    assert tags[0] == tags[1] != tags[2]
+    assert hashlib.sha256(secret.encode()).hexdigest()[:8] not in tags
+
+
+def test_partial_mode_hides_secrets_that_its_digest_would_reveal() -> None:
+    redactor = SecretRedactor(RedactionConfig(redact_mode="partial"))
+
+    assert redactor.redact_text('password = "my pass word1"').value == (
+        'password = "[REDACTED_SECRET]"'
+    )

@@ -213,3 +213,13 @@ def test_legacy_import_redacts_with_deprecation_warning() -> None:
 @pytest.mark.parametrize("module", ["audit", "compat", "patterns"])
 def test_legacy_submodules_remain_importable(module: str) -> None:
     assert importlib.import_module(f"promptcloak.{module}")
+
+
+def test_redact_params_scans_lazy_iterables_that_sdks_accept() -> None:
+    redacted = redact_params(
+        system=(block for block in [{"type": "text", "text": OPENAI_FAKE}]),
+        messages=[{"role": "user", "content": map(dict, [[("text", OPENAI_FAKE)]])}],
+    )
+
+    assert redacted["system"] == [{"type": "text", "text": "[REDACTED_SECRET]"}]
+    assert redacted["messages"][0]["content"] == [{"text": "[REDACTED_SECRET]"}]

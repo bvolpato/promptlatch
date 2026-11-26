@@ -7,9 +7,10 @@ import logging
 import posixpath
 import secrets
 import socket
-from collections.abc import AsyncIterator, Iterable, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterable, Mapping, MutableMapping
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any, Literal
 from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
@@ -112,7 +113,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        timeout = httpx.Timeout(expanded.target.timeout_seconds)
         monitoring = Observability(expanded) if expanded.observability.enabled else None
         price_task = None
         if monitoring is not None:
@@ -120,7 +120,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _app.state.observability = monitoring
             price_task = asyncio.create_task(monitoring.refresh_prices())
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with _new_client(expanded) as client:
                 _app.state.client = client
                 yield
         finally:
@@ -227,7 +227,7 @@ async def forward_request(request: Request, path: str) -> Response:
     settings: Settings = request.app.state.settings
     observation: RequestObservation | None = getattr(request.state, "observation", None)
     _check_proxy_auth(request, settings)
-    target_url = _target_url(request, path, settings)
+    target_url = _target_url(request, _encoded_path(request, path), settings)
     await _validate_target(target_url, settings)
 
     body = await _read_request_body(request, settings.server.max_request_body_bytes)
@@ -252,11 +252,15 @@ async def forward_request(request: Request, path: str) -> Response:
         content = json.dumps(chat_payload, separators=(",", ":")).encode("utf-8")
 
     _debug_request(request, path, target_url, raw_body, content, stats, settings)
+    body_rewritten = content != raw_body
     del raw_body
     if not compat_responses_to_chat:
         json_payload = None
 
     headers = _forward_headers(request, settings)
+    if compat_responses_to_chat:
+        # The bridge reads the response and cannot decode every coding a client accepts.
+        headers["accept-encoding"] = "identity"
     if getattr(request.state, "body_decoded", False):
         original_encoding = "identity"
     else:
@@ -286,8 +290,10 @@ async def forward_request(request: Request, path: str) -> Response:
         compression_ms = compressed.compression_ms
         if request_encoding != "identity":
             headers["content-encoding"] = request_encoding
-            for name in ("content-md5", "content-digest", "repr-digest", "digest"):
-                headers.pop(name, None)
+            body_rewritten = True
+    if body_rewritten:
+        for name in ("content-md5", "content-digest", "repr-digest", "digest"):
+            headers.pop(name, None)
     client, close_client = _client_for_request(request, settings)
 
     try:
@@ -377,8 +383,9 @@ async def forward_request(request: Request, path: str) -> Response:
 
     if transform_response and isinstance(upstream_payload, dict):
         response_payload = chat_response_to_responses(upstream_payload, json_payload)
-        return JSONResponse(
-            response_payload,
+        # JSONResponse cannot encode the lone surrogates that escaped JSON can carry.
+        return Response(
+            json.dumps(response_payload, separators=(",", ":")),
             status_code=upstream.status_code,
             headers=response_headers,
         )
@@ -480,6 +487,9 @@ def _redactor_for_request(request: Request, settings: Settings) -> SecretRedacto
     raw_rules = request.headers.get("x-redact-extra-rules")
     if not raw_rules:
         return request.app.state.redactor
+    # JSON is UTF-8, but ASGI header strings are Latin-1.
+    with suppress(UnicodeDecodeError):
+        raw_rules = raw_rules.encode("latin-1").decode("utf-8")
     redaction = settings.redaction
     if len(raw_rules.encode("utf-8")) > redaction.max_extra_rules_header_bytes:
         raise HTTPException(status_code=400, detail="X-Redact-Extra-Rules header too large")
@@ -550,7 +560,7 @@ def _redact_request_body(
         if parse_json and _is_json_request(request):
             try:
                 return body, body, stats, json.loads(body)
-            except json.JSONDecodeError:
+            except ValueError:
                 raise HTTPException(status_code=400, detail="invalid JSON request body") from None
         return body, body, stats, None
 
@@ -576,7 +586,9 @@ def _redact_request_body(
     if not body:
         return body, body, stats, None
 
-    if media_type == "application/x-www-form-urlencoded":
+    declared_json = _is_json_request(request)
+    payload = None if declared_json or parse_json else _undeclared_json(body)
+    if media_type == "application/x-www-form-urlencoded" and payload is None:
         try:
             fields = parse_qsl(body.decode("utf-8"), keep_blank_values=True, errors="strict")
         except UnicodeError:
@@ -584,11 +596,12 @@ def _redact_request_body(
         cleaned, stats = _redact_parameter_pairs(fields, redactor)
         return body, urlencode(cleaned).encode("utf-8"), stats, None
 
-    if _is_json_request(request):
+    if declared_json:
         try:
             payload = json.loads(body)
-        except json.JSONDecodeError:
+        except ValueError:
             raise HTTPException(status_code=400, detail="invalid JSON request body") from None
+    if declared_json or payload is not None:
         protocol = redaction_protocol or ("openai-responses" if preserve_responses else None)
         try:
             result = (
@@ -601,15 +614,27 @@ def _redact_request_body(
                 status_code=400,
                 detail="request contains colliding keys after redaction",
             ) from None
-        return (
-            body,
-            json.dumps(result.value, separators=(",", ":")).encode("utf-8"),
-            result.stats,
-            result.value,
-        )
+        payload = result.value
+        # Undeclared JSON keeps its bytes unless a decoded string needs redaction.
+        if declared_json or result.stats.redactions:
+            return (
+                body,
+                json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                result.stats,
+                payload,
+            )
 
     result = redactor.redact_text(body.decode("utf-8", errors="surrogateescape"))
-    return body, result.value.encode("utf-8", errors="surrogateescape"), result.stats, None
+    return body, result.value.encode("utf-8", errors="surrogateescape"), result.stats, payload
+
+
+def _undeclared_json(body: bytes) -> dict[str, Any] | list[Any] | None:
+    """Parse JSON sent without a JSON media type. Its escapes hide secrets from text scans."""
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, (dict, list)) else None
 
 
 def _redact_query_params(
@@ -658,8 +683,15 @@ def _client_for_request(request: Request, settings: Settings) -> tuple[httpx.Asy
     client = getattr(request.app.state, "client", None)
     if client is not None:
         return client, False
-    timeout = httpx.Timeout(settings.target.timeout_seconds)
-    return httpx.AsyncClient(timeout=timeout), True
+    return _new_client(settings), True
+
+
+def _new_client(settings: Settings) -> httpx.AsyncClient:
+    # A shared jar would replay one caller's provider cookies on other callers' requests.
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.target.timeout_seconds),
+        cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+    )
 
 
 def _check_proxy_auth(request: Request, settings: Settings) -> None:
@@ -667,7 +699,7 @@ def _check_proxy_auth(request: Request, settings: Settings) -> None:
     if not api_key:
         return
     auth = request.headers.get("authorization", "")
-    if not secrets.compare_digest(auth, f"Bearer {api_key}"):
+    if not secrets.compare_digest(auth.encode("latin-1"), f"Bearer {api_key}".encode()):
         raise HTTPException(status_code=401, detail="invalid PromptLatch API key")
 
 
@@ -677,6 +709,15 @@ def _should_bridge_responses_to_chat(request: Request, path: str, settings: Sett
         and request.method == "POST"
         and path.rstrip("/") == "/v1/responses"
     )
+
+
+def _encoded_path(request: Request, path: str) -> str:
+    """Return the path as sent, so encoded delimiters such as %2F keep their meaning."""
+    raw_path = request.scope.get("raw_path")
+    if raw_path is None:
+        return path
+    encoded = raw_path.decode("latin-1").removeprefix(request.scope.get("root_path", ""))
+    return encoded if unquote(encoded) == path else path
 
 
 def _target_url(request: Request, path: str, settings: Settings) -> str:
@@ -708,7 +749,8 @@ async def _validate_target(target_url: str, settings: Settings) -> None:
         parsed = urlsplit(target_url)
         hostname = parsed.hostname
         _ = parsed.port
-    except (UnicodeError, ValueError):
+        _ = httpx.URL(target_url)
+    except (UnicodeError, ValueError, httpx.InvalidURL):
         raise HTTPException(status_code=400, detail="invalid target URL") from None
     if parsed.scheme not in {"http", "https"} or not hostname:
         raise HTTPException(status_code=400, detail="invalid target URL")
@@ -753,7 +795,8 @@ def _effective_port(parsed: SplitResult) -> int | None:
 
 
 def _normalized_url_path(path: str) -> str:
-    return posixpath.normpath("/" + unquote(path).lstrip("/"))
+    # Paths are forwarded as sent. Decode twice so double-encoded dot segments stay blocked.
+    return posixpath.normpath("/" + unquote(unquote(path)).lstrip("/"))
 
 
 def _is_private_host(host: str) -> bool:
@@ -779,7 +822,7 @@ def _forwards_client_auth(request: Request, settings: Settings) -> bool:
     )
 
 
-def _forward_headers(request: Request, settings: Settings) -> dict[str, str]:
+def _forward_headers(request: Request, settings: Settings) -> httpx.Headers:
     target_api_key = request.headers.get("x-target-api-key")
     target_authorization = request.headers.get("x-target-authorization")
     configured_api_key = (
@@ -791,7 +834,7 @@ def _forward_headers(request: Request, settings: Settings) -> dict[str, str]:
     ).lower()
     if target_api_key_header not in {"authorization", "x-api-key", "x-goog-api-key"}:
         raise HTTPException(status_code=400, detail="invalid X-Target-API-Key-Header header")
-    headers: dict[str, str] = {}
+    forwarded: list[tuple[str, str]] = []
     dropped = DROP_REQUEST_HEADERS | _connection_header_names(request.headers)
     if getattr(request.state, "body_decoded", False):
         dropped |= {"content-encoding", "content-md5", "content-digest", "repr-digest", "digest"}
@@ -813,14 +856,9 @@ def _forward_headers(request: Request, settings: Settings) -> dict[str, str]:
             continue
         if lowered.startswith("x-redact-"):
             continue
-        if lowered == "content-encoding":
-            headers["content-encoding"] = (
-                f"{headers['content-encoding']}, {value}"
-                if "content-encoding" in headers
-                else value
-            )
-            continue
-        headers[key] = value
+        forwarded.append((key, value))
+    # ASGI header strings are Latin-1, so this restores the bytes the client sent.
+    headers = httpx.Headers(forwarded, encoding="latin-1")
     headers["accept-encoding"] = request.headers.get("accept-encoding", "identity")
     if target_api_key:
         _set_target_api_key(headers, target_api_key, target_api_key_header)
@@ -836,7 +874,7 @@ def _uses_configured_target(request: Request, settings: Settings) -> bool:
     return not override or override.rstrip("/") == settings.target.default_base_url.rstrip("/")
 
 
-def _set_target_api_key(headers: dict[str, str], api_key: str, header: str) -> None:
+def _set_target_api_key(headers: MutableMapping[str, str], api_key: str, header: str) -> None:
     if header in {"x-api-key", "x-goog-api-key"}:
         headers[header] = api_key
         return
@@ -997,7 +1035,9 @@ def _response_headers(
         | _connection_header_names(headers)
         | (DROP_TRANSFORMED_RESPONSE_HEADERS if transformed else set())
     )
-    result = {key: value for key, value in headers.items() if key.lower() not in dropped}
+    # Starlette encodes header values as Latin-1, so decode the upstream bytes the same way.
+    upstream_headers = httpx.Headers(headers, encoding="latin-1")
+    result = {key: value for key, value in upstream_headers.items() if key.lower() not in dropped}
     if protect_dashboard:
         # Upstream documents share the dashboard origin but must never execute there.
         result["content-security-policy"] = (
@@ -1009,5 +1049,9 @@ def _response_headers(
 
 def _connection_header_names(headers: Mapping[str, str]) -> set[str]:
     return {
-        name.strip().lower() for name in headers.get("connection", "").split(",") if name.strip()
+        name.strip().lower()
+        for key, value in headers.items()
+        if key.lower() == "connection"
+        for name in value.split(",")
+        if name.strip()
     }

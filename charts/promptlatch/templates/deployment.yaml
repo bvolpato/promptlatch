@@ -37,6 +37,10 @@ spec:
                 name: {{ .Values.existingSecret | quote }}
           {{- end }}
           env:
+            {{- if not (hasKey (.Values.env | default dict) "XDG_STATE_HOME") }}
+            - name: XDG_STATE_HOME
+              value: /var/lib/promptlatch
+            {{- end }}
             {{- if .Values.serverAuth.enabled }}
             - name: PROMPTLATCH_REQUIRE_SERVER_API_KEY
               value: "true"
@@ -73,3 +77,10 @@ spec:
               port: 8000
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          # Request history needs a writable path because the root filesystem is read-only.
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/promptlatch
+      volumes:
+        - name: state
+          emptyDir: {}

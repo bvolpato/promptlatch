@@ -106,7 +106,9 @@ class RuleConfig(BaseModel):
             try:
                 pattern = re.compile(value)
             except re.error as exc:
-                raise ValueError(f"invalid redaction regex: {exc}") from exc
+                # The error text can quote the rule, which can hold part of a secret.
+                position = "" if exc.pos is None else f" at position {exc.pos}"
+                raise ValueError(f"invalid redaction regex{position}") from None
             if pattern.search("") is not None:
                 raise ValueError("redaction regex cannot match empty text")
         return value
@@ -121,7 +123,11 @@ class RuleConfig(BaseModel):
 
 def _validated_base_url(value: str) -> str:
     value = value.rstrip("/")
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        # The error text can quote the URL, which can hold a password.
+        raise ValueError("target base URL is not valid") from None
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("target base URL must use http:// or https:// with a hostname")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -178,7 +184,13 @@ class AuditConfig(BaseModel):
     @field_validator("file")
     @classmethod
     def expand_path(cls, value: Path | None) -> Path | None:
-        return value.expanduser() if value is not None else None
+        if value is None:
+            return None
+        try:
+            return value.expanduser()
+        except RuntimeError:
+            # `~name` is a literal path when no such user exists.
+            return value
 
 
 class CompatConfig(BaseModel):

@@ -614,6 +614,30 @@ def test_version_probe_stops_when_cli_resolves_to_the_shim(
     assert calls.read_text(encoding="utf-8").splitlines() == ["call"]
 
 
+def test_wrapper_that_names_the_original_cli_is_not_recursion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_launcher_environment(monkeypatch)
+    original = tmp_path / "original"
+    original.write_text("#!/bin/sh\necho 9.9.9\n", encoding="utf-8")
+    original.chmod(0o755)
+    wrapper = tmp_path / "claude"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'export PROMPTLATCH_CLAUDE_BIN="{original}"\n'
+        f'exec "{sys.executable}" -c '
+        "'import promptlatch.launchers as l; l._CLI_VERSION_TIMEOUT = 120; "
+        "l._require_ready_proxy = lambda *a, **k: None; l.claude_main()' "
+        '"$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    monkeypatch.setattr(launchers, "_CLI_VERSION_TIMEOUT", 120)
+
+    launchers._require_supported_cli_version("claude", str(wrapper), dict(os.environ))
+
+
 def test_claude_launcher_preserves_native_auth_and_filters_routing_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

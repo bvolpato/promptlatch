@@ -140,29 +140,29 @@ def _main(client: str, arguments: list[str]) -> NoReturn:
     if _requests_latch_help(arguments):
         _print_help(program, client)
         raise SystemExit(0)
-    if os.environ.get(_VERSION_PROBE_ENV) == client:
-        # The resolved CLI is this shim, or a wrapper around it. Stop before it recurses.
-        print(_VERSION_PROBE_RECURSION)
-        raise SystemExit(1)
-
     try:
         environment = os.environ.copy()
+        probed = tuple(filter(None, environment.pop(_VERSION_PROBE_ENV, "").split(os.pathsep)))
         proxy = _proxy_address(environment.get("PROMPTLATCH_PROXY_URL", _DEFAULT_PROXY_URL))
         _merge_no_proxy(environment, proxy.hostname)
         executable = _resolve_cli(client, environment)
+        if executable in probed:
+            # The resolved CLI is a wrapper around this shim. Stop before it recurses.
+            print(_VERSION_PROBE_RECURSION)
+            raise SystemExit(1)
 
         if client == "codex":
             _reject_codex_routing_overrides(arguments)
             _reject_codex_unproxied_commands(arguments)
-            _require_supported_cli_version(client, executable, environment)
+            _require_supported_cli_version(client, executable, environment, probed)
         elif client == "gemini":
             _reject_unsupported_gemini_proxy_url(proxy)
             _reject_gemini_unproxied_commands(arguments)
             _reject_alternate_gemini_providers(environment)
-            _require_supported_cli_version(client, executable, environment)
+            _require_supported_cli_version(client, executable, environment, probed)
         else:
             _reject_alternate_claude_providers(environment)
-            _require_supported_cli_version(client, executable, environment)
+            _require_supported_cli_version(client, executable, environment, probed)
 
         _require_ready_proxy(proxy.origin, client_name=client)
         if client == "codex":
@@ -403,7 +403,7 @@ def _codex_invocation(
 
 
 def _require_supported_cli_version(
-    client: str, executable: str, environment: dict[str, str]
+    client: str, executable: str, environment: dict[str, str], probed: tuple[str, ...] = ()
 ) -> None:
     if client == "codex":
         minimum = _CODEX_MINIMUM_VERSION
@@ -425,7 +425,7 @@ def _require_supported_cli_version(
             errors="replace",
             timeout=_CLI_VERSION_TIMEOUT,
             check=False,
-            env=environment | {_VERSION_PROBE_ENV: client},
+            env=environment | {_VERSION_PROBE_ENV: os.pathsep.join((*probed, executable))},
         )
     except (OSError, subprocess.SubprocessError):
         result = None

@@ -86,7 +86,7 @@ def _config_errors() -> Iterator[None]:
         yield
     except ValidationError as exc:
         details = [
-            ": ".join(filter(None, (".".join(map(str, error["loc"])), error["msg"])))
+            ": ".join(filter(None, (_error_location(error["loc"]), error["msg"])))
             for error in exc.errors(include_url=False, include_context=False, include_input=False)
         ]
         raise typer.BadParameter(
@@ -104,8 +104,21 @@ def _config_errors() -> Iterator[None]:
         reason = exc.strerror or type(exc).__name__
         path = exc.filename2 or exc.filename or "config files"
         raise typer.BadParameter(f"Cannot access {path}: {reason}") from None
-    except ValueError as exc:
+    except httpx.InvalidURL:
+        raise typer.BadParameter("Invalid PromptLatch config: a URL is not valid.") from None
+    except RecursionError:
+        raise typer.BadParameter("PromptLatch config is nested too deeply.") from None
+    except typer.Exit:
+        raise
+    except (RuntimeError, ValueError) as exc:
         raise typer.BadParameter(f"Invalid PromptLatch config: {exc}") from None
+
+
+def _error_location(location: tuple[int | str, ...]) -> str:
+    # A key that the user chose, such as an endpoint URL, can hold a credential.
+    return ".".join(
+        str(part) if isinstance(part, int) or part.isidentifier() else "<key>" for part in location
+    )
 
 
 def _load_settings(config: Path | None) -> Settings:
@@ -192,7 +205,9 @@ def init(
     force: Annotated[bool, typer.Option(help="Overwrite existing config.")] = False,
 ) -> None:
     resolved = config.expanduser()
-    if resolved.exists() and not force:
+    with _config_errors():
+        exists = resolved.exists()
+    if exists and not force:
         raise typer.BadParameter(f"{resolved} already exists")
     content = config_template(target_base_url, target_api_key_env)
     with _config_errors():
@@ -215,7 +230,9 @@ def encrypt_rules(
 ) -> None:
     resolved_config = resolve_config_path(config)
     resolved_key_file = key_file.expanduser()
-    if not resolved_config.exists():
+    with _config_errors():
+        exists = resolved_config.exists()
+    if not exists:
         raise typer.BadParameter(f"{resolved_config} does not exist")
     with _config_errors():
         data = yaml.safe_load(resolved_config.read_text(encoding="utf-8")) or {}
@@ -338,8 +355,9 @@ def scan(
             json.dumps({"text": result.value, "stats": result.stats.__dict__}, sort_keys=True)
         )
     elif not quiet:
-        # Only inline TEXT needs a newline. Files and stdin keep their own line endings.
-        typer.echo(result.value, nl=text is not None and text != "-")
+        # Bytes keep color codes and do not depend on the locale. Only inline TEXT needs a newline.
+        output = result.value.encode("utf-8", errors="surrogateescape")
+        typer.echo(output, nl=text is not None and text != "-")
     if check and result.stats.redactions > 0:
         raise typer.Exit(code=1)
 

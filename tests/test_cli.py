@@ -119,6 +119,19 @@ _INVALID_CONFIGS = {
     "root": f"- {_CONFIG_SECRET}\n".encode(),
     "utf8": b"\xff" + _CONFIG_SECRET.encode(),
     "key": b"redaction:\n  encrypted: true\n  encrypted_rules: AAAA\n",
+    "endpoint": (
+        "target:\n  request_compression:\n    endpoints:\n"
+        f"      'https://u:{_CONFIG_SECRET}@h.example/v1': brotli\n"
+    ).encode(),
+    "host": (
+        b"target:\n  request_compression:\n    endpoints:\n      'https://999.0.0.1/v1': gzip\n"
+    ),
+    "url": f"target:\n  default_base_url: 'https://u:{_CONFIG_SECRET}@h：80/v1'\n".encode(),
+    "regex": (
+        f"redaction:\n  rules:\n    - type: regex\n      value: '(?P={_CONFIG_SECRET})'\n"
+    ).encode(),
+    "nested": b"[" * 3000 + b"]" * 3000,
+    "home": b"observability:\n  database_path: '~no-such-user-fixture/db'\n",
     "directory": None,
 }
 
@@ -146,6 +159,38 @@ def test_invalid_config_is_a_usage_error_without_config_values(
     # Exit code 1 would look like a detected secret to `scan --check` callers.
     assert result.exit_code == 2, result.exception
     assert _CONFIG_SECRET not in result.output
+
+
+def test_wrong_rule_key_is_a_usage_error(tmp_path, monkeypatch) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "redaction:\n  rules:\n    - type: exact\n      value: abcd1234\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PROMPTLATCH_CONFIG_KEY", generate_key())
+    assert CliRunner().invoke(app, ["encrypt-rules", "--config", str(config)]).exit_code == 0
+    monkeypatch.setenv("PROMPTLATCH_CONFIG_KEY", generate_key())
+
+    result = CliRunner().invoke(app, ["scan", "--config", str(config), "clean"])
+
+    assert result.exit_code == 2, result.exception
+
+
+@pytest.mark.parametrize("name", ["yaml", "regex"])
+def test_encrypt_rules_reports_invalid_config_as_usage_error(tmp_path, name) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_bytes(_INVALID_CONFIGS[name])
+
+    result = CliRunner().invoke(app, ["encrypt-rules", "--config", str(config)])
+
+    assert result.exit_code == 2, result.exception
+    assert _CONFIG_SECRET not in result.output
+
+
+def test_audit_file_under_unknown_home_is_a_literal_path(tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("audit:\n  file: '~no-such-user-fixture/a.log'\n", encoding="utf-8")
+
+    assert CliRunner().invoke(app, ["scan", "--config", str(config), "clean"]).exit_code == 0
 
 
 def test_serve_reports_unset_environment_reference_as_usage_error(tmp_path, monkeypatch) -> None:
@@ -539,8 +584,11 @@ def test_scan_supports_argument_stdin_file_mode_check_and_quiet(tmp_path, monkey
     assert secret not in env_cfg_scan.output
 
 
-@pytest.mark.parametrize("content", [b"a\r\nb\r\n", b"line\n", b"no newline"])
-def test_scan_preserves_file_and_stdin_line_endings(tmp_path, content: bytes) -> None:
+@pytest.mark.parametrize(
+    "content",
+    [b"a\r\nb\r\n", b"line\n", b"no newline", b"\x1b[31mred\x1b[0m\n", "é €\n".encode()],
+)
+def test_scan_preserves_file_and_stdin_bytes(tmp_path, content: bytes) -> None:
     config, _ = _write_cli_config(tmp_path)
     sample = tmp_path / "sample.txt"
     sample.write_bytes(content)

@@ -148,6 +148,8 @@ def _packaged_catalog() -> _Catalog | None:
 def _has_unhandled_rates(
     entry: dict[str, Any], input_tokens: int, cache_read: int, cache_write: int
 ) -> bool:
+    if entry.get("off_peak_pricing"):
+        return True
     for key, value in entry.items():
         if "cost" not in key or key in _BASE_RATES or key in _OPTIONAL_TOOL_RATES or not value:
             continue
@@ -172,7 +174,7 @@ def _has_unhandled_rates(
                 scale = {None: 1, "k": 1000, "m": 1_000_000}[tier[2]]
                 if input_tokens <= int(tier[1]) * scale:
                     continue
-            if key == "cache_creation_input_token_cost_above_1hr" and not cache_write:
+            if key.startswith("cache_creation_input_token_cost_above_1hr") and not cache_write:
                 continue
             return True
     return False

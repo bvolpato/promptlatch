@@ -77,6 +77,30 @@ def test_installs_this_checkout_with_reinstall_and_preserves_uv_exit_status(tmp_
     ]
 
 
+def test_exported_cdpath_does_not_change_checkout_path(tmp_path: Path) -> None:
+    checkout = tmp_path / "src" / "promptlatch"
+    checkout.mkdir(parents=True)
+    shutil.copy2(INSTALLER, checkout / "install.sh")
+    (tmp_path / "stale" / "promptlatch").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", encoding="utf-8")
+    fake_uv.chmod(0o755)
+
+    assert BASH is not None
+    result = subprocess.run(
+        [BASH, "promptlatch/install.sh"],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path / "src",
+        env=os.environ | {"CDPATH": str(tmp_path / "stale"), "PATH": f"{fake_bin}:{SYSTEM_PATH}"},
+    )
+
+    assert result.stdout.splitlines()[-1] == str(checkout.resolve())
+
+
 def test_rejects_unknown_arguments_without_running_uv(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

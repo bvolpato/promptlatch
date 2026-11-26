@@ -64,7 +64,9 @@
       ["Encoding counts", `${codecSummary} · ${count(totals.request_compression_unknown_requests || 0)} unknown`],
     ];
   }
-  const text = (id, value) => { $(id).textContent = value; };
+  // Rewriting unchanged text makes live regions announce it on every poll.
+  const text = (id, value) => { if ($(id).textContent !== value) $(id).textContent = value; };
+  const asList = (value) => Array.isArray(value) ? value : value == null ? [] : [value];
   const shortId = (id) => id ? id.length > 17 ? `${id.slice(0, 9)}…${id.slice(-5)}` : id : "Unknown";
   const date = (timestamp, full = false) => known(timestamp) ? new Date(timestamp * 1000).toLocaleString(undefined, full ? { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short" } : { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
   const time = (timestamp) => known(timestamp) ? new Date(timestamp * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—";
@@ -224,7 +226,7 @@
 
   // Pure presentation helpers also run in Node's test runner without booting the dashboard.
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { jsonPresentation, renderJSON, fraction, tokenTotal, cost, uploadPresentation, uploadTotalsPresentation };
+    module.exports = { jsonPresentation, renderJSON, fraction, tokenTotal, cost, uploadPresentation, uploadTotalsPresentation, visibleMessage, bodyNotices };
     return;
   }
 
@@ -304,17 +306,25 @@
       state.requestId = state.detail = null;
       showEmpty("Invalid request link", "The link must contain one valid request ID. Select a request from the sidebar or open Stats.");
       renderTree();
-    } else if (initial && state.threads.items.length) {
-      await selectSession(state.threads.items[0], { latest: true, keepSidebar: true, historyMode: "replace" });
-    } else {
-      state.detailVersion += 1;
-      state.requestId = state.detail = null;
-      if (state.threadId) { showView("session"); renderSession(); }
-      else showEmpty("Select a request", "Choose a session from the sidebar to inspect its retained requests.");
-      renderTree();
+    } else if (!initial) clearRequest();
+    if (initial && (route.view === "requests" || route.view === "overview")) {
+      if (state.threads.items.length) await selectSession(state.threads.items[0], { latest: true, keepSidebar: true, historyMode: "replace" });
+      else {
+        // Nothing loaded yet: let refresh select the first session or show the waiting message.
+        state.initialized = false;
+        await refresh();
+      }
     }
     if (version !== state.routeVersion) return;
     updateIterationNavigation();
+  }
+
+  function clearRequest() {
+    state.detailVersion += 1;
+    state.requestId = state.detail = null;
+    if (state.threadId) { showView("session"); renderSession(); }
+    else showEmpty("Select a request", "Choose a session from the sidebar to inspect its retained requests.");
+    renderTree();
   }
 
   function replaceKeepingPosition(container, children) {
@@ -336,7 +346,9 @@
   }
 
   function toggleSidebar(open) {
+    const focused = $("sidebar").contains(document.activeElement);
     $("workbench").classList.toggle("sidebar-open", open);
+    if (focused && !$("sidebar").offsetParent) $("session-toggle").focus();
     $("session-toggle").setAttribute("aria-expanded", String(open));
     $("session-toggle").setAttribute("aria-label", open ? "Hide sessions" : "Show sessions");
   }
@@ -415,13 +427,13 @@
   }
 
   async function api(path, { method = "GET", bearerToken } = {}) {
-    const headers = bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {};
+    const headers = bearerToken === undefined ? {} : { Authorization: `Bearer ${bearerToken}` };
     const response = await fetch(new URL(path.replace(/^\//, ""), document.baseURI), {
       method, headers, cache: "no-store",
       credentials: "same-origin", redirect: "error", signal: AbortSignal.timeout(12000),
     });
     if (!response.ok) {
-      const error = new Error(response.status === 401 ? bearerToken ? "Dashboard token was rejected. Check the token file and try again." : "Dashboard session expired. Enter your dashboard token." : response.status === 403 ? "Open the dashboard directly using its server address." : "History is temporarily unavailable.");
+      const error = new Error(response.status === 401 ? bearerToken === undefined ? "Dashboard session expired. Enter your dashboard token." : "Dashboard token was rejected. Check the token file and try again." : response.status === 403 ? "Open the dashboard directly using its server address." : "History is temporarily unavailable.");
       error.status = response.status;
       throw error;
     }
@@ -431,7 +443,7 @@
 
   async function endSession() {
     if (!state.authenticated || state.locking) return;
-    const epoch = ++state.epoch;
+    const epoch = state.epoch;
     state.locking = true;
     state.lockError = false;
     $("signout").disabled = true;
@@ -697,7 +709,7 @@
       let page = await api(sessionPath(id, offset));
       if (epoch !== state.epoch || version !== state.treeVersion || id !== state.threadId) return;
       if (page.total && offset >= page.total) {
-        offset = Math.floor((page.total - 1) / 100) * 100;
+        offset = lastPage(page.total, 100);
         page = await api(sessionPath(id, offset));
       }
       if (epoch !== state.epoch || version !== state.treeVersion || id !== state.threadId) return;
@@ -710,12 +722,16 @@
     } catch (error) {
       if (epoch !== state.epoch || version !== state.treeVersion) return;
       state.sessionLoading = false;
-      if (error.status === 401) { clearLocalSession(); return; }
+      if (error.status === 401) { clearLocalSession(error.message); return; }
       text("load-error", "Could not load session iterations. Use Refresh to retry.");
       $("load-error").hidden = false;
       renderTree();
       renderSession();
     }
+  }
+
+  function lastPage(total, size) {
+    return Math.max(0, Math.floor((total - 1) / size) * size);
   }
 
   function changeSessionPage(offset) {
@@ -805,19 +821,26 @@
     state.expanded = true;
     state.collapsedTurns.clear();
     state.sessionLoading = true;
-    state.treeVersion += 1;
+    // The tree already shows this session, so finish loading it even if the request is deselected.
+    const treeVersion = ++state.treeVersion;
     state.session = { items: [], total: thread.requests, offset: context.request_offset, limit: 100 };
     renderTree();
-    const [threads, session] = await Promise.all([
-      api(threadsPath(context.thread_offset)),
-      api(sessionPath(thread.thread_id, context.request_offset)),
-    ]);
-    if (epoch !== state.epoch || version !== state.detailVersion || id !== state.requestId) return;
-    state.threads = threads;
-    state.session = session;
-    state.sessionLoading = false;
-    updateFilterOptions();
-    renderTree(); renderSession(); updateIterationNavigation();
+    try {
+      const [threads, session] = await Promise.all([
+        api(threadsPath(context.thread_offset)),
+        api(sessionPath(thread.thread_id, context.request_offset)),
+      ]);
+      if (epoch !== state.epoch || treeVersion !== state.treeVersion) return;
+      if (state.threadOffset === context.thread_offset) state.threads = threads;
+      state.session = session;
+    } finally {
+      if (epoch === state.epoch && treeVersion === state.treeVersion) {
+        state.sessionLoading = false;
+        updateFilterOptions();
+        renderTree(); renderSession(); updateIterationNavigation();
+        $("session-tree").querySelector(".iteration-button.selected")?.scrollIntoView({ block: "nearest" });
+      }
+    }
   }
 
   async function selectRequest(id, { keepSidebar = false, background = false, historyMode = "push" } = {}) {
@@ -856,7 +879,7 @@
     $("payload-wrap").disabled = true;
     for (const target of ["request-strip", "request-upload", "request-metric-notes", "conversation-content", "conversation-notices", "payload-notices", "request-metrics"]) $(target).replaceChildren();
     $("request-upload").hidden = true;
-    for (const tab of ["conversation", "payload", "metrics"]) $("panel-" + tab).scrollTop = 0;
+    for (const pane of ["request-view", "panel-conversation", "panel-payload", "panel-metrics"]) $(pane).scrollTop = 0;
     updateIterationNavigation();
     try {
       const [item] = await Promise.all([
@@ -868,8 +891,7 @@
       renderDetail(item, true);
     } catch (error) {
       if (epoch !== state.epoch || version !== state.detailVersion) return;
-      if (error.status === 401) { clearLocalSession(); return; }
-      state.sessionLoading = false;
+      if (error.status === 401) { clearLocalSession(error.message); return; }
       state.detail = null;
       text("request-title", "Request unavailable");
       const message = error.status === 404 ? "This request is no longer retained or does not exist. Older requests are removed to enforce the storage cap. Global aggregate statistics remain available in Stats." : "Could not load this request. Select it again to retry.";
@@ -901,7 +923,7 @@
 
   function bodyNotices(item) {
     const nodes = [];
-    if (item.body_truncated) nodes.push(element("p", "body-notice", "Request body truncated to the history size limit. This is a partial capture."));
+    if (item.body_truncated && item.request_body != null) nodes.push(element("p", "body-notice", "Request body truncated to the history size limit. This is a partial capture."));
     if (item.body_omitted_reason || item.request_body == null) nodes.push(element("p", "body-notice", item.body_omitted_reason ? `Request body omitted: ${item.body_omitted_reason}` : "No request body retained."));
     return nodes;
   }
@@ -1018,7 +1040,7 @@
       const capture = item.request_body == null ? ["unavailable", "No payload"] : item.body_truncated ? ["partial", "Partial capture"] : ["complete", "Captured"];
       $("request-capture-state").className = `tag capture-state ${capture[0]}`;
       text("request-capture-state", capture[1]);
-      $("request-capture-state").title = item.body_truncated ? "Only the stored troubleshooting copy was truncated. This does not truncate the forwarded request." : item.request_body == null ? `Request body unavailable${item.body_omitted_reason ? `: ${item.body_omitted_reason}` : "."}` : "Redacted request body retained.";
+      $("request-capture-state").title = item.request_body == null ? `Request body unavailable${item.body_omitted_reason ? `: ${item.body_omitted_reason}` : "."}` : item.body_truncated ? "Only the stored troubleshooting copy was truncated. This does not truncate the forwarded request." : "Redacted request body retained.";
       $("copy-payload").disabled = item.request_body == null;
       $("payload-wrap").disabled = item.request_body == null;
       text("payload-copy-status", "");
@@ -1108,7 +1130,7 @@
   function visibleMessage(message) {
     if (["function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"].includes(message.type)) return true;
     if (message.role === "tool" && message.tool_call_id) return true;
-    if (hasContent(message.content ?? message.summary)) return true;
+    if (hasContent(message.content) || hasContent(message.summary)) return true;
     return (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) || (message.tool_calls != null && !Array.isArray(message.tool_calls)) || message.function_call != null;
   }
 
@@ -1137,7 +1159,7 @@
         renderContent(body, output);
       } else {
         if (message.tool_call_id) body.append(element("p", "context-note", `Tool call ${message.tool_call_id}`));
-        renderContent(body, message.content ?? message.summary);
+        renderContent(body, hasContent(message.content) ? message.content : message.summary ?? message.content);
         if (Array.isArray(message.tool_calls)) {
           for (const call of message.tool_calls.slice(0, 100)) {
             if (call && typeof call === "object" && !Array.isArray(call)) body.append(toolBlock(call.function?.name || call.name, call.function?.arguments ?? call.arguments ?? call.input, call.id));
@@ -1171,19 +1193,20 @@
       return;
     }
     const wrapped = payload.request ?? payload.generateContentRequest ?? payload.generate_content_request;
-    const inner = (!Array.isArray(payload.messages) && !Array.isArray(payload.input) && typeof payload.input !== "string" && !Array.isArray(payload.contents) && wrapped && typeof wrapped === "object" && !Array.isArray(wrapped)) ? wrapped : payload;
+    const inner = (!Array.isArray(payload.messages) && !Array.isArray(payload.input) && typeof payload.input !== "string" && payload.contents == null && wrapped && typeof wrapped === "object" && !Array.isArray(wrapped)) ? wrapped : payload;
     const prefix = [];
     if (typeof payload.instructions === "string") prefix.push({ role: "system", content: payload.instructions, name: "Instructions" });
     if (typeof payload.system === "string" || Array.isArray(payload.system)) prefix.push({ role: "system", content: payload.system });
     const sysInst = inner.systemInstruction ?? inner.system_instruction;
     if (typeof sysInst === "string") prefix.push({ role: "system", content: sysInst, name: "System instruction" });
-    else if (sysInst && typeof sysInst === "object" && Array.isArray(sysInst.parts)) prefix.push({ role: "system", content: sysInst.parts, name: "System instruction" });
+    else if (sysInst && typeof sysInst === "object" && sysInst.parts != null) prefix.push({ role: "system", content: asList(sysInst.parts), name: "System instruction" });
     let messages = [];
     if (Array.isArray(payload.messages)) messages = payload.messages;
     else if (Array.isArray(payload.input)) messages = payload.input;
     else if (typeof payload.input === "string") prefix.push({ role: "user", content: payload.input });
-    else if (Array.isArray(inner.contents)) {
-      messages = inner.contents.map((entry) => (entry && typeof entry === "object" && !Array.isArray(entry)) ? { ...entry, role: entry.role === "model" ? "assistant" : (entry.role || "user"), content: entry.content ?? entry.parts } : entry);
+    else {
+      // Gemini also accepts bare strings, single objects, and entries that are parts.
+      messages = asList(inner.contents).map((entry) => typeof entry === "string" ? { role: "user", content: entry } : (entry && typeof entry === "object" && !Array.isArray(entry)) ? { ...entry, role: entry.role === "model" ? "assistant" : (entry.role || "user"), content: entry.content ?? (entry.parts == null && entry.text != null ? [entry] : asList(entry.parts)) } : entry);
     }
     function* capturedMessages(visibleOnly = true) {
       for (const source of [messages, prefix]) {
@@ -1383,7 +1406,9 @@
     const svg = document.createElementNS(ns, "svg");
     svg.setAttribute("viewBox", "0 0 720 140"); svg.setAttribute("preserveAspectRatio", "none"); svg.setAttribute("aria-hidden", "true");
     const maximum = daily.reduce((peak, day) => Math.max(peak, day.requests || 0), 1);
-    const points = daily.map((day, index) => [daily.length === 1 ? 360 : index * 720 / (daily.length - 1), 136 - (day.requests || 0) / maximum * 120]);
+    // One day has no line to draw, so span the chart at that day's value.
+    const plotted = daily.length === 1 ? [daily[0], daily[0]] : daily;
+    const points = plotted.map((day, index) => [index * 720 / (plotted.length - 1), 136 - (day.requests || 0) / maximum * 120]);
     const path = points.map(([x, y], index) => `${index ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
     const area = document.createElementNS(ns, "path"); area.setAttribute("d", `${path} L${points[points.length - 1][0]},140 L${points[0][0]},140 Z`); area.setAttribute("class", "trend-area");
     const line = document.createElementNS(ns, "path"); line.setAttribute("d", path); line.setAttribute("class", "trend-line");
@@ -1410,8 +1435,14 @@
       ]);
       if (epoch !== state.epoch) return;
       if (days === state.days) renderSummary(summary);
-      if (traffic === state.traffic && offset === state.threadOffset) { state.threads = threads; updateFilterOptions(); }
-      if (session && treeVersion === state.treeVersion && threadId === state.threadId && !state.sessionLoading) state.session = session;
+      if (traffic === state.traffic && offset === state.threadOffset) {
+        if (offset && offset >= threads.total) { state.threadOffset = lastPage(threads.total, 50); state.refreshAgain = true; }
+        else { state.threads = threads; updateFilterOptions(); }
+      }
+      if (session && treeVersion === state.treeVersion && threadId === state.threadId && !state.sessionLoading) {
+        if (sessionOffset && sessionOffset >= session.total) loadSessionPage(lastPage(session.total, 100));
+        else state.session = session;
+      }
       renderTree(); renderSession(); updateIterationNavigation();
       if (!state.lockError) $("load-error").hidden = true;
       text("live-status", "Online");
@@ -1427,13 +1458,23 @@
       const selectedRequestChanged = selectedMetadata && state.detail && (
         selectedMetadata.outcome !== state.detail.outcome ||
         selectedMetadata.status_code !== state.detail.status_code ||
-        selectedMetadata.completed_at !== state.detail.completed_at
+        selectedMetadata.completed_at !== state.detail.completed_at ||
+        selectedMetadata.cost_usd !== state.detail.cost_usd
       );
       if (state.detail && (state.detail.outcome === "active" || selectedRequestChanged)) {
         const id = state.requestId;
         const version = state.detailVersion;
-        const item = await api(`/api/requests/${encodeURIComponent(id)}`);
+        const item = await api(`/api/requests/${encodeURIComponent(id)}`).catch((error) => {
+          if (error.status !== 404) throw error;
+          return null;
+        });
         if (epoch !== state.epoch || version !== state.detailVersion || id !== state.requestId) return;
+        if (!item) {
+          // Evicted while selected: show the unavailable notice instead of failing every refresh.
+          state.detail = null;
+          await selectRequest(id, { keepSidebar: true, background: state.view !== "request", historyMode: "none" });
+          return;
+        }
         const bodyChanged = item.request_body !== state.detail?.request_body || item.body_truncated !== state.detail?.body_truncated || item.body_omitted_reason !== state.detail?.body_omitted_reason;
         state.detail = item;
         const positions = ["conversation", "payload", "metrics"].map((tab) => $("panel-" + tab).scrollTop);
@@ -1442,7 +1483,7 @@
       }
     } catch (error) {
       if (epoch !== state.epoch) return;
-      if (error.status === 401) { clearLocalSession(); return; }
+      if (error.status === 401) { clearLocalSession(error.message); return; }
       if (!state.lockError) text("load-error", "Activity refresh failed. Displayed values may be stale. Retrying automatically.");
       $("load-error").hidden = false;
       text("live-status", "Refresh delayed");
@@ -1457,11 +1498,13 @@
     event.preventDefault();
     $("signin-submit").disabled = true;
     $("signin-error").hidden = true;
-    let token = $("dashboard-token").value;
+    let token = $("dashboard-token").value.trim();
     const epoch = ++state.epoch;
     $("retry-session").hidden = true;
     $("retry-session").disabled = true;
     try {
+      // fetch refuses these headers with an error that looks like a connection failure.
+      if (/[^\x00-\xff]/.test(token)) throw Object.assign(new Error("Dashboard token contains unsupported characters. Check the token file and try again."), { status: 401 });
       const session = await api("/api/session", { method: "POST", bearerToken: token });
       token = "";
       $("dashboard-token").value = "";
@@ -1505,10 +1548,8 @@
     refresh();
   });
   $("clear-selection").addEventListener("click", () => {
-    state.requestId = state.detail = null;
-    state.detailVersion += 1;
     writeLocation("requests");
-    showView("session"); renderSession(); renderTree();
+    clearRequest();
   });
   $("copy-request-link").addEventListener("click", async () => {
     const id = state.requestId;

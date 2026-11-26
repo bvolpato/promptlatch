@@ -43,7 +43,12 @@ from promptlatch.observability import (
     parse_gemini_route,
 )
 from promptlatch.patterns import SENSITIVE_FIELD_RE
-from promptlatch.redaction import RedactionKeyCollisionError, RedactionStats, SecretRedactor
+from promptlatch.redaction import (
+    RedactionKeyCollisionError,
+    RedactionResult,
+    RedactionStats,
+    SecretRedactor,
+)
 from promptlatch.request_compression import (
     DecompressedRequestTooLargeError,
     InvalidCompressedRequestError,
@@ -586,9 +591,19 @@ def _redact_request_body(
     if not body:
         return body, body, stats, None
 
-    declared_json = _is_json_request(request)
-    payload = None if declared_json or parse_json else _undeclared_json(body)
-    if media_type == "application/x-www-form-urlencoded" and payload is None:
+    protocol = redaction_protocol or ("openai-responses" if preserve_responses else None)
+    if _is_json_request(request):
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid JSON request body") from None
+        except RecursionError:
+            raise _too_deep() from None
+        result = _redact_json(payload, redactor, protocol)
+        return body, _json_bytes(result.value), result.stats, result.value
+
+    undeclared = None if parse_json else _undeclared_json(body)
+    if media_type == "application/x-www-form-urlencoded" and undeclared is None:
         try:
             fields = parse_qsl(body.decode("utf-8"), keep_blank_values=True, errors="strict")
         except UnicodeError:
@@ -596,45 +611,81 @@ def _redact_request_body(
         cleaned, stats = _redact_parameter_pairs(fields, redactor)
         return body, urlencode(cleaned).encode("utf-8"), stats, None
 
-    if declared_json:
-        try:
-            payload = json.loads(body)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="invalid JSON request body") from None
-    if declared_json or payload is not None:
-        protocol = redaction_protocol or ("openai-responses" if preserve_responses else None)
-        try:
-            result = (
-                redactor.redact_payload(payload, protocol=protocol)
-                if protocol is not None
-                else redactor.redact_payload(payload)
-            )
-        except RedactionKeyCollisionError:
-            raise HTTPException(
-                status_code=400,
-                detail="request contains colliding keys after redaction",
-            ) from None
-        payload = result.value
-        # Undeclared JSON keeps its bytes unless a decoded string needs redaction.
-        if declared_json or result.stats.redactions:
-            return (
-                body,
-                json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-                result.stats,
-                payload,
-            )
+    content, stats = _redact_bytes(body, redactor)
+    if undeclared is None:
+        return body, content, stats, None
 
-    result = redactor.redact_text(body.decode("utf-8", errors="surrogateescape"))
-    return body, result.value.encode("utf-8", errors="surrogateescape"), result.stats, payload
+    # Text rules also match keys, numbers, and JSON syntax, so both scans must run.
+    parsed = _undeclared_json(content)
+    if parsed is not None:
+        payload, repeated_keys = parsed
+        result = _redact_json(payload, redactor, protocol)
+        stats.merge(result.stats)
+        if result.stats.redactions or repeated_keys:
+            content = _json_bytes(result.value)
+        return body, content, stats, result.value
+
+    # The text scan broke the JSON, so scan the original values and then the new text.
+    payload, repeated_keys = undeclared
+    result = _redact_json(payload, redactor, protocol)
+    if result.stats.redactions or repeated_keys:
+        content, stats = _redact_bytes(_json_bytes(result.value), redactor)
+        stats.merge(result.stats)
+    return body, content, stats, None
 
 
-def _undeclared_json(body: bytes) -> dict[str, Any] | list[Any] | None:
-    """Parse JSON sent without a JSON media type. Its escapes hide secrets from text scans."""
+def _redact_json(
+    payload: Any,
+    redactor: SecretRedactor,
+    protocol: Literal["openai-responses", "gemini-generate-content"] | None,
+) -> RedactionResult:
     try:
-        payload = json.loads(body)
-    except (ValueError, RecursionError):
+        if protocol is None:
+            return redactor.redact_payload(payload)
+        return redactor.redact_payload(payload, protocol=protocol)
+    except RedactionKeyCollisionError:
+        raise HTTPException(
+            status_code=400,
+            detail="request contains colliding keys after redaction",
+        ) from None
+    except RecursionError:
+        raise _too_deep() from None
+
+
+def _redact_bytes(body: bytes, redactor: SecretRedactor) -> tuple[bytes, RedactionStats]:
+    result = redactor.redact_text(body.decode("utf-8", errors="surrogateescape"))
+    return result.value.encode("utf-8", errors="surrogateescape"), result.stats
+
+
+def _json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _too_deep() -> HTTPException:
+    return HTTPException(status_code=400, detail="JSON request body is nested too deeply")
+
+
+def _undeclared_json(body: bytes) -> tuple[dict[str, Any] | list[Any] | str, bool] | None:
+    """Parse JSON sent without a JSON media type. Its escapes hide secrets from text scans.
+
+    The flag reports repeated keys. Parsing keeps only the last value, so the original bytes
+    can hold values that the structural scan never sees.
+    """
+    repeated_keys = False
+
+    def build(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        nonlocal repeated_keys
+        value = dict(pairs)
+        repeated_keys = repeated_keys or len(value) != len(pairs)
+        return value
+
+    try:
+        payload = json.loads(body, object_pairs_hook=build)
+    except ValueError:
         return None
-    return payload if isinstance(payload, (dict, list)) else None
+    except RecursionError:
+        raise _too_deep() from None
+    return (payload, repeated_keys) if isinstance(payload, (dict, list, str)) else None
 
 
 def _redact_query_params(
@@ -779,13 +830,14 @@ def _target_matches_allowed_url(target_url: str, allowed_url: str) -> bool:
         or _effective_port(target) != _effective_port(allowed)
     ):
         return False
-    target_path = _normalized_url_path(target.path)
     allowed_path = _normalized_url_path(allowed.path).rstrip("/")
-    return (
-        not allowed_path
-        or target_path == allowed_path
-        or target_path.startswith(allowed_path + "/")
-    )
+    if not allowed_path:
+        return True
+    # Servers resolve dot segments at different decoding levels, so no single reading is safe.
+    if ".." in _decoded_url_path(target.path).replace("\\", "/").split("/"):
+        return False
+    target_path = _normalized_url_path(target.path)
+    return target_path == allowed_path or target_path.startswith(allowed_path + "/")
 
 
 def _effective_port(parsed: SplitResult) -> int | None:
@@ -794,9 +846,13 @@ def _effective_port(parsed: SplitResult) -> int | None:
     return {"http": 80, "https": 443}.get(parsed.scheme.lower())
 
 
+def _decoded_url_path(path: str) -> str:
+    # Paths are forwarded as sent. Decode twice so double-encoded dot segments stay visible.
+    return unquote(unquote(path))
+
+
 def _normalized_url_path(path: str) -> str:
-    # Paths are forwarded as sent. Decode twice so double-encoded dot segments stay blocked.
-    return posixpath.normpath("/" + unquote(unquote(path)).lstrip("/"))
+    return posixpath.normpath("/" + _decoded_url_path(path).lstrip("/"))
 
 
 def _is_private_host(host: str) -> bool:

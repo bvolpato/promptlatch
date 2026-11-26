@@ -17,12 +17,13 @@ from promptlatch.config import (
     ObservabilityConfig,
     RedactionConfig,
     RequestCompressionConfig,
+    RuleConfig,
     ServerConfig,
     Settings,
     TargetConfig,
 )
 from promptlatch.history import HistoryReader
-from promptlatch.proxy import _read_request_body, create_app
+from promptlatch.proxy import _read_request_body, _redact_request_body, create_app
 from promptlatch.redaction import SecretRedactor
 from promptlatch.request_compression import zstd
 from tests.fixtures import OPENAI_FAKE, PROVIDER_FIXTURES
@@ -2055,6 +2056,65 @@ async def test_undeclared_json_is_scanned_after_decoding_escapes(content_type: s
         "prompt": "1+1=2 & 100%\n[REDACTED_SECRET]\n",
     }
     assert route.calls[1].request.content == clean_body
+
+
+@pytest.mark.parametrize(
+    "content_type", [None, "text/plain;charset=UTF-8", "application/x-www-form-urlencoded"]
+)
+@pytest.mark.parametrize(
+    ("body", "secrets"),
+    [
+        # Only the text scan reads these keys and numbers.
+        ('{"env":{"PGPASSWORD":"hunter2hunter2"}}', ["hunter2hunter2"]),
+        (
+            '{"env":{"PGPASSWORD":"hunter2hunter2"},"prompt":"a\\n' + OPENAI_FAKE + '"}',
+            ["hunter2hunter2", OPENAI_FAKE],
+        ),
+        (
+            '{"card": 4111111111111111, "prompt": "\\u0041\\u000a' + OPENAI_FAKE + '"}',
+            ["4111111111111111", OPENAI_FAKE],
+        ),
+        # Parsing drops the first value.
+        (
+            '{"p":"\\u0041\\u000a\\u0073' + OPENAI_FAKE[1:] + '","p":"clean"}',
+            [OPENAI_FAKE[1:]],
+        ),
+        ('"\\u0041\\u000a\\u0073' + OPENAI_FAKE[1:] + '"', [OPENAI_FAKE[1:]]),
+    ],
+)
+def test_undeclared_json_secrets_reach_neither_upstream_nor_history(
+    content_type: str | None, body: str, secrets: list[str]
+) -> None:
+    headers = [(b"content-type", content_type.encode())] if content_type else []
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": headers})
+    redactor = SecretRedactor(
+        RedactionConfig(
+            engine="basic",
+            rules=[RuleConfig(type="regex", value=r"\b4\d{15}\b")],
+        )
+    )
+
+    _, content, _, payload = _redact_request_body(request, body.encode(), redactor)
+
+    for secret in secrets:
+        assert secret not in content.decode()
+        assert secret not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
+@pytest.mark.parametrize("depth", [1_500, 200_000])
+async def test_deeply_nested_json_returns_client_error(content_type: str, depth: int) -> None:
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": content_type},
+            content="[" * depth + "]" * depth,
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "JSON request body is nested too deeply"
 
 
 @pytest.mark.asyncio

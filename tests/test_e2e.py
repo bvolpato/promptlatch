@@ -269,7 +269,18 @@ async def test_e2e_allowlist_rejects_path_traversal() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/v1/%2e%2e/admin", "/v1/..%2fadmin", "/v1/%252e%252e/admin"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/%2e%2e/admin",
+        "/v1/..%2fadmin",
+        "/v1/%252e%252e/admin",
+        "/v1/../admin/..%2fv1/keys",
+        "/v1/../admin/..%252fv1/keys",
+        "/v1/../admin/keys%23%2f..%2f..%2fv1",
+        "/v1/..%5cadmin/..%5cv1/keys",
+    ],
+)
 async def test_e2e_allowlist_rejects_encoded_path_traversal(path: str) -> None:
     settings = Settings(
         target=TargetConfig(

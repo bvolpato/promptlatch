@@ -55,11 +55,25 @@ def test_site_publishes_agent_integration_prompt() -> None:
     assert published_prompt == prompt
 
 
+def test_site_publishes_agent_config() -> None:
+    example = (ROOT / "examples" / "promptlatch-agents.config.yaml").read_text(encoding="utf-8")
+
+    assert (ROOT / "site" / "agents.yaml").read_text(encoding="utf-8") == example
+
+
 def test_site_local_assets_exist() -> None:
     site = (ROOT / "site" / "index.html").read_text(encoding="utf-8")
+    styles = (ROOT / "site" / "styles.css").read_text(encoding="utf-8")
+    sources = re.findall(r'(?:src|href|data-prompt-url)="\./([^"?]+)', site)
+    sources += re.findall(r'url\("\./([^"?]+)', styles)
 
-    for source in re.findall(r'src="\./([^"?]+)', site):
+    assert sources
+    for source in sources:
         assert (ROOT / "site" / source).is_file(), source
+    # The site is published under /promptlatch/, where root-relative URLs break.
+    assert not re.search(r"""(?:src|href|url)[=(]"?/""", site + styles)
+    for script in ("highlight.js", "rules.js", "demo.js", "site.js", "prompt.js"):
+        assert f'<script src="./{script}" defer></script>' in site
 
 
 def test_site_dynamic_target_example_includes_allowlist() -> None:

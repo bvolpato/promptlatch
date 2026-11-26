@@ -1380,3 +1380,28 @@ def test_gemini_grounding_media_and_tool_prompt_tokens_disable_plain_text_pricin
     snap = metrics.snapshot()
     assert snap["unsupported_costs"] is True
     assert "private" not in json.dumps(snap)
+
+
+@pytest.mark.parametrize(
+    ("usage", "unsupported"),
+    [
+        ({"speed": "fast"}, True),
+        ({"inference_geo": "us"}, True),
+        ({"iterations": [{"type": "compaction"}, {"type": "message"}]}, True),
+        ({"speed": "standard", "inference_geo": "global"}, False),
+        ({"iterations": [{"type": "message"}]}, False),
+        ({"speed": None, "inference_geo": None, "iterations": None}, False),
+    ],
+)
+def test_usage_with_other_rates_is_not_priced(usage: dict[str, Any], unsupported: bool) -> None:
+    metrics = ResponseMetrics(1)
+    payload = {
+        "type": "message",
+        "model": "claude-opus-5-5",
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5, **usage},
+    }
+    metrics.observe_body(json.dumps(payload).encode())
+
+    assert metrics.snapshot()["unsupported_costs"] is unsupported

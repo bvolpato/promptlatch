@@ -1006,6 +1006,19 @@ class ResponseMetrics:
     def _merge_usage(self, usage: dict[str, Any], *, anthropic: bool) -> None:
         # Providers send null for counters they do not supply.
         usage = _without_nulls(usage)
+        # Fast mode and US inference have their own rates. Totals leave out compaction.
+        iterations = usage.get("iterations")
+        if (
+            usage.get("speed", "standard") != "standard"
+            or usage.get("inference_geo") == "us"
+            or (
+                isinstance(iterations, list)
+                and any(
+                    isinstance(item, dict) and item.get("type") != "message" for item in iterations
+                )
+            )
+        ):
+            self._unsupported_costs = True
         tier = usage.get("service_tier")
         if isinstance(tier, str) and 0 < len(tier) <= 64:
             self._service_tier = tier

@@ -15,7 +15,8 @@ def _bound_text(value: str) -> str | None:
         return None
     if len(value) > MAX_PREVIEW_CHARS:
         value = value[: MAX_PREVIEW_CHARS - 1].rstrip() + "…"
-    return value
+    # JSON can carry lone surrogates, which UTF-8 storage cannot represent.
+    return value.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def bound_preview_text(value: str) -> str | None:

@@ -96,6 +96,20 @@ def test_missing_history_has_no_filesystem_side_effects(tmp_path):
     assert not path.parent.exists()
 
 
+@pytest.mark.parametrize("suffixes", [("",), (".stats.sqlite3",), ("", ".stats.sqlite3")])
+def test_empty_database_files_read_as_empty_history(tmp_path, suffixes):
+    path = tmp_path / "history.sqlite3"
+    for suffix in suffixes:
+        Path(str(path) + suffix).touch(mode=0o600)
+    reader = HistoryReader(path)
+    assert reader.summary()["lifetime_totals"]["requests"] == 0
+    assert reader.requests()["items"] == []
+    assert reader.threads()["items"] == []
+    assert reader.tail()["items"] == []
+    assert reader.request("missing") is None
+    assert reader.thread_for_response("missing") is None
+
+
 def test_private_storage_roundtrip_and_aggregate_unknown_values(tmp_path):
     path = tmp_path / "private" / "history.sqlite3"
     store = HistoryStore(path)
@@ -267,6 +281,22 @@ def test_retention_caps_files_preserves_rollups_and_finishes_evicted_active_requ
     restarted.close()
     assert reader.summary()["storage"]["total_bytes"] <= budget
     assert reader.summary()["totals"]["requests"] == 151
+
+
+def test_pruned_request_count_excludes_the_request_being_finished(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    store = HistoryStore(path, max_database_bytes=256 * 1024)
+    store.start()
+    for index in range(20):
+        request_id = str(index)
+        assert store.submit_start(start_record(request_id, request_body="x" * 3000))
+        store._queue.join()
+        assert store.submit_finish(request_id, finish_record())
+        store._queue.join()
+    store.close()
+    storage = HistoryReader(path).summary()["storage"]
+    assert storage["pruned_requests"] > 0
+    assert storage["pruned_requests"] + storage["retained_requests"] == 20
 
 
 def test_transaction_failure_cannot_partially_increment_totals(tmp_path, monkeypatch, caplog):
@@ -720,6 +750,25 @@ def test_body_memory_pressure_omits_content_without_losing_metrics(tmp_path, mon
     assert detail["user_preview"] is None
     assert detail["assistant_preview"] is None
     assert HistoryReader(path).summary()["totals"]["total_tokens"] == 30
+
+
+def test_finish_under_memory_pressure_keeps_the_captured_body(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    store = HistoryStore(path)
+    store.start()
+    store.submit_start(start_record("one", user_preview="captured preview"))
+    store._queue.join()
+    store._queue_body_limit = 2
+    store.submit_finish(
+        "one", finish_record(outcome="http_error", upstream_error={"message": "over budget"})
+    )
+    store.close()
+    detail = HistoryReader(path).request("one")
+    assert detail is not None
+    assert detail["request_body"] == start_record("one")["request_body"]
+    assert detail["user_preview"] == "captured preview"
+    assert detail.get("body_omitted_reason") is None
+    assert detail["upstream_error"] is None
 
 
 def test_stats_never_contain_request_bodies_or_extra_fields(tmp_path):

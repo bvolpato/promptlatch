@@ -526,10 +526,11 @@ class HistoryStore:
                 self._degraded = True
                 return False
             if body_bytes + self._queued_body_bytes > self._queue_body_limit:
-                record.update(
-                    request_body=None, body_truncated=True, body_omitted_reason="queue_pressure"
-                )
-                record.update(dict.fromkeys(PREVIEW_FIELDS))
+                if kind == "start":
+                    record.update(
+                        request_body=None, body_truncated=True, body_omitted_reason="queue_pressure"
+                    )
+                    record.update(dict.fromkeys(PREVIEW_FIELDS))
                 record["upstream_error"] = None
                 body_bytes = 0
             try:
@@ -1150,7 +1151,7 @@ class HistoryStore:
         history_limit = self._max_storage_pages - stats_limit
         self._set_page_limits(connection, stats_limit, history_limit)
 
-    def _prune(self, connection: sqlite3.Connection, needed: int) -> None:
+    def _prune(self, connection: sqlite3.Connection, needed: int, request_id: str) -> None:
         while True:
             pages = connection.execute("PRAGMA history.page_count").fetchone()[0]
             free = connection.execute("PRAGMA history.freelist_count").fetchone()[0]
@@ -1158,7 +1159,9 @@ class HistoryStore:
                 return
             cursor = connection.execute(
                 "DELETE FROM history.requests WHERE request_id IN "
-                "(SELECT request_id FROM history.requests ORDER BY started_at,request_id LIMIT 32)"
+                "(SELECT request_id FROM history.requests WHERE request_id<>? "
+                "ORDER BY started_at,request_id LIMIT 32)",
+                (request_id,),
             )
             if not cursor.rowcount:
                 return
@@ -1182,7 +1185,7 @@ class HistoryStore:
             body = None
             encoded = _encode(metadata)
             needed = len(encoded.encode("utf-8")) + 5 * _PAGE_SIZE
-        self._prune(connection, needed)
+        self._prune(connection, needed, record["request_id"])
         if needed > self._detail_target:
             return
         connection.execute(
@@ -1218,6 +1221,9 @@ class HistoryReader:
             info = os.fstat(fd)
             db_id = (int(info.st_dev), int(info.st_ino))
             _validate_directory(path.parent)
+            if not info.st_size:
+                # A writer creates files before tables; an empty file holds no history.
+                return None
         finally:
             os.close(fd)
         connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)

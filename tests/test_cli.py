@@ -679,7 +679,8 @@ def test_stats_reports_human_and_json_without_creating_missing_db(tmp_path) -> N
     assert "github_token: 1" in human.output
     assert "openai/gpt-5.4: 2 req" in human.output
     assert "\u2014" not in human.output
-    assert "private" not in human.output
+    # macOS temporary paths resolve under /private/var.
+    assert "private" not in human.output.replace(str(database), "")
     assert "sensitive prompt body" not in human.output
 
     as_json = runner.invoke(app, ["stats", "--config", str(config), "--days", "14", "--json"])

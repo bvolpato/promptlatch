@@ -42,7 +42,7 @@ def _token(
 
 
 # JSON can escape `/` and base64 characters. An escaped delimiter still ends the value.
-SIGNED_VALUE_CHAR = r"(?:[^&#\s\"'<>`\\)]|\\/|\\u(?!00(?:2[0-9]|3[CcEe]))[0-9A-Fa-f]{4})"
+SIGNED_VALUE_CHAR = r"(?:[^&#\s\"'<>`\\)]|\\{1,4}/|\\{1,4}u(?!00(?:2[0-9]|3[CcEe]))[0-9A-Fa-f]{4})"
 
 BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("anthropic_key", _token(r"sk-ant-", r"[A-Za-z0-9_-]{20,}")),
@@ -167,7 +167,7 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             # Code uses these names for other things, so the value must look like a key.
             r"(?:account|access)[_-]?keys?(?![_-]?(?:id|name))"
             r"(?=[A-Za-z0-9_.-]{0,128}\\*[\"']?[ \t]*[:=][ \t]*\\*[\"']?"
-            r"(?=[A-Za-z+/_=-]{0,64}[0-9])[A-Za-z0-9+/_=-]{16,}(?![A-Za-z0-9.(\[])))"
+            r"(?=[A-Za-z+/_=-]{0,64}[0-9])[A-Za-z0-9+/_=-]{16,}(?![A-Za-z0-9+/_=.(\[-])))"
             r"[A-Za-z0-9_.-]{0,128})"
             r"\\*(?P=key_quote)\s*[:=]\s*(?P<value_quote>(?:\\*[\"'])?))"
             r"(?P<secret>[^\"'\s;\[\]]{8,})(?P=value_quote)"
@@ -195,8 +195,9 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"mariadb(?:\+[a-z0-9_]+)?|mongodb(?:\+srv)?|rediss?|amqps?|"
             r"clickhouse(?:s|db)?(?:\+[a-z0-9_]+)?)://"
             r"[^:\s/@]*:)(?![0-9]+/)"
-            # A quote can be part of the password. Before JSON punctuation it ends the string.
-            r"((?:[^@\s/\"]|\"(?!\s*[,:}\]]))+(?:/[^@\s/?#\"'<>`,\\]+)*(?:@[^@\s/?#\"'<>`,\\]+)*)(@)"
+            # A quote can be part of the password. Before JSON structure it ends the string.
+            r"((?:[^@\s/\"]|"
+            r"\"(?![}\])\s]{0,8}(?:,\s{0,8}[\"'{\[]|:\s{0,8}[\"'{\[0-9-]|[;,]?(?:\s|$))))+(?:/[^@\s/?#\"'<>`,\\]+)*(?:@[^@\s/?#\"'<>`,\\]+)*)(@)"
         ),
     ),
 ]

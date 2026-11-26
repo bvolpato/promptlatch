@@ -11,10 +11,11 @@ import re
 import threading
 from bisect import bisect_right
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
+from itertools import pairwise
 from types import GeneratorType
 from typing import Any, Literal
 
@@ -121,9 +122,14 @@ _TOKEN_COUNT_LABEL = re.compile(
 _BLOCK_OPENER = re.compile(
     r"[ \t}]*(?:async[ \t]+)?(?:case|class|def|elif|except|for|if|match|when|while|with)\b.*:[ \t]*"
 )
+_WORD_OR_SIGN = re.compile(r"[A-Za-z_]\w*|[^\w\s]")
+_OPENER_WORDS = frozenset(
+    {"and", "as", "async", "await", "case", "class", "def", "elif", "except", "for", "if", "in",
+     "is", "match", "not", "or", "when", "while", "with"}
+)  # fmt: skip
 _NEXT_STATEMENT = re.compile(
     r"(?:continue|raise|return)(?=\s|$)|"
-    r"[A-Za-z_][A-Za-z_.-]*(?::(?=\s|$)|[ \t]+[-+*/|&]?=[ \t]|[(\[])"
+    r"[A-Za-z_][A-Za-z_.-]*(?:[ \t]+[-+*/|&]?=[ \t]|[(\[])"
 )
 
 # These plugins report a value because of where it stands, not because of its shape.
@@ -134,14 +140,19 @@ _MAPPING_KEY = re.compile(r"[A-Za-z_][A-Za-z_.-]*")
 # A quoted mapping key is a label, not a value.
 _CLOSING_QUOTE = re.compile(r"\\*[\"'`](?!\s*:)")
 _VALUE_LABEL = re.compile(
-    r"(?i)(?:api[_-]?key|credential|passw(?:or)?d|pwd|secret|token)[a-z0-9_.-]{0,32}"
-    r"\\*[\"'`]?[ \t]*(?:[=:!]=|[:=>])[ \t]*\\*[\"'`]?$"
+    r"(?i)(?P<option>--?[a-z0-9-]{0,32})?"
+    r"(?:api[_-]?key|credential|passw(?:or)?d|passphrase|pwd|secret|token|"
+    r"(?:access|account|auth|encryption|private|signing)[_-]?key|"
+    r"(?<![a-z])(?:pass|auth(?:orization)?)(?![a-z]))[a-z0-9_.-]{0,32}"
+    r"(?:\[[^\]\n]{0,16}\])?\\*[\"'`]?"
+    r"(?:[ \t]*(?:[=:!?+]=|[:=>])[ \t]*(?:(?:basic|bearer|token)[ \t]+)?|(?(option)[ \t]+|(?!)))"
+    r"\\*[\"'`]?$"
 )
 _LINE_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 _PLAIN_WORD = re.compile(r"[A-Za-z][a-z]*|[A-Z]+")
 _FIELD_NAME = re.compile(r"[A-Za-z_.]+")
 _TYPE_NAMES = frozenset(
-    {"any", "bool", "boolean", "bytes", "false", "float", "int", "integer", "nil", "none",
+    {"any", "array", "bool", "boolean", "bytes", "false", "float", "int", "integer", "nil", "none",
      "null", "number", "object", "str", "string", "true", "undefined"}
 )  # fmt: skip
 # The other plugins can stop inside a longer token.
@@ -354,9 +365,25 @@ def _is_next_statement(value: str, start: int) -> bool:
     if label_end is None or _NEXT_STATEMENT.match(value, start) is None:
         return False
     label_start = value.rfind("\n", max(0, label_end - 512), label_end) + 1
-    return (label_start > 0 or label_end <= 512) and _BLOCK_OPENER.fullmatch(
-        value, label_start, label_end
-    ) is not None
+    if (not label_start and label_end > 512) or (
+        _BLOCK_OPENER.fullmatch(value, label_start, label_end) is None
+    ):
+        return False
+    # Two plain words in a row are prose, such as `for staging use this password:`.
+    words = _WORD_OR_SIGN.findall(value, label_start, label_end)
+    return not any(
+        all(word[0].isalnum() and word not in _OPENER_WORDS for word in pair)
+        for pair in pairwise(words)
+    )
+
+
+def _every_occurrence(secret: str, value: str, test: Callable[[str, int], object]) -> bool:
+    found = False
+    for start, _ in _occurrences(secret, value):
+        if not test(value, start):
+            return False
+        found = True
+    return found
 
 
 def _line_above(value: str, start: int) -> int | None:
@@ -405,7 +432,7 @@ def _is_common_value(secret: str) -> bool:
 
 def _is_value_position(value: str, start: int, end: int) -> bool:
     """Recognize a labeled or quoted value, a URL password, or the rest of an INI line."""
-    if _VALUE_LABEL.search(value[max(0, start - 64) : start]) is not None:
+    if _VALUE_LABEL.search(value[max(0, start - 96) : start]) is not None:
         return True
     before = value[max(0, start - 1) : start]
     if before == ":" and value.startswith("@", end):
@@ -1820,18 +1847,22 @@ class SecretRedactor:
                 for sentinel, original_tag in sentinel_map.items():
                     if sentinel in secret_value:
                         secret_value = secret_value.replace(sentinel, original_tag)
-            starts: list[int] = []
+            entry = None
             if secret_type == "Secret Keyword":
                 # An INI transformer reads the body of `if token:` as the value of `token`.
-                starts = [start for start, _ in _occurrences(secret_value, original)]
-                if starts and all(
-                    _is_next_statement(original, start) or _is_token_count(original, start)
-                    for start in starts
+                if _every_occurrence(
+                    secret_value,
+                    original,
+                    lambda text, start: (
+                        _is_next_statement(text, start) or _is_token_count(text, start)
+                    ),
                 ):
                     continue
-            nested = bool(starts) and all(
-                _line_above(original, start) is not None for start in starts
-            )
+                entry = _MAPPING_ENTRY.match(secret_value)
+                if entry is not None and not _every_occurrence(
+                    secret_value, original, lambda text, start: _line_above(text, start) is not None
+                ):
+                    entry = None
             if secret_type == "GitHub Token" and len(secret_value) < 30:
                 continue
             if secret_type == "Artifactory Credentials":
@@ -1840,7 +1871,6 @@ class SecretRedactor:
                 secret_value = secret_value.strip("\"'")
             if not secret_value:
                 continue
-            entry = _MAPPING_ENTRY.match(secret_value) if nested else None
             if entry is not None:
                 value, count = self._replace_mapping_value(secret_value, entry, value)
             else:
@@ -1857,7 +1887,7 @@ class SecretRedactor:
         item = secret_value[entry.end() :]
         if (
             not item
-            or entry.group(1) in _SCHEMA_KEYWORDS
+            or (entry.group(1) in _SCHEMA_KEYWORDS and item.isdigit())
             or item.lower() in _TYPE_NAMES
             or self._is_placeholder(item)
         ):

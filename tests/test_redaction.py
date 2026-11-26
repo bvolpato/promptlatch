@@ -1706,6 +1706,10 @@ def test_distinctive_labeled_value_is_still_redacted_everywhere() -> None:
         "accessKey: process.env.S3_ACCESS_KEY,",
         "access_key=self.access_key",
         "access_key: Optional",
+        "access_key=get_s3_access_key_value(x)",
+        "for x in tokens:\n    process_everything(x)",
+        '{"a":"redis://h:6379"},{"b":"x@y"}',
+        '{"r":{"a":"redis://h:6379"},"b":"x@y"}',
         "a: 1\npassword:\n  type: string\n  minLength: 8\n",
     ],
 )
@@ -1728,6 +1732,11 @@ def test_code_and_config_that_name_a_field_are_unchanged(
         ("secrets", "db-main: {}"),
         ("api_key", "prod = {}"),
         ("if you need the password", "{}"),
+        ("for staging use this password", "admin: {}"),
+        ("with this token", "value: {}"),
+        ("for staging use this password", "admin = {}"),
+        ("passwords", "type: {}"),
+        ("secrets", "format: {}"),
     ],
 )
 def test_mapping_under_a_sensitive_label_is_redacted(
@@ -1769,6 +1778,12 @@ def test_next_label_is_not_read_as_the_value_of_an_empty_label(
         ("hunter", "mysql --password={} -h db"),
         ("hunter", "password: {}, user: bob"),
         ("hunter", "<password>{}</password>"),
+        ("hunter", "DB_PASS={} psql -h db"),
+        ("hunter", "auth_key={} x"),
+        ("hunter", "Authorization: Basic {} x"),
+        ("hunter", "login --password {} -h db"),
+        ("hunter", "password[0] = {} x"),
+        ("hunter", "PASSWORD?={} x"),
         ("s3cret", "PGPASSWORD={} psql -h db"),
         ("s3cret", "log in with {} now"),
         ("my-secret-passphrase", "sshpass -p {}"),
@@ -1816,6 +1831,7 @@ def test_nested_schema_text_under_a_sensitive_name_is_redacted() -> None:
     "text",
     [
         'postgres://u:Opaque"Fixture1@db/app',
+        'postgres://u:Opaque"}Fixture1@db/app',
         '{"dsn":"postgres://u:Opaque\\"Fixture1@db/app"}',
         r"https:\/\/h\/o?X-Amz-Security-" + r"Token=Opaque\/Fixture1+a\u002Bb==&X-Amz-Date=1",
         "×" + "gh" + "p_" + "Fixture1" + "0" * 30,

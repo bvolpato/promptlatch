@@ -9,6 +9,7 @@ import os
 import queue
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -403,7 +404,7 @@ class HistoryStore:
         self._warned_counts = (0, 0)
         self._last_warning = float("-inf")
         self._last_error: str | None = None
-        self._writer_lock_fd: int | None = None
+        self._writer_lock_fds: list[int] = []
         self._queued_body_bytes = 0
         self._queue_body_limit = min(32 * 1024 * 1024, max_database_bytes // 8)
         # Reserve both databases plus a full rollback copy of each page. The
@@ -594,25 +595,29 @@ class HistoryStore:
             import fcntl
         except ImportError as exc:
             raise RuntimeError("Local history requires POSIX advisory file locks") from exc
-        # Never lock a database file itself. macOS and BSD flock() locks conflict with
-        # the fcntl() locks SQLite takes, so the writer would block its own connection.
-        path = _lock_path(self.database_path)
-        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        # macOS and BSD flock() locks conflict with the fcntl() locks SQLite takes, so a lock
+        # on a database file would block the writer's own connection.
+        paths = [_lock_path(self.database_path)]
+        if sys.platform == "linux":
+            # Releases 0.2.6 to 0.2.11 lock this file. On Linux, the lock types are independent.
+            paths.append(_stats_path(self.database_path))
         try:
-            _validate_file(fd)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for path in paths:
+                flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+                fd = os.open(path, flags, 0o600)
+                self._writer_lock_fds.append(fd)
+                _validate_file(fd)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(fd)
+            self._release_writer_lock()
             raise RuntimeError("Another history writer is already using this database") from None
         except BaseException:
-            os.close(fd)
+            self._release_writer_lock()
             raise
-        self._writer_lock_fd = fd
 
     def _release_writer_lock(self) -> None:
-        if self._writer_lock_fd is not None:
-            os.close(self._writer_lock_fd)
-            self._writer_lock_fd = None
+        while self._writer_lock_fds:
+            os.close(self._writer_lock_fds.pop())
 
     def _startup_pages(self, path: Path) -> int:
         """Inspect SQLite headers without triggering journal recovery or writes."""

@@ -873,6 +873,7 @@ def test_exclusive_writer_lock_allows_readers_and_releases_on_close(tmp_path):
     assert HistoryReader(path).summary()["totals"]["requests"] == 1
 
 
+@pytest.mark.skipif(sys.platform == "linux", reason="Linux keeps the lock types independent")
 def test_writer_lock_leaves_sqlite_files_unlocked(tmp_path):
     # flock() on a database file blocks SQLite itself on macOS and BSD.
     fcntl = pytest.importorskip("fcntl")
@@ -885,6 +886,26 @@ def test_writer_lock_leaves_sqlite_files_unlocked(tmp_path):
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         store.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="0.2.11 history does not start elsewhere")
+def test_writer_lock_excludes_earlier_releases(tmp_path):
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / "history.sqlite3"
+    # Releases 0.2.6 to 0.2.11 lock the stats database.
+    with path.with_name(path.name + ".stats.sqlite3").open("w+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="Another history writer"):
+            HistoryStore(path).start()
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+        store = HistoryStore(path)
+        store.start()
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            store.close()
 
 
 def test_response_thread_link_is_indexed_and_survives_restart(tmp_path):

@@ -873,6 +873,20 @@ def test_exclusive_writer_lock_allows_readers_and_releases_on_close(tmp_path):
     assert HistoryReader(path).summary()["totals"]["requests"] == 1
 
 
+def test_writer_lock_leaves_sqlite_files_unlocked(tmp_path):
+    # flock() on a database file blocks SQLite itself on macOS and BSD.
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / "history.sqlite3"
+    store = HistoryStore(path)
+    store.start()
+    try:
+        for database in (path, path.with_name(path.name + ".stats.sqlite3")):
+            with database.open("rb") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        store.close()
+
+
 def test_response_thread_link_is_indexed_and_survives_restart(tmp_path):
     path = tmp_path / "history.sqlite3"
     store = HistoryStore(path)

@@ -167,6 +167,10 @@ def _stats_path(path: Path) -> Path:
     return path.with_name(path.name + ".stats.sqlite3")
 
 
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
 def _file_bytes(path: Path) -> int:
     total = 0
     for suffix in ("", "-journal", "-wal", "-shm"):
@@ -590,7 +594,9 @@ class HistoryStore:
             import fcntl
         except ImportError as exc:
             raise RuntimeError("Local history requires POSIX advisory file locks") from exc
-        path = _stats_path(self.database_path)
+        # Never lock a database file itself. macOS and BSD flock() locks conflict with
+        # the fcntl() locks SQLite takes, so the writer would block its own connection.
+        path = _lock_path(self.database_path)
         fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         try:
             _validate_file(fd)

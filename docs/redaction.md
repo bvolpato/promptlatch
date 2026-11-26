@@ -19,8 +19,7 @@ Coverage includes fixture-shaped examples for:
 - User-defined exact-tail and regex rules for private formats.
 
 JSON, query parameters, and URL-encoded form fields are scanned structurally.
-A body that parses as a JSON object or array is scanned as JSON even without a JSON
-content type.
+A body that parses as JSON without a JSON content type is scanned as text and as JSON.
 Other unencoded text bodies are scanned without changing unrelated bytes.
 Multipart uploads are rejected with `415` while redaction is enabled: raw byte
 scanning cannot reliably protect attachment contents or form fields. Incoming
@@ -39,7 +38,8 @@ safe to share between threads.
 ## Verify redaction
 
 A model reply cannot verify the forwarded request. Send a fixture token to an echo
-endpoint and inspect the echoed body:
+endpoint and inspect the echoed body. Use a config without a target allowlist, such as
+the one from `promptlatch init`:
 
 ```bash
 FAKE_GEMINI_KEY="AI""zaSyFixtureToken000000000000000000000"
@@ -58,7 +58,7 @@ Expected output:
 GEMINI_API_KEY=[REDACTED_SECRET]
 ```
 
-Audit logs omit matched values and include counts and rule names. Test rules
+Audit logs omit matched values and include the request path, counts, and rule names. Test rules
 directly from the terminal or in pre-commit scripts without starting the proxy:
 
 ```bash
@@ -76,7 +76,8 @@ and any loopback proxy `/healthz` endpoint (including running-version drift);
 ## Security boundary
 
 - Request bodies and query parameters are scanned before they leave your machine.
-- Audit logs record redaction counts and rule names without storing secret values.
+- URL paths and header values are not scanned. Encoded text such as base64 is not decoded.
+- Audit logs record the request path, redaction counts, and rule names. They do not record matched values.
 - Local request history stores redacted bodies and metrics. Redacted prompts can
   still contain private information; use metadata-only storage when needed.
 - When request history is enabled, it can also retain a small allowlist of upstream

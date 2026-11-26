@@ -11,10 +11,11 @@ Report vulnerabilities privately through GitHub Security Advisories for this rep
 
 ## What it does
 
-- No telemetry, analytics, or phone-home behavior.
+- No telemetry or analytics. The only outside request that PromptLatch makes on its own is a daily download of a public price list, which sends no prompts, keys, or usage. `observability.pricing_enabled: false` turns it off.
 - Redaction runs locally with deterministic `bc-detect-secrets` plugins plus provider rules.
 - Request scanning stays in memory and does not write prompt bodies to temporary files.
-- Audit logs contain redaction counts and rule names without storing secret values.
+- Local history stores redacted request bodies by default. `observability.store_request_bodies: false` keeps metadata only.
+- Audit logs contain the request path, redaction counts, and rule names. They do not contain the matched values.
 - Client-supplied auth headers are dropped unless forwarding is explicitly configured.
 - Private/loopback target URLs are blocked by default to reduce SSRF risk.
 
@@ -27,6 +28,8 @@ Report vulnerabilities privately through GitHub Security Advisories for this rep
 - Private-target checks validate DNS before connection but do not pin that resolution. Allow only trusted upstream hostnames.
 - Emergency request tracing can print raw request bodies locally.
 - Provider responses pass through without scanning or redaction.
+- URL paths and header values are forwarded without scanning. A secret in a URL path also reaches the audit log and history.
+- Base64 and other encoded text is not decoded before scanning. Binary and image content is not scanned.
 - Detection quality depends on known provider formats, labeled values, connection-string shapes, and configured tail/regex rules.
 - Entropy-only matching is disabled to avoid unpredictable false positives.
 

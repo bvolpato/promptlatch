@@ -13,6 +13,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+RELEASE_DOCS = (
+    "AGENTS_DEPLOY.md",
+    "AGENTS_MONITOR.md",
+    "CONTRIBUTING.md",
+    "PROMPT.md",
+    "README.md",
+    "docs/deployment.md",
+    "site/PROMPT.md",
+    "site/index.html",
+)
+DOC_VERSION = re.compile(r"(?:promptlatch[:-]|/download/v|^VERSION=)(\d+\.\d+\.\d+)", re.MULTILINE)
 TAG = re.compile(r"^v(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$")
 
 
@@ -119,6 +130,15 @@ def main() -> None:
     ]
     if missing_references:
         raise SystemExit("release references missing: " + ", ".join(missing_references))
+
+    stale_references = [
+        f"{name}={version}"
+        for name in RELEASE_DOCS
+        for version in DOC_VERSION.findall((ROOT / name).read_text(encoding="utf-8"))
+        if version != expected
+    ]
+    if stale_references:
+        raise SystemExit("stale release references: " + ", ".join(stale_references))
 
     print(f"release check: {expected}")
 

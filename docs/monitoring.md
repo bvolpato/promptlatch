@@ -95,7 +95,7 @@ Recognized LLM streams that end without a completion event show `stream_incomple
 - **Usage:** provider-reported input, output, and total tokens. Missing usage stays unknown. PromptLatch does not substitute character counts. Reasoning, cached input, and cache-write tokens appear when supplied. Response parsing recognizes JSON and SSE even when the content type is missing or incorrect. Requests show why metrics are unavailable. Old captures cannot recover unrecorded usage.
 - **Cost:** estimates from a bundled [LiteLLM pricing catalog](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json) snapshot and its public pricing map for supported exact model matches. The LiteLLM SDK is not required. Catalog version and checksum identify offline rates. Unknown models, usage, or unsupported pricing remain unknown. Estimates are not invoices.
 
-The pricing map refreshes in the background daily. No prompts, keys, model selections, or usage are sent to the pricing source. To disable the download, set `observability.pricing_enabled: false`.
+The pricing map refreshes in the background daily. No prompts, keys, model selections, or usage are sent to the pricing source. To disable the download and all cost estimates, set `observability.pricing_enabled: false`.
 
 ChatGPT subscription calls use equivalent OpenAI API token rates, labeled **API-price equivalent**. These estimates compare API usage costs and are not subscription charges. Non-LLM requests do not count as missing LLM usage or pricing.
 
@@ -119,7 +119,7 @@ A bounded background writer keeps SQLite work off the request event loop. Droppe
 
 One server process can write to each history database, guarded by `<database_path>.lock`. Use separate database paths for multiple proxy workers. Starting a second writer against the same path fails.
 
-For containers, mount a persistent writable volume and set `XDG_STATE_HOME` or `PROMPTLATCH_OBSERVABILITY_DATABASE_PATH` inside it. Enable the dashboard on that server when needed. It uses the same history and listening port.
+For containers, mount a persistent writable volume and set `XDG_STATE_HOME` or `PROMPTLATCH_OBSERVABILITY_DATABASE_PATH` inside it. The Helm chart has no value for a persistent volume and uses `emptyDir`. Enable the dashboard on that server when needed. It uses the same history and listening port.
 
 ## Settings
 

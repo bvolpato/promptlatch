@@ -2,13 +2,17 @@
 
 PromptLatch reads `~/.config/promptlatch/config.yaml` by default. Pass `--config <path>` to use another file. To create a starting file, run `promptlatch init`.
 
-`${NAME}` values are read from the environment, so keep keys out of the file.
+Keep keys out of the file. A value that is exactly `${NAME}` is read from the environment. Text such as `prefix-${NAME}` is not expanded. If the variable is not set, the value is empty. For `server.api_key`, also set `server.require_api_key: true`, so that a missing variable stops startup and does not turn off proxy authentication.
+
+[Environment variables](#environment-variables) override the file.
 
 ```yaml
 server:
   host: 127.0.0.1
   port: 8000
   api_key: null
+  require_api_key: false
+  debug_max_body_chars: 20000
   max_request_body_bytes: 0
   max_decompressed_request_body_bytes: 67108864
 
@@ -29,9 +33,11 @@ redaction:
   enabled: true
   engine: detect-secrets
   redact_mode: full
+  placeholder: "[REDACTED_SECRET]"
   encrypted: false
   max_extra_rules: 20
   max_extra_rule_chars: 1024
+  max_extra_rules_header_bytes: 16384
   allow_extra_regex_rules: false
   rules:
     - type: exact
@@ -48,6 +54,13 @@ observability:
   store_request_bodies: true
   pricing_enabled: true
   dashboard_enabled: false
+
+audit:
+  enabled: true
+  file: null
+
+compat:
+  responses_to_chat: false
 ```
 
 ## Redaction modes
@@ -56,15 +69,43 @@ observability:
 | --- | --- | --- |
 | `full` (default) | `[REDACTED_SECRET]` | Most setups. |
 | `tagged` | `[REDACTED:<rule>#<8-hex-hmac>]` | Multi-turn prompts and traces that must tell identical credentials from different ones. |
-| `partial` | First and last characters plus a digest | Local debugging. History does not store request bodies in this mode. |
+| `partial` | First and last characters plus a keyed tag for long token matches, `[REDACTED_SECRET]` for the rest | Local debugging. History does not store request bodies in this mode. |
 
-Tagged placeholders expose no secret characters. The HMAC key is random per process by default. For tags that stay the same across restarts, set `redaction.tag_key` or `PROMPTLATCH_REDACTION_TAG_KEY` to at least 16 characters.
+Tagged placeholders expose no secret characters. One call tags at most 64 different values, and further values get `[REDACTED_SECRET]`. The HMAC key is random per process by default. For tags that stay the same across restarts, set `redaction.tag_key` or `PROMPTLATCH_REDACTION_TAG_KEY` to at least 16 characters.
 
 ## Custom rules
 
-Add a rule for each private token format. Store only the tail of a key in an exact rule. Exact values of 16 characters or fewer match as a tail inside a longer value.
+Add a rule for each private token format. An exact value needs at least 8 characters.
 
-Per-request rules are exact matches by default. Regex rules remain available in trusted config. Set `redaction.allow_extra_regex_rules: true` only for authenticated clients that you trust.
+- An exact value of 8 to 16 characters is a tail. It matches only at the end of a longer token, with at least 8 token characters before it. Store the tail of a key in this form.
+- An exact value of 17 or more characters matches wherever it appears.
+- For a short value that appears on its own, such as a 12-character password, use a regex rule.
+
+To add rules to one request, send them as JSON in the `X-Redact-Extra-Rules` header. The proxy removes this header before forwarding:
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H 'X-Redact-Extra-Rules: [{"type":"exact","value":"project-bluebird-internal"}]' \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-6-sol","input":"status of project-bluebird-internal"}'
+```
+
+Per-request rules are exact matches by default. Set `redaction.allow_extra_regex_rules: true` only for authenticated clients that you trust.
+
+## Environment variables
+
+Set a variable to override one config value:
+
+| Variable | Config value |
+| --- | --- |
+| `PROMPTLATCH_CONFIG` | Config file path |
+| `PROMPTLATCH_HOST`, `PROMPTLATCH_PORT` | `server.host`, `server.port` |
+| `PROMPTLATCH_SERVER_API_KEY`, `PROMPTLATCH_REQUIRE_SERVER_API_KEY` | `server.api_key`, `server.require_api_key` |
+| `PROMPTLATCH_TARGET_BASE_URL`, `PROMPTLATCH_TARGET_API_KEY`, `PROMPTLATCH_TARGET_API_KEY_HEADER` | `target.default_base_url`, `target.api_key`, `target.api_key_header` |
+| `PROMPTLATCH_FORWARD_CLIENT_AUTHORIZATION`, `PROMPTLATCH_TARGET_TIMEOUT_SECONDS` | `target.forward_client_authorization`, `target.timeout_seconds` |
+| `PROMPTLATCH_REDACTION_ENABLED`, `PROMPTLATCH_REDACTION_ENGINE`, `PROMPTLATCH_REDACTION_MODE`, `PROMPTLATCH_REDACTION_TAG_KEY` | `redaction.enabled`, `redaction.engine`, `redaction.redact_mode`, `redaction.tag_key` |
+| `PROMPTLATCH_RESPONSES_TO_CHAT` | `compat.responses_to_chat` |
+| `PROMPTLATCH_DASHBOARD_ENABLED`, `PROMPTLATCH_OBSERVABILITY_<SETTING>` | `observability.dashboard_enabled`, `observability.<setting>` |
 
 ## Request size limits
 

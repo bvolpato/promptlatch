@@ -9,10 +9,10 @@
 
 ## Docker
 
-Create an environment file for the published image:
+Create an environment file for the published image at `~/.config/promptlatch/provider.env`
+with mode `0600`:
 
-```bash
-# ~/.config/promptlatch/provider.env, mode 0600
+```text
 PROMPTLATCH_TARGET_BASE_URL=https://api.openai.com/v1
 PROMPTLATCH_TARGET_API_KEY=<openai-upstream-key>
 ```
@@ -112,8 +112,9 @@ helpers does not load user config until a command or app requests it.
 ## Upgrading from PromptCloak
 
 Version 0.2 renamed the package, command, environment variables, config directory,
-container image, and Helm chart. Old Python imports, environment variables, and default
-config path remain compatible through 0.2.x and emit migration warnings.
+container image, and Helm chart. Old Python imports, environment variables, and the old
+default config path still work in 0.3 and emit migration warnings. A later release can
+remove them.
 
 Remove the old uv tool so a stale `promptcloak` command cannot shadow the new install:
 
@@ -121,7 +122,8 @@ Remove the old uv tool so a stale `promptcloak` command cannot shadow the new in
 uv tool uninstall promptcloak
 ```
 
-Move local config before switching services:
+Move local config before switching services. If `~/.config/promptlatch` already exists, move
+the files one by one instead:
 
 ```bash
 mv ~/.config/promptcloak ~/.config/promptlatch

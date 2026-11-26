@@ -13,7 +13,7 @@ Coding agents read your `.env`, your logs, and your configs, then send them to a
 
 - **Use it as a proxy** for Claude Code, Codex, Gemini CLI, OpenCode, or any client with a custom base URL.
 - **Use it as a Python library** to redact text, messages, or payloads before an SDK call.
-- **It stays local.** Rules are deterministic, with no model calls and no telemetry.
+- **It stays local.** Rules are deterministic, with no model calls and no telemetry. The proxy downloads a public price list once a day for cost estimates and sends no data about you. To turn this off, set `observability.pricing_enabled: false`.
 
 [Try the live demo](https://bvolpato.github.io/promptlatch/) or start below.
 
@@ -21,7 +21,7 @@ Coding agents read your `.env`, your logs, and your configs, then send them to a
 
 ### Coding agents
 
-Install PromptLatch and start the proxy:
+Install PromptLatch with [uv](https://docs.astral.sh/uv/getting-started/installation/), which also supplies Python, and start the proxy:
 
 ```bash
 uv tool install promptlatch
@@ -38,7 +38,7 @@ In another terminal, use the wrapper for your agent:
 | `codex` | `codex-latch` |
 | `gemini` | `gemini-latch` |
 
-The wrappers keep your login and do not edit your agent's config files. If the proxy is down or redaction is off, they stop instead of sending unredacted prompts. For OpenCode, OpenRouter, and manual setup, see the [agent guide](https://github.com/bvolpato/promptlatch/blob/main/docs/agents.md).
+The wrappers keep your login and do not edit your agent's config files. If the proxy is down or redaction is off, they stop instead of sending unredacted prompts. For OpenCode, OpenRouter, and manual setup, see the [agent guide](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md).
 
 ### Any API client
 
@@ -89,10 +89,15 @@ Test a string without starting anything:
 
 ```bash
 promptlatch scan 'DATABASE_URL=postgres://app:example-password@db/prod'
-# DATABASE_URL=postgres://app:[REDACTED_SECRET]@db/prod
 ```
 
-A model's reply cannot prove what the proxy sent. To check a running proxy, send a fake key to an echo server and read what arrived:
+```text
+DATABASE_URL=postgres://app:[REDACTED_SECRET]@db/prod
+```
+
+For agents, send a request through a wrapper and read what left your machine in the [inspector](#see-what-was-sent).
+
+A model's reply cannot prove what the proxy sent. To check the API client setup, send a fake key to an echo server and read what arrived:
 
 ```bash
 FAKE_KEY="AI""zaSyFixtureToken000000000000000000000"
@@ -102,10 +107,13 @@ curl --compressed -fsS http://127.0.0.1:8000/post \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"content":"GEMINI_API_KEY='"$FAKE_KEY"'"}]}' \
   | jq -r '.data.messages[0].content'
-# GEMINI_API_KEY=[REDACTED_SECRET]
 ```
 
-This needs a config without a target allowlist, such as the one from `promptlatch init`. The agent config above allows the official provider endpoints only.
+```text
+GEMINI_API_KEY=[REDACTED_SECRET]
+```
+
+The agent config rejects this request, because it allows the official provider endpoints only. Use a config without a target allowlist, such as the one from `promptlatch init`.
 
 ## What it redacts
 
@@ -124,6 +132,7 @@ Matching uses provider patterns and [bc-detect-secrets](https://github.com/bridg
 - It does not know private token formats that no rule describes. Add a [custom rule](https://github.com/bvolpato/promptlatch/blob/main/docs/configuration.md#custom-rules).
 - It does not scan provider responses, MCP traffic, or tool subprocesses.
 - It does not scan multipart uploads. The proxy rejects them with `415`.
+- It does not scan URL paths or header values, and it does not decode base64 or other encoded text.
 - It does not anonymize. Names, source code, and other private text pass through.
 
 Read [SECURITY.md](https://github.com/bvolpato/promptlatch/blob/main/SECURITY.md) before you share a proxy or bind it beyond loopback.
@@ -133,10 +142,11 @@ Read [SECURITY.md](https://github.com/bvolpato/promptlatch/blob/main/SECURITY.md
 The proxy keeps a local history of redacted requests, token usage, latency, and cost estimates:
 
 ```bash
-promptlatch stats --days 7        # usage, cost, and redactions by rule
-promptlatch tail --follow         # live requests
-promptlatch serve --dashboard     # web inspector at http://127.0.0.1:8000/
+promptlatch stats --days 7
+promptlatch tail --follow
 ```
+
+For the web inspector, start the proxy with `promptlatch serve --dashboard` and open `http://127.0.0.1:8000/`. The agent config already enables it. Sign in with the token from the file that `serve` names at startup.
 
 ![PromptLatch dashboard with a captured conversation in which credentials appear as REDACTED_SECRET](https://raw.githubusercontent.com/bvolpato/promptlatch/main/site/dashboard.png)
 
@@ -174,10 +184,10 @@ To let a coding agent do the setup, give it [PROMPT.md](https://github.com/bvolp
 
 ## Documentation
 
-- [Coding agents](https://github.com/bvolpato/promptlatch/blob/main/docs/agents.md): wrappers, Claude Code, Codex, OpenCode
+- [Coding agents](https://github.com/bvolpato/promptlatch/blob/main/docs/coding-agents.md): wrappers, Claude Code, Codex, OpenCode
 - [Providers and routes](https://github.com/bvolpato/promptlatch/blob/main/docs/providers.md): per-request targets, auth headers, streaming
 - [Python library](https://github.com/bvolpato/promptlatch/blob/main/docs/library.md): helpers, SDK examples, custom rules
-- [Configuration](https://github.com/bvolpato/promptlatch/blob/main/docs/configuration.md): all settings, redaction modes, compression, rule encryption
+- [Configuration](https://github.com/bvolpato/promptlatch/blob/main/docs/configuration.md): settings, environment variables, redaction modes, compression, rule encryption
 - [Redaction](https://github.com/bvolpato/promptlatch/blob/main/docs/redaction.md): coverage, body handling, verification
 - [Local monitoring](https://github.com/bvolpato/promptlatch/blob/main/docs/monitoring.md): dashboard, metrics, storage
 - [Deployment](https://github.com/bvolpato/promptlatch/blob/main/docs/deployment.md): Docker, Helm, health checks, upgrades

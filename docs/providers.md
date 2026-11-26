@@ -27,8 +27,9 @@ curl http://127.0.0.1:8000/v1/responses \
 ```
 
 Set `X-Target-API-Key-Header: x-api-key` for Anthropic-style upstream authentication,
-or `X-Target-API-Key-Header: x-goog-api-key` for Google Gemini API keys (do not pass
-API keys in `?key=` query parameters, as PromptLatch redacts query-string secrets).
+or `X-Target-API-Key-Header: x-goog-api-key` for Google Gemini API keys. Do not pass a
+Gemini key in the `?key=` query parameter. PromptLatch drops that parameter unless client
+auth forwarding is on.
 
 Configured target keys are bound to `target.default_base_url`. A dynamic target that
 requires authentication must receive its key through `X-Target-API-Key` or
@@ -46,6 +47,9 @@ For custom rules per request, see [custom rules](configuration.md#custom-rules).
 | Anthropic / Claude-compatible | `https://api.anthropic.com` | `x-api-key` | Forward `/v1/messages`; PromptLatch does not translate OpenAI JSON into Anthropic JSON. |
 | Google Gemini | `https://generativelanguage.googleapis.com` | `x-goog-api-key` | Forward `/v1beta/models/{model}:generateContent` and `:streamGenerateContent` (`?alt=sse`). |
 | Local Ollama or vLLM | `http://127.0.0.1:11434/v1` or another local `/v1` endpoint | provider-specific | Set `block_private_targets: false` only for local-only configs. |
+
+For a default Anthropic or Gemini target, set `target.api_key_header` to the value in this
+table. `promptlatch init` writes `authorization`.
 
 OpenRouter per request:
 

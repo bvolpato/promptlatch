@@ -182,8 +182,8 @@ safe_text = result.value
 ## Configure custom rules
 
 The default helpers use the default `RedactionConfig`. For per-application rules,
-create a `PromptLatch` instance. Exact rules of 16 characters or fewer match a
-secret tail inside a longer value. Prefer storing only that tail in config.
+create a `PromptLatch` instance. An exact rule of 8 to 16 characters matches a secret
+tail at the end of a longer token. See [custom rules](configuration.md#custom-rules).
 
 ```python
 from promptlatch import PromptLatch

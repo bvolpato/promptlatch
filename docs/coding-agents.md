@@ -17,8 +17,11 @@ uv tool install promptlatch
 curl -fsSL -o agents.yaml \
   https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/promptlatch-agents.config.yaml
 promptlatch serve --config agents.yaml
+```
 
-# In another terminal:
+In another terminal, run one of the wrappers:
+
+```bash
 codex-latch
 claude-latch
 gemini-latch
@@ -81,7 +84,7 @@ compression so request bodies remain scannable. Claude's nonessential traffic is
 disabled for the invocation. These wrappers cover model-provider requests, including
 conversation history and tool outputs sent back to the model. Login, MCP servers,
 tool subprocesses, plugins, and other network connections are separate. Files and
-images embedded as binary or encoded content retain the limits in [SECURITY.md](../SECURITY.md).
+images embedded as binary or encoded content are not scanned. See [SECURITY.md](../SECURITY.md).
 
 Configuration references: [Codex gateway authentication](https://learn.chatgpt.com/docs/enterprise/sign-in-with-chatgpt-through-a-gateway),
 [Claude Code gateways](https://code.claude.com/docs/en/llm-gateway), and
@@ -90,7 +93,7 @@ Configuration references: [Codex gateway authentication](https://learn.chatgpt.c
 ## Claude Code manual configuration
 
 Claude Code sends Anthropic Messages requests. Configure the provider key on PromptLatch,
-then use a separate local bearer token for proxy authentication:
+and use a separate local bearer token for proxy authentication:
 
 ```bash
 export ANTHROPIC_UPSTREAM_API_KEY="<anthropic-upstream-key>"
@@ -98,11 +101,14 @@ export PROMPTLATCH_TARGET_BASE_URL="https://api.anthropic.com"
 export PROMPTLATCH_TARGET_API_KEY="$ANTHROPIC_UPSTREAM_API_KEY"
 export PROMPTLATCH_TARGET_API_KEY_HEADER="x-api-key"
 export PROMPTLATCH_SERVER_API_KEY="<local-proxy-key>"
-
 promptlatch serve
+```
 
+In another terminal:
+
+```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
-export ANTHROPIC_AUTH_TOKEN="$PROMPTLATCH_SERVER_API_KEY"
+export ANTHROPIC_AUTH_TOKEN="<local-proxy-key>"
 export DISABLE_TELEMETRY=1
 export DO_NOT_TRACK=1
 claude
@@ -120,21 +126,21 @@ header. Generic client `Authorization` is not forwarded.
 Start PromptLatch:
 
 ```bash
-mkdir -p ~/.config/promptlatch
-cp examples/promptlatch-openrouter.config.yaml ~/.config/promptlatch/config.yaml
-export OPENROUTER_API_KEY="<openrouter-upstream-key>"
-promptlatch serve
+curl -fsSL -o openrouter.yaml \
+  https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/promptlatch-openrouter.config.yaml
+promptlatch serve --config openrouter.yaml
 ```
 
-The checked-in PromptLatch config restricts dynamic routing to OpenRouter and leaves
+This config restricts dynamic routing to OpenRouter and leaves
 `forward_client_authorization` and `responses_to_chat` disabled.
 
 Install the Codex profile:
 
 ```bash
 mkdir -p ~/.codex
-cp examples/codex-openrouter-promptlatch.config.toml \
-  ~/.codex/openrouter-promptlatch.config.toml
+curl -fsSL -o ~/.codex/openrouter-promptlatch.config.toml \
+  https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/codex-openrouter-promptlatch.config.toml
+export OPENROUTER_API_KEY="<openrouter-upstream-key>"
 ```
 
 Profile contents:
@@ -142,6 +148,7 @@ Profile contents:
 ```toml
 model = "openai/gpt-oss-120b"
 model_provider = "promptlatch-openrouter"
+model_reasoning_effort = "high"
 
 [model_providers.promptlatch-openrouter]
 name = "PromptLatch OpenRouter"
@@ -175,11 +182,12 @@ Responses clients limited to text, messages, and standard function tools.
 ## OpenCode
 
 The current stable OpenCode config supports custom Chat Completions providers through
-`@ai-sdk/openai-compatible`. Copy the checked-in example into your project, or merge the provider
-block into existing `opencode.json`:
+`@ai-sdk/openai-compatible`. Start the proxy as in [Codex with OpenRouter](#codex-with-openrouter). Then
+download the example into your project, or merge the provider block into an existing `opencode.json`:
 
 ```bash
-cp examples/opencode-openrouter-promptlatch.json opencode.json
+curl -fsSL -o opencode.json \
+  https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/opencode-openrouter-promptlatch.json
 export OPENROUTER_API_KEY="<openrouter-upstream-key>"
 ```
 

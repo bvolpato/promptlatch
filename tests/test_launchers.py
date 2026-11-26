@@ -33,8 +33,7 @@ def _clear_launcher_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "PROMPTLATCH_CODEX_BIN",
         "CODEX_HOME",
         "PROMPTLATCH_CLAUDE_BIN",
-        "PROMPTLATCH_GEMINI_BIN",
-        "PROMPTLATCH_GEMINI_AUTH",
+        "PROMPTLATCH_AGY_BIN",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -46,20 +45,15 @@ def _clear_launcher_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "CLAUDE_CODE_USE_FOUNDRY",
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
-        "GEMINI_API_KEY_AUTH_MECHANISM",
-        "GOOGLE_GENAI_USE_GCA",
         "GOOGLE_GENAI_USE_VERTEXAI",
-        "GEMINI_CLI_USE_COMPUTE_ADC",
-        "CLOUD_SHELL",
         "GOOGLE_GEMINI_BASE_URL",
-        "CODE_ASSIST_ENDPOINT",
-        "GOOGLE_VERTEX_BASE_URL",
-        "GEMINI_CLI_CUSTOM_HEADERS",
-        "GEMINI_CLI_HOME",
-        "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
-        "GEMINI_CLI_SYSTEM_DEFAULTS_PATH",
-        "GEMINI_SANDBOX",
-        "GEMINI_DEFAULT_AUTH_TYPE",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "AGY_ADC_AUTH",
+        "AGY_LLM_GATEWAY_URL",
+        "AGY_LLM_GATEWAY_API_KEY",
+        "AGY_LLM_GATEWAY_HEADERS",
+        "AGY_LLM_GATEWAY_PROXY_URL",
+        "CLOUD_CODE_URL",
         "HTTP_PROXY",
         "http_proxy",
         "HTTPS_PROXY",
@@ -74,15 +68,6 @@ def _clear_launcher_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in names:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CODEX_HOME", "/tmp/promptlatch-launchers-test-codex-home")
-    monkeypatch.setenv("GEMINI_CLI_HOME", "/tmp/promptlatch-launchers-test-gemini-home")
-    monkeypatch.setenv(
-        "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
-        "/tmp/promptlatch-launchers-test-gemini-etc/settings.json",
-    )
-    monkeypatch.setenv(
-        "GEMINI_CLI_SYSTEM_DEFAULTS_PATH",
-        "/tmp/promptlatch-launchers-test-gemini-etc/system-defaults.json",
-    )
 
 
 def _install_exec_capture(
@@ -792,310 +777,157 @@ def test_launcher_does_not_change_working_directory(monkeypatch: pytest.MonkeyPa
     assert calls[0][0] == "/opt/bin/cli"
 
 
-def test_gemini_version_check_parses_multiline_output_and_enforces_minimum(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        launchers.subprocess,
-        "run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            args=["gemini", "--version"],
-            returncode=0,
-            stdout="(node:12345) ExperimentalWarning: SQLite is an experimental feature\n0.41.2\n",
-        ),
-    )
-    launchers._require_supported_cli_version("gemini", "/opt/bin/gemini", {})
-
-    monkeypatch.setattr(
-        launchers.subprocess,
-        "run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            args=["gemini", "--version"],
-            returncode=0,
-            stdout="0.33.9\n",
-        ),
-    )
-    with pytest.raises(launchers.LauncherError, match="Gemini CLI 0.34.0 or newer is required"):
-        launchers._require_supported_cli_version("gemini", "/opt/bin/gemini", {})
-
-
-def test_gemini_api_key_mode_sets_headers_locks_env_and_promotes_google_api_key(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+@pytest.fixture
+def agy_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     _clear_launcher_environment(monkeypatch)
-    monkeypatch.setenv("GEMINI_CLI_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("GOOGLE_API_KEY", "fixture-google-key")
-    monkeypatch.setenv(
-        "GEMINI_CLI_CUSTOM_HEADERS",
-        "X-Request-ID: req-1, X-Target-Base-URL: https://evil.example, "
-        "X-Redact-Extra-Rules: [], X-Client: test",
-    )
+    monkeypatch.setenv("GEMINI_API_KEY", "fixture-gemini-key")
+    paths = (tmp_path / "admin_settings.json", tmp_path / "settings.json")
+    monkeypatch.setattr(launchers, "_agy_gateway_settings_paths", lambda _environment: paths)
+    return paths
+
+
+def test_agy_launcher_routes_through_the_gateway_settings(
+    agy_settings: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
     calls = _install_exec_capture(monkeypatch)
+    for name in ("CLOUD_CODE_URL", "GOOGLE_GEMINI_BASE_URL", "AGY_LLM_GATEWAY_PROXY_URL"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    monkeypatch.setenv("GOOGLE_API_KEY", "other-key")
+    monkeypatch.setenv("AGY_LLM_GATEWAY_HEADERS", "X-Target-Base-URL: https://attacker.example")
+    arguments = ["--model", "acp", "-p", "remote-control"]
 
-    launchers._main("gemini", ["-m", "gemini-2.5-pro", "-p", "explain gemma"])
+    launchers._main("agy", arguments)
 
-    assert len(calls) == 1
     executable, argv, environment = calls[0]
-    assert executable == "/opt/bin/cli"
-    assert argv == ["/opt/bin/cli", "-m", "gemini-2.5-pro", "-p", "explain gemma"]
-    assert environment["GOOGLE_GEMINI_BASE_URL"] == "http://127.0.0.1:8000"
-    assert environment["CODE_ASSIST_ENDPOINT"] == "http://127.0.0.1:8000"
-    assert environment["GOOGLE_GENAI_USE_GCA"] == "false"
-    assert environment["GOOGLE_GENAI_USE_VERTEXAI"] == "false"
-    assert environment["GEMINI_CLI_USE_COMPUTE_ADC"] == "false"
-    assert environment["CLOUD_SHELL"] == "false"
-    assert environment["GEMINI_SANDBOX"] == "false"
-    assert environment["GOOGLE_VERTEX_BASE_URL"] == "http://127.0.0.1:8000"
-    assert environment["GEMINI_DEFAULT_AUTH_TYPE"] == "gemini-api-key"
-    assert environment["HTTPS_PROXY"] == ""
-    assert environment["HTTP_PROXY"] == ""
-    assert environment["GEMINI_TELEMETRY_ENABLED"] == "false"
-    assert environment["GEMINI_TELEMETRY_LOG_PROMPTS"] == "false"
-    assert environment["GEMINI_API_KEY"] == "fixture-google-key"
-    assert environment["GEMINI_API_KEY_AUTH_MECHANISM"] == "x-goog-api-key"
-    assert environment["GEMINI_CLI_CUSTOM_HEADERS"] == (
-        "X-Request-ID: req-1, X-Client: test, "
-        "X-Target-Base-URL: https://generativelanguage.googleapis.com"
+    assert argv == [executable, "--settings", '{"modelProvider":""}', *arguments]
+    assert environment["AGY_LLM_GATEWAY_URL"] == "http://127.0.0.1:8000"
+    assert environment["AGY_LLM_GATEWAY_WIRE_PROTOCOL"] == "genai"
+    assert environment["AGY_LLM_GATEWAY_API_KEY"] == "promptlatch"
+    assert environment["AGY_LLM_GATEWAY_HEADERS"] == (
+        "X-Target-Base-URL: https://generativelanguage.googleapis.com, "
+        "X-Target-API-Key: fixture-gemini-key, X-Target-API-Key-Header: x-goog-api-key"
     )
-
-
-def test_gemini_auto_mode_honors_jsonc_selected_type_over_ambient_api_key(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _clear_launcher_environment(monkeypatch)
-    home = tmp_path / "home"
-    (home / ".gemini").mkdir(parents=True)
-    (home / ".gemini" / "settings.json").write_text(
-        """
-        // Comment with trailing commas
-        {
-          "security": {
-            "auth": {
-              /* OAuth selected in Gemini CLI */
-              "selectedType": "oauth-personal",
-            },
-          },
-        }
-        """,
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("GEMINI_CLI_HOME", str(home))
-    monkeypatch.setenv("GEMINI_API_KEY", "ambient-gemini-key")
-    monkeypatch.setenv("GOOGLE_API_KEY", "ambient-google-key")
-    monkeypatch.chdir(tmp_path)
-    calls = _install_exec_capture(monkeypatch)
-
-    launchers._main("gemini", [])
-
-    _, _, environment = calls[0]
-    assert environment["GOOGLE_GENAI_USE_GCA"] == "true"
-    assert environment["GEMINI_API_KEY"] == ""
-    assert environment["GOOGLE_API_KEY"] == ""
-    assert environment["GEMINI_CLI_CUSTOM_HEADERS"] == (
-        "X-Target-Base-URL: https://cloudcode-pa.googleapis.com"
-    )
-
-
-def test_gemini_saved_oauth_creds_select_code_assist_target(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _clear_launcher_environment(monkeypatch)
-    home = tmp_path / "home"
-    (home / ".gemini").mkdir(parents=True)
-    (home / ".gemini" / "oauth_creds.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("GEMINI_CLI_HOME", str(home))
-    monkeypatch.chdir(tmp_path)
-    calls = _install_exec_capture(monkeypatch)
-
-    launchers._main("gemini", [])
-
-    _, _, environment = calls[0]
-    assert environment["GOOGLE_GENAI_USE_GCA"] == "true"
-    assert (
-        "X-Target-Base-URL: https://cloudcode-pa.googleapis.com"
-        in environment["GEMINI_CLI_CUSTOM_HEADERS"]
-    )
+    for name in launchers._AGY_DROPPED_VARIABLES:
+        assert name not in environment
 
 
 @pytest.mark.parametrize(
-    ("switch", "value"),
+    ("variables", "message"),
     [
-        ("GOOGLE_GENAI_USE_VERTEXAI", "1"),
-        ("GEMINI_CLI_USE_COMPUTE_ADC", "1"),
-        ("CLOUD_SHELL", "1"),
-        ("HTTPS_PROXY", "http://127.0.0.1:9999"),
-        ("http_proxy", "http://127.0.0.1:9999"),
-        ("grpc_proxy", "http://127.0.0.1:9999"),
-        ("GEMINI_SANDBOX", "docker"),
-        ("GEMINI_SANDBOX", "true"),
-        ("GEMINI_DEFAULT_AUTH_TYPE", "vertex-ai"),
+        ({"GEMINI_API_KEY": ""}, "requires GEMINI_API_KEY"),
+        ({"GEMINI_API_KEY": "key, X-Target-Base-URL: https://attacker.example"}, "characters"),
+        ({"GEMINI_API_KEY": "key\nX-Other: 1"}, "characters"),
+        ({"AGY_ADC_AUTH": "true"}, "AGY_ADC_AUTH"),
+        ({"AGY_LLM_GATEWAY_URL": "https://gateway.example"}, "AGY_LLM_GATEWAY_URL"),
     ],
 )
-def test_gemini_launcher_refuses_alternate_provider_modes(
-    monkeypatch: pytest.MonkeyPatch, switch: str, value: str
+def test_agy_launcher_refuses_other_credentials_and_gateways(
+    agy_settings: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variables: dict[str, str],
+    message: str,
 ) -> None:
-    _clear_launcher_environment(monkeypatch)
-    monkeypatch.setenv("GEMINI_API_KEY", "fixture-key")
-    monkeypatch.setenv(switch, value)
     calls = _install_exec_capture(monkeypatch)
-    with pytest.raises(SystemExit) as result:
-        launchers._main("gemini", [])
-    assert result.value.code == 1
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(SystemExit, match="1"):
+        launchers._main("agy", [])
+
     assert calls == []
+    assert message in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
     "arguments",
     [
-        ["gemma"],
-        ["gemma", "status"],
-        ["-m", "gemini-2.5-flash", "gemma"],
-        ["--model=gemini-2.5-flash", "gemma"],
-        ["--resume", "-m", "gemini-2.5-pro", "gemma", "status"],
-        ["-w", "mybranch", "gemma", "status"],
-        ["-dm", "gemini-2.5-pro", "gemma", "status"],
-        ["-r", "gemma"],
-        ["-s", "-p", "hello"],
-        ["--sandbox", "-p", "hello"],
-        ["--sandbox=docker", "-p", "hello"],
-        ["-ds", "hello"],
-        ["--acp"],
-        ["--experimental-acp"],
+        ["--settings", '{"modelProvider":"gemini"}'],
+        ["-settings={}"],
+        ["-p", "hi", "--settings={}"],
+        ["--remote-agent"],
+        ["-p", "hi", "-remote-agent"],
+        ["--remote-control=true"],
+        ["acp"],
+        ["--model", "x", "acp"],
+        ["-c", "remote-control", "start"],
     ],
 )
-def test_gemini_launcher_refuses_unproxied_or_bypassing_flags_but_allows_double_dash(
-    monkeypatch: pytest.MonkeyPatch, arguments: list[str]
+def test_agy_launcher_refuses_arguments_that_bypass_the_proxy(
+    agy_settings: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, arguments: list[str]
 ) -> None:
-    _clear_launcher_environment(monkeypatch)
-    monkeypatch.setenv("GEMINI_API_KEY", "fixture-key")
     calls = _install_exec_capture(monkeypatch)
-    with pytest.raises(SystemExit) as result:
-        launchers._main("gemini", arguments)
-    assert result.value.code == 1
+
+    with pytest.raises(SystemExit, match="1"):
+        launchers._main("agy", arguments)
+
     assert calls == []
 
-    launchers._main("gemini", ["--", "gemma"])
-    assert len(calls) == 1
 
-
-def test_gemini_launcher_rejects_non_standard_http_loopback_and_allows_https(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_launcher_environment(monkeypatch)
-    monkeypatch.setenv("GEMINI_API_KEY", "fixture-key")
-    monkeypatch.setenv("PROMPTLATCH_PROXY_URL", "http://127.0.0.2:8000")
-    calls = _install_exec_capture(monkeypatch)
-    with pytest.raises(SystemExit) as result:
-        launchers._main("gemini", [])
-    assert result.value.code == 1
-    assert calls == []
-
-    monkeypatch.setenv("PROMPTLATCH_PROXY_URL", "https://127.0.0.2:8443")
-    launchers._main("gemini", [])
-    assert len(calls) == 1
-
-
+@pytest.mark.parametrize("index", [0, 1])
 @pytest.mark.parametrize(
-    "settings_payload",
+    ("content", "allowed"),
     [
-        '{"experimental": {"gemmaModelRouter": {"enabled": true}}}',
-        '{"experimental": {"gemmaModelRouter": {"enabled": "true"}}}',
-        '{"experimental": {"gemmaModelRouter": {"enabled": 1}}}',
-        '{"experimental": "invalid"}',
-        '{"security": {"auth": {"useExternal": true}}}',
-        '{"security": {"auth": {"selectedType": "vertex-ai"}}}',
-        '{"security": {"auth": "invalid"}}',
-        '{"tools": {"sandbox": true}}',
-        '{"tools": {"sandbox": "docker"}}',
+        ('{"gateway": {"enabled": false}}', False),
+        ('{"proxy": {"address": "http://proxy.example"}}', False),
+        ('{/* comment */ "gateway": {},}', False),
+        ("not json", False),
+        ("[]", False),
+        ('{"models": {"list": []}}', True),
     ],
 )
-def test_gemini_launcher_rejects_bypassing_settings(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, settings_payload: str
+def test_agy_launcher_refuses_files_that_can_reroute_the_gateway(
+    agy_settings: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    index: int,
+    content: str,
+    allowed: bool,
 ) -> None:
-    _clear_launcher_environment(monkeypatch)
-    home = tmp_path / "home"
-    (home / ".gemini").mkdir(parents=True)
-    (home / ".gemini" / "settings.json").write_text(settings_payload, encoding="utf-8")
-    monkeypatch.setenv("GEMINI_CLI_HOME", str(home))
-    monkeypatch.setenv("GEMINI_API_KEY", "fixture-key")
-    monkeypatch.chdir(tmp_path)
     calls = _install_exec_capture(monkeypatch)
-    with pytest.raises(SystemExit) as result:
-        launchers._main("gemini", [])
-    assert result.value.code == 1
-    assert calls == []
+    agy_settings[index].write_text(content, encoding="utf-8")
+
+    if allowed:
+        launchers._main("agy", [])
+    else:
+        with pytest.raises(SystemExit, match="1"):
+            launchers._main("agy", [])
+
+    assert len(calls) == allowed
 
 
-def test_gemini_launcher_rejects_workspace_auth_divergence_and_header_injection(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_agy_gateway_settings_paths_cover_managed_and_user_files() -> None:
+    managed, user = launchers._agy_gateway_settings_paths({"HOME": "/home/fixture"})
+
+    assert managed.name == "admin_settings.json"
+    assert managed.parent.name.lower() == "antigravity"
+    assert user == Path("/home/fixture/.antigravity/settings.json")
+
+
+@pytest.mark.parametrize(("version", "supported"), [("1.5.7", False), ("1.5.8", True)])
+def test_agy_version_minimum(
+    monkeypatch: pytest.MonkeyPatch, version: str, supported: bool
 ) -> None:
-    _clear_launcher_environment(monkeypatch)
-    home = tmp_path / "home"
-    work = tmp_path / "work"
-    (home / ".gemini").mkdir(parents=True)
-    (work / ".gemini").mkdir(parents=True)
-    (home / ".gemini" / "settings.json").write_text(
-        '{"security": {"auth": {"selectedType": "gemini-api-key"}}}', encoding="utf-8"
+    monkeypatch.setattr(
+        launchers.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["agy", "--version"], returncode=0, stdout=version
+        ),
     )
-    (work / ".gemini" / "settings.json").write_text(
-        '{"security": {"auth": {"selectedType": "oauth-personal"}}}', encoding="utf-8"
-    )
-    monkeypatch.setenv("GEMINI_CLI_HOME", str(home))
-    monkeypatch.chdir(work)
-    calls = _install_exec_capture(monkeypatch)
-    with pytest.raises(SystemExit) as result:
-        launchers._main("gemini", [])
-    assert result.value.code == 1
-    assert calls == []
-
-    (work / ".gemini" / "settings.json").unlink()
-    monkeypatch.setenv("GEMINI_CLI_CUSTOM_HEADERS", "X-One: a\r\nX-Target-Base-URL: https://evil")
-    with pytest.raises(SystemExit) as result2:
-        launchers._main("gemini", [])
-    assert result2.value.code == 1
-    assert calls == []
-
-    monkeypatch.setenv("GEMINI_CLI_CUSTOM_HEADERS", "Bad Header Name: value")
-    with pytest.raises(SystemExit) as result3:
-        launchers._main("gemini", [])
-    assert result3.value.code == 1
-    assert calls == []
-
-    # BOM-prefixed reserved headers are stripped, and unset env keys stay unset for keychain/dotenv
-    monkeypatch.setenv(
-        "GEMINI_CLI_CUSTOM_HEADERS",
-        "\ufeffX-Target-API-Key: evil-key, \ufeffX-Redact-Extra-Rules: [], X-Valid: ok",
-    )
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("GEMINI_CLI_HOME", "~/home")
-    launchers._main("gemini", [])
-    assert len(calls) == 1
-    _, _, environment = calls[0]
-    assert "GEMINI_API_KEY" not in environment
-    assert "GOOGLE_API_KEY" not in environment
-    assert environment["GEMINI_CLI_HOME"] == str(home.resolve())
-    assert environment["GEMINI_CLI_CUSTOM_HEADERS"] == (
-        "X-Valid: ok, X-Target-Base-URL: https://generativelanguage.googleapis.com"
-    )
+    if supported:
+        launchers._require_supported_cli_version("agy", "/opt/bin/agy", {})
+    else:
+        with pytest.raises(launchers.LauncherError, match="1.5.8 or newer"):
+            launchers._require_supported_cli_version("agy", "/opt/bin/agy", {})
 
 
-def test_gemini_help_does_not_check_proxy_or_cli(
+def test_agy_help_does_not_check_proxy_or_cli(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _clear_launcher_environment(monkeypatch)
-    monkeypatch.setattr(
-        launchers,
-        "_require_ready_proxy",
-        lambda _url, **_kwargs: pytest.fail("help must not contact the proxy"),
-    )
-    monkeypatch.setattr(
-        launchers.shutil,
-        "which",
-        lambda *_args, **_kwargs: pytest.fail("help must not resolve the CLI"),
-    )
-    with pytest.raises(SystemExit) as result:
-        launchers._main("gemini", ["--latch-help"])
-    assert result.value.code == 0
-    output = capsys.readouterr().out
-    assert "PROMPTLATCH_GEMINI_AUTH" in output
-    assert "PROMPTLATCH_GEMINI_BIN" in output
+    monkeypatch.setattr(launchers.shutil, "which", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(SystemExit, match="0"):
+        launchers._main("agy", ["--latch-help"])
+
+    assert "PROMPTLATCH_AGY_BIN" in capsys.readouterr().out

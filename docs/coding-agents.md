@@ -1,8 +1,9 @@
 # Coding agents
 
-Run Codex, Claude Code, Gemini CLI, or OpenCode through a local PromptLatch proxy.
+Run Codex, Claude Code, Antigravity CLI, or OpenCode through a local PromptLatch proxy.
 
 - [Wrapper commands](#wrapper-commands) for Codex, Claude Code, and Gemini CLI
+- [Antigravity CLI](#antigravity-cli)
 - [Claude Code manual configuration](#claude-code-manual-configuration)
 - [Codex with OpenRouter](#codex-with-openrouter)
 - [OpenCode](#opencode)
@@ -35,6 +36,13 @@ The example binds to loopback, enables client-auth forwarding, restricts targets
 the official endpoints below, and enables the inspector at `http://127.0.0.1:8000/`.
 Use your existing server instead if it has equivalent authentication and native
 Responses settings. Do not start a second server on an occupied port.
+
+Google replaced Gemini CLI with Antigravity CLI. Its
+[announcement](https://developers.googleblog.com/en/an-important-update-transitioning-gemini-cli-to-antigravity-cli/)
+ends Gemini CLI for free, Pro, and Ultra accounts on June 18, 2026. Gemini CLI remains
+available with paid API keys and with Gemini Code Assist Standard or Enterprise licenses, and
+`gemini-latch` is for those users. It does not support `agy`. See
+[Antigravity CLI](#antigravity-cli).
 
 | Command / authentication | Upstream |
 | --- | --- |
@@ -69,7 +77,8 @@ be forwarded. This mode requires no `server.api_key` or `target.api_key`; keep t
 listener local. Normal keyed-proxy configuration remains available for other clients.
 `PROMPTLATCH_PROXY_URL` accepts loopback addresses only. Use
 `PROMPTLATCH_CODEX_BIN`, `PROMPTLATCH_CLAUDE_BIN`, or `PROMPTLATCH_GEMINI_BIN` to
-select a CLI executable explicitly.
+select a CLI executable explicitly. Do not set `PROMPTLATCH_GEMINI_BIN` to `agy`.
+Antigravity CLI ignores the settings that keep Gemini CLI on the proxy.
 
 Codex's effective provider configuration is checked before launch. Conflicting
 provider settings, managed routing requirements, and Codex Cloud commands stop with
@@ -89,6 +98,40 @@ images embedded as binary or encoded content are not scanned. See [SECURITY.md](
 Configuration references: [Codex gateway authentication](https://learn.chatgpt.com/docs/enterprise/sign-in-with-chatgpt-through-a-gateway),
 [Claude Code gateways](https://code.claude.com/docs/en/llm-gateway), and
 [Claude Code networking](https://code.claude.com/docs/en/corporate-proxy).
+
+## Antigravity CLI
+
+Antigravity CLI (`agy`) sends model requests to a custom URL only in
+[API-key mode](https://antigravity.google/docs/install?tab=cli). Account sign-in ignores that
+URL, so its requests do not pass through PromptLatch.
+
+`agy` cannot name a target for each request, so make the Gemini API the default target:
+
+```bash
+PROMPTLATCH_TARGET_BASE_URL=https://generativelanguage.googleapis.com \
+  promptlatch serve --config agents.yaml
+```
+
+`codex-latch` and `claude-latch` name their own target, so they can use the same proxy.
+
+In another terminal, start `agy` with a Gemini API key:
+
+```bash
+export GEMINI_API_KEY="<gemini-api-key>"
+export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:8000"
+agy --settings '{"modelProvider":"gemini"}'
+```
+
+`--settings` applies to one session and saves nothing. To make it permanent, set
+`modelProvider` to `gemini` in `~/.gemini/antigravity-cli/settings.json`. Without this
+setting, `agy` ignores both variables and asks you to sign in.
+
+There is no wrapper that checks this setup. Before you rely on it, run
+`promptlatch tail --follow`, send a prompt, and make sure that the request appears.
+If it does not appear, the request did not pass through PromptLatch.
+
+Do not set `AGY_ADC_AUTH`. Remote agents, MCP servers, tool subprocesses, and updates use
+separate connections that PromptLatch does not scan.
 
 ## Claude Code manual configuration
 

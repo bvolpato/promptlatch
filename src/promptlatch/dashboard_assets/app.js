@@ -66,6 +66,7 @@
   }
   // Rewriting unchanged text makes live regions announce it on every poll.
   const text = (id, value) => { if ($(id).textContent !== value) $(id).textContent = value; };
+  const announce = (id, value) => { $(id).textContent = value; };
   const asList = (value) => Array.isArray(value) ? value : value == null ? [] : [value];
   const shortId = (id) => id ? id.length > 17 ? `${id.slice(0, 9)}…${id.slice(-5)}` : id : "Unknown";
   const date = (timestamp, full = false) => known(timestamp) ? new Date(timestamp * 1000).toLocaleString(undefined, full ? { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short" } : { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
@@ -294,7 +295,8 @@
     state.locationHash = hash;
     const version = ++state.routeVersion;
     const route = locationRoute();
-    state.initialized = true;
+    // Until the first request arrives, only a link to a request settles the initial view.
+    state.initialized = initial || state.threads.items.length > 0 || route.view === "request" || route.view === "invalid";
     if (route.view === "request") {
       await selectRequest(route.id, { historyMode: "none" });
     } else if (route.view === "overview") {
@@ -1206,7 +1208,7 @@
     else if (typeof payload.input === "string") prefix.push({ role: "user", content: payload.input });
     else {
       // Gemini also accepts bare strings, single objects, and entries that are parts.
-      messages = asList(inner.contents).map((entry) => typeof entry === "string" ? { role: "user", content: entry } : (entry && typeof entry === "object" && !Array.isArray(entry)) ? { ...entry, role: entry.role === "model" ? "assistant" : (entry.role || "user"), content: entry.content ?? (entry.parts == null && entry.text != null ? [entry] : asList(entry.parts)) } : entry);
+      messages = asList(inner.contents).map((entry) => typeof entry === "string" ? { role: "user", content: entry } : (entry && typeof entry === "object" && !Array.isArray(entry)) ? { ...entry, role: entry.role === "model" ? "assistant" : (entry.role || "user"), content: entry.content ?? (entry.parts == null && (entry.text != null || entry.role == null) ? [entry] : asList(entry.parts)) } : entry);
     }
     function* capturedMessages(visibleOnly = true) {
       for (const source of [messages, prefix]) {
@@ -1472,7 +1474,11 @@
         if (!item) {
           // Evicted while selected: show the unavailable notice instead of failing every refresh.
           state.detail = null;
-          await selectRequest(id, { keepSidebar: true, background: state.view !== "request", historyMode: "none" });
+          const background = state.view !== "request";
+          const inspectorView = state.inspectorView;
+          const loading = selectRequest(id, { keepSidebar: true, background, historyMode: "none" });
+          if (background) state.inspectorView = inspectorView;
+          await loading;
           return;
         }
         const bodyChanged = item.request_body !== state.detail?.request_body || item.body_truncated !== state.detail?.body_truncated || item.body_omitted_reason !== state.detail?.body_omitted_reason;
@@ -1559,14 +1565,14 @@
       await navigator.clipboard.writeText(link);
       if (state.requestId !== id || !state.authenticated) return;
       $("copy-request-link").textContent = "Copied";
-      text("copy-link-status", "Request link copied.");
+      announce("copy-link-status", "Request link copied.");
     } catch {
       if (state.requestId !== id || !state.authenticated) return;
       const field = $("request-link");
       field.value = link;
       field.hidden = false;
       field.focus(); field.select();
-      text("copy-link-status", "Copy this selected request link.");
+      announce("copy-link-status", "Copy this selected request link.");
     }
   });
   $("copy-payload").addEventListener("click", async () => {
@@ -1577,14 +1583,14 @@
       await navigator.clipboard.writeText(item.request_body);
       if (epoch !== state.epoch || state.requestId !== item.request_id || !state.authenticated) return;
       $("copy-payload").textContent = "Copied";
-      text("payload-copy-status", "Retained redacted payload copied.");
+      announce("payload-copy-status", "Retained redacted payload copied.");
     } catch {
       if (epoch !== state.epoch || state.requestId !== item.request_id || !state.authenticated) return;
       const range = document.createRange();
       range.selectNodeContents($("request-payload"));
       const selection = window.getSelection();
       selection?.removeAllRanges(); selection?.addRange(range);
-      text("payload-copy-status", "Clipboard unavailable. Displayed payload selected for copying.");
+      announce("payload-copy-status", "Clipboard unavailable. Displayed payload selected for copying.");
     }
   });
   $("payload-wrap").addEventListener("click", () => {

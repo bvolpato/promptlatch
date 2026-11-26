@@ -23,12 +23,12 @@
   const patterns = {
     bash: [
       ["string", /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g],
-      ["comment", /#[^\n]*/g],
+      ["comment", /(?<=^|\s)#[^\n]*/gm],
       ["variable", /\$\{?[A-Z0-9_]+\}?/g],
-      ["flag", /--?[A-Za-z0-9][A-Za-z0-9-]*/g],
+      ["flag", /(?<![\w-])--?[A-Za-z0-9][A-Za-z0-9-]*/g],
       [
         "keyword",
-        /\b(?:brew|promptlatch|export|curl|docker|helm|kubectl|uv|mkdir|cp|codex|opencode|claude|jq|kind)\b/g,
+        /^(?:brew|promptlatch|export|curl|docker|helm|kubectl|uv|mkdir|cp|cd|git|python|opencode|(?:codex|claude|gemini)-latch)\b|(?<=\| )jq\b/gm,
       ],
     ],
     json: [
@@ -43,7 +43,7 @@
       ["number", /\b-?\d+(?:\.\d+)?\b/g],
       [
         "keyword",
-        /\b(?:from|import|as|client|messages|response|model|max_tokens|input|assert|return|with)\b/g,
+        /\b(?:from|import|as|assert|return|with|def|for|in|if)\b/g,
       ],
       ["call", /\b[A-Za-z_][A-Za-z0-9_]*(?=\()/g],
     ],
@@ -93,7 +93,7 @@
 
   for (const block of document.querySelectorAll("pre code")) {
     const source = block.textContent;
-    const language = detectLanguage(source);
+    const language = block.dataset.lang || detectLanguage(source);
     block.dataset.language = language;
     if (language === "text") continue;
     block.innerHTML = highlight(source, language);

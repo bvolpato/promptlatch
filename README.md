@@ -172,8 +172,8 @@ To block secrets in commits, add `git diff --cached | promptlatch scan --check -
 | --- | --- |
 | Homebrew | `brew install bvolpato/tap/promptlatch` |
 | pip | `python -m pip install promptlatch` |
-| Docker | `docker pull ghcr.io/bvolpato/promptlatch:0.2.11` |
-| Helm | `helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.2.11/promptlatch-0.2.11.tgz` |
+| Docker | `docker pull ghcr.io/bvolpato/promptlatch:0.3.0` |
+| Helm | `helm pull https://github.com/bvolpato/promptlatch/releases/download/v0.3.0/promptlatch-0.3.0.tgz` |
 | Source | `git clone https://github.com/bvolpato/promptlatch.git && cd promptlatch && ./install.sh` |
 
 If Homebrew refuses an untrusted tap, run `brew trust bvolpato/tap` first.

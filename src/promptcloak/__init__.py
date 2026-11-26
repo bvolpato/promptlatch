@@ -1,4 +1,4 @@
-"""Compatibility imports for PromptLatch 0.2."""
+"""Compatibility imports for the previous package name."""
 
 from __future__ import annotations
 

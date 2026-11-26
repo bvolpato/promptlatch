@@ -1142,7 +1142,7 @@ class SecretRedactor:
         return secret, tag_id
 
     def _tag_context_id(self) -> str:
-        if self.config.redact_mode != "tagged":
+        if self.config.redact_mode == "full":
             return ""
         _, tag_id = self._active_tag_pair()
         return f"{tag_id}:{self._dynamic_tag_labels.version}"
@@ -1178,14 +1178,14 @@ class SecretRedactor:
             if match.group(1) is None or self._is_valid_tag_label(match.group(1))
         ]
 
-    def _format_tagged(self, secret: str, rule_name: str) -> str:
-        label = self._safe_tag_label(rule_name)
+    def _keyed_tag(self, secret: str) -> str | None:
+        """Derive a keyed tag, or None when one call has derived too many."""
         state: _TagCallState | None = getattr(self._tag_local, "state", None)
         tag = state.memo.get(secret) if state is not None else None
         if tag is None:
             if state is not None and state.derivations >= _MAX_TAG_DERIVATIONS_PER_CALL:
                 state.capped_count += 1
-                return MASK
+                return None
             tag_secret, _ = self._active_tag_pair()
             tag = hashlib.pbkdf2_hmac(
                 "sha256",
@@ -1197,7 +1197,12 @@ class SecretRedactor:
             if state is not None:
                 state.derivations += 1
                 state.memo[secret] = tag
-        return f"[REDACTED:{label}#{tag}]"
+        return tag
+
+    def _format_tagged(self, secret: str, rule_name: str) -> str:
+        label = self._safe_tag_label(rule_name)
+        tag = self._keyed_tag(secret)
+        return MASK if tag is None else f"[REDACTED:{label}#{tag}]"
 
     def _sub_tagged_safe(
         self,
@@ -1950,11 +1955,12 @@ class SecretRedactor:
         return self._mask(match.group(0))
 
     def _mask(self, secret: str) -> str:
-        # Eight visible characters and the digest are enough to guess a shorter secret.
+        # Eight visible characters are too much of a shorter secret.
         if self.config.redact_mode == "full" or len(secret) < 20:
             return self.placeholder
-        digest = hashlib.sha256(secret.encode("utf-8", "surrogatepass")).hexdigest()[:8]
-        return f"{secret[:4]}...{secret[-4:]}:{digest}"
+        # The tag is keyed, so the visible text cannot be used to test guesses.
+        tag = self._keyed_tag(secret)
+        return self.placeholder if tag is None else f"{secret[:4]}...{secret[-4:]}:{tag}"
 
 
 class _PromptText(io.StringIO, NamedIO):

@@ -1,5 +1,6 @@
 import base64
 import binascii
+import hashlib
 import json
 import re
 import struct
@@ -1888,6 +1889,19 @@ def test_lone_surrogate_in_labeled_value_is_redacted(
 
     assert "Opaque \ud83d" not in result.value
     assert "fixture" not in result.value
+
+
+def test_partial_mode_tag_is_keyed() -> None:
+    secret = "FixturePassword-0123456789"
+    config = RedactionConfig(engine="basic", redact_mode="partial", rules=[
+        RuleConfig(type="regex", value="FixturePassword-[0-9]+", name="fixture")
+    ])  # fmt: skip
+    first, again, other = SecretRedactor(config), SecretRedactor(config), SecretRedactor(config)
+    again._default_tag_secret = first._default_tag_secret
+    tags = [item.redact_text(secret).value.rpartition(":")[2] for item in (first, again, other)]
+
+    assert tags[0] == tags[1] != tags[2]
+    assert hashlib.sha256(secret.encode()).hexdigest()[:8] not in tags
 
 
 def test_partial_mode_hides_secrets_that_its_digest_would_reveal() -> None:

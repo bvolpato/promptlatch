@@ -24,6 +24,7 @@ from promptlatch.config import _ENV_REF_RE, RedactionConfig, RuleConfig
 from promptlatch.patterns import (
     BUILTIN_PATTERNS,
     SENSITIVE_FIELD_RE,
+    SIGNED_VALUE_CHAR,
     STRICT_SENSITIVE_FIELD_RE,
     TOKEN_START,
 )
@@ -37,7 +38,7 @@ _SIGNED_URL_TAGGED_RE = re.compile(
     r"(?i)((?:[?&](?:amp;)?|\\u0026)(?:x-amz-signature|x-amz-credential|"
     r"x-amz-security-token|x-goog-signature|x-goog-credential|googleaccessid|"
     r"signature|sig)=)"
-    r"((?:\[REDACTED:[A-Za-z0-9_.-]{1,64}#[0-9a-f]{8}\]|[^&#\s\"'<>`\\)])+)"
+    rf"((?:\[REDACTED:[A-Za-z0-9_.-]{{1,64}}#[0-9a-f]{{8}}\]|{SIGNED_VALUE_CHAR})+)"
 )
 _MAX_DYNAMIC_TAG_LABELS = 4096
 _TAG_KEY_PBKDF2_ITERATIONS = 600_000
@@ -115,7 +116,11 @@ _TOKEN_COUNT_LABEL = re.compile(
     r"(?i)(?:budget|cached?|completion|creation|input|max|new|num|output|prompt|read|reasoning|"
     r"thinking|total)[_-]?tokens\\*[\"']?\s*[:=]\s*$"
 )
-# A statement or mapping key on the indented line after `name:`.
+# A statement on the indented line after `if token:`. Data uses the same shapes, so the line
+# above must also open a code block.
+_BLOCK_OPENER = re.compile(
+    r"[ \t}]*(?:async[ \t]+)?(?:case|class|def|elif|except|for|if|match|when|while|with)\b.*:[ \t]*"
+)
 _NEXT_STATEMENT = re.compile(
     r"(?:continue|raise|return)(?=\s|$)|"
     r"[A-Za-z_][A-Za-z_.-]*(?::(?=\s|$)|[ \t]+[-+*/|&]?=[ \t]|[(\[])"
@@ -123,11 +128,18 @@ _NEXT_STATEMENT = re.compile(
 
 # These plugins report a value because of where it stands, not because of its shape.
 _POSITIONAL_SECRET_TYPES = frozenset({"Secret Keyword", "Basic Auth Credentials"})
+# An entry of a mapping that stands under a sensitive label.
+_MAPPING_ENTRY = re.compile(r"([A-Za-z_][A-Za-z_.-]*)(?:[ \t]*=[ \t]+|:(?:[ \t]+|$))")
+_MAPPING_KEY = re.compile(r"[A-Za-z_][A-Za-z_.-]*")
 # A quoted mapping key is a label, not a value.
 _CLOSING_QUOTE = re.compile(r"\\*[\"'`](?!\s*:)")
+_VALUE_LABEL = re.compile(
+    r"(?i)(?:api[_-]?key|credential|passw(?:or)?d|pwd|secret|token)[a-z0-9_.-]{0,32}"
+    r"\\*[\"'`]?[ \t]*(?:[=:!]=|[:=>])[ \t]*\\*[\"'`]?$"
+)
 _LINE_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 _PLAIN_WORD = re.compile(r"[A-Za-z][a-z]*|[A-Z]+")
-_FIELD_NAME = re.compile(r"[A-Za-z_.-]+")
+_FIELD_NAME = re.compile(r"[A-Za-z_.]+")
 _TYPE_NAMES = frozenset(
     {"any", "bool", "boolean", "bytes", "false", "float", "int", "integer", "nil", "none",
      "null", "number", "object", "str", "string", "true", "undefined"}
@@ -136,7 +148,10 @@ _TYPE_NAMES = frozenset(
 _TOKEN_REST = re.compile(r"-*[A-Za-z0-9_][A-Za-z0-9_+/=-]*")
 _BASE64_REST = re.compile(r"[A-Za-z0-9+/]*={0,2}")
 _BASE64_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
-_PRIVATE_KEY_END = re.compile(r"-----END (?:[A-Z]+ )?PRIVATE KEY(?: BLOCK)?-----")
+_PRIVATE_KEY_END = {
+    "private_key": re.compile(r"-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"),
+    "pgp_private_key": re.compile(r"-----END PGP " + r"PRIVATE KEY BLOCK-----"),
+}
 _SURROGATES = re.compile(r"[\ud800-\udfff]")
 
 _SCHEMA_MEMBERS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
@@ -335,14 +350,38 @@ def _is_code_reference(value: str, start: int, end: int) -> bool:
 
 def _is_next_statement(value: str, start: int) -> bool:
     """Recognize code on an indented line, not a value carried over from the line above."""
+    label_end = _line_above(value, start)
+    if label_end is None or _NEXT_STATEMENT.match(value, start) is None:
+        return False
+    label_start = value.rfind("\n", max(0, label_end - 512), label_end) + 1
+    return (label_start > 0 or label_end <= 512) and _BLOCK_OPENER.fullmatch(
+        value, label_start, label_end
+    ) is not None
+
+
+def _line_above(value: str, start: int) -> int | None:
+    """Return the end of the line above when `start` is the first text on an indented line."""
     position = start
     while position and value[position - 1] in " \t":
         position -= 1
-    return (
-        0 < position < start
-        and value[position - 1] == "\n"
-        and _NEXT_STATEMENT.match(value, start) is not None
-    )
+    if not 0 < position < start or value[position - 1] != "\n":
+        return None
+    return position - 1
+
+
+def _is_next_label(value: str, separator: int, start: int, end: int) -> bool:
+    """Recognize the label of the next line, which the line above does not have as its value."""
+    if "\n" not in value[separator:start]:
+        return False
+    name = _MAPPING_KEY.match(value, start, end)
+    if name is None:
+        return False
+    if value[name.end() : end] == ":":
+        return True
+    position = end
+    while position < len(value) and value[position] in " \t":
+        position += 1
+    return name.end() == end and value[position : position + 1] in (":", "=")
 
 
 def _is_token_count(value: str, start: int) -> bool:
@@ -355,18 +394,19 @@ def _is_token_count(value: str, start: int) -> bool:
 
 def _is_common_value(secret: str) -> bool:
     """Recognize a value that ordinary text or a field name is likely to contain."""
-    return (
-        len(secret) < 8
-        or _PLAIN_WORD.fullmatch(secret) is not None
-        or (
-            _FIELD_NAME.fullmatch(secret) is not None
-            and SENSITIVE_FIELD_RE.search(secret) is not None
-        )
+    if len(secret) < 8 and (len(secret) < 5 or secret.isdigit()):
+        return True
+    if _PLAIN_WORD.fullmatch(secret) is not None:
+        return True
+    return _FIELD_NAME.fullmatch(secret) is not None and any(
+        match.end() == len(secret) for match in SENSITIVE_FIELD_RE.finditer(secret)
     )
 
 
 def _is_value_position(value: str, start: int, end: int) -> bool:
-    """Recognize a quoted value, a URL password, or the rest of an INI line."""
+    """Recognize a labeled or quoted value, a URL password, or the rest of an INI line."""
+    if _VALUE_LABEL.search(value[max(0, start - 64) : start]) is not None:
+        return True
     before = value[max(0, start - 1) : start]
     if before == ":" and value.startswith("@", end):
         return True
@@ -383,6 +423,9 @@ def _is_value_position(value: str, start: int, end: int) -> bool:
 
 def _token_span(value: str, start: int, end: int, secret_type: str) -> tuple[int, int]:
     """Extend a plugin match to the whole token that contains it."""
+    if secret_type == "Private Key":
+        # The plugin reports the header, which the private key rules need to find the end.
+        return start, end
     rest = _TOKEN_REST.match(value, end)
     if secret_type == "AWS Access Key" and end - start == 40:
         # The secret access key rule also matches a window of a longer session token.
@@ -1057,9 +1100,9 @@ class SecretRedactor:
             _cache_from._derived_tag_pair if _cache_from is not None else None
         )
         # Validate any configured or environment-expanded tag_key eagerly; only run
-        # PBKDF2 eagerly when tagged mode is active.
+        # PBKDF2 eagerly when the mode writes tags.
         self._resolve_tag_key()
-        if self.config.redact_mode == "tagged":
+        if self.config.redact_mode != "full":
             self._active_tag_pair()
         self._static_tag_labels = (
             frozenset(
@@ -1275,10 +1318,7 @@ class SecretRedactor:
             context = "responses-request"
         elif protocol == "gemini-generate-content":
             context = "gemini-request"
-        if (
-            self.config.redact_mode != "tagged"
-            or getattr(self._tag_local, "state", None) is not None
-        ):
+        if self.config.redact_mode == "full" or getattr(self._tag_local, "state", None) is not None:
             return RedactionResult(self._walk(payload, stats, context=context), stats)
         state = _TagCallState()
         self._tag_local.state = state
@@ -1292,10 +1332,7 @@ class SecretRedactor:
         stats = RedactionStats()
         if not self.config.enabled:
             return RedactionResult(text, stats)
-        if (
-            self.config.redact_mode != "tagged"
-            or getattr(self._tag_local, "state", None) is not None
-        ):
+        if self.config.redact_mode == "full" or getattr(self._tag_local, "state", None) is not None:
             return RedactionResult(self._redact_string(text, stats), stats)
         state = _TagCallState()
         self._tag_local.state = state
@@ -1395,9 +1432,25 @@ class SecretRedactor:
         )
         for key, item in schema.items():
             if key in _SCHEMA_MEMBERS and isinstance(item, Mapping):
-                redacted[key] = self._redact_schema_members(item, stats)
+                redacted[key] = self._redact_sensitive_members(item, stats, strict=strict)
             elif key in _SCHEMA_KEYWORDS:
                 redacted[key] = self._redact_sensitive_schema(item, stats, strict=strict)
+        return redacted
+
+    def _redact_sensitive_members(
+        self, members: Mapping[Any, Any], stats: RedactionStats, *, strict: bool
+    ) -> dict[Any, Any]:
+        """Keep the structure of a nested schema. Its text belongs to the sensitive field."""
+        redacted: dict[Any, Any] = {}
+        for name, schema in members.items():
+            redacted_name = self._redact_string(name, stats) if isinstance(name, str) else name
+            if redacted_name in redacted:
+                raise RedactionKeyCollisionError("mapping keys collide after redaction")
+            redacted[redacted_name] = (
+                self._redact_sensitive_schema(schema, stats, strict=strict)
+                if isinstance(schema, Mapping)
+                else self._redact_sensitive_field(schema, stats, strict=strict)
+            )
         return redacted
 
     def _model_fields(self, value: Any) -> Mapping[str, Any] | None:
@@ -1763,6 +1816,11 @@ class SecretRedactor:
         )
         # Replace the longest value first, so that no shorter one breaks it up.
         for secret_type, secret_value in sorted(found, key=lambda item: -len(item[1])):
+            if sentinel_map and nonce in secret_value:
+                for sentinel, original_tag in sentinel_map.items():
+                    if sentinel in secret_value:
+                        secret_value = secret_value.replace(sentinel, original_tag)
+            starts: list[int] = []
             if secret_type == "Secret Keyword":
                 # An INI transformer reads the body of `if token:` as the value of `token`.
                 starts = [start for start, _ in _occurrences(secret_value, original)]
@@ -1771,10 +1829,9 @@ class SecretRedactor:
                     for start in starts
                 ):
                     continue
-            if sentinel_map and nonce in secret_value:
-                for sentinel, original_tag in sentinel_map.items():
-                    if sentinel in secret_value:
-                        secret_value = secret_value.replace(sentinel, original_tag)
+            nested = bool(starts) and all(
+                _line_above(original, start) is not None for start in starts
+            )
             if secret_type == "GitHub Token" and len(secret_value) < 30:
                 continue
             if secret_type == "Artifactory Credentials":
@@ -1783,9 +1840,30 @@ class SecretRedactor:
                 secret_value = secret_value.strip("\"'")
             if not secret_value:
                 continue
-            value, count = self._replace_detected_secret(secret_value, value, secret_type, original)
+            entry = _MAPPING_ENTRY.match(secret_value) if nested else None
+            if entry is not None:
+                value, count = self._replace_mapping_value(secret_value, entry, value)
+            else:
+                value, count = self._replace_detected_secret(
+                    secret_value, value, secret_type, original
+                )
             stats.add(f"detect_secrets:{secret_type}", count)
         return value
+
+    def _replace_mapping_value(
+        self, secret_value: str, entry: re.Match[str], value: str
+    ) -> tuple[str, int]:
+        """Keep the name of a mapping entry that stands under a sensitive label."""
+        item = secret_value[entry.end() :]
+        if (
+            not item
+            or entry.group(1) in _SCHEMA_KEYWORDS
+            or item.lower() in _TYPE_NAMES
+            or self._is_placeholder(item)
+        ):
+            return value, 0
+        spans = [(start + entry.end(), end) for start, end in _occurrences(secret_value, value)]
+        return self._replace_spans(spans, value, "detect_secrets:Secret Keyword")
 
     def _replace_detected_secret(
         self, secret_value: str, value: str, secret_type: str, original: str
@@ -1832,7 +1910,8 @@ class SecretRedactor:
             return self._sub_assignment_pattern(pattern, value, rule_name=name)
         if name in {"private_key", "pgp_private_key"}:
             # Each BEGIN line past the last END line would scan the rest of the text.
-            limit = max((match.end() for match in _PRIVATE_KEY_END.finditer(value)), default=0)
+            ends = _PRIVATE_KEY_END[name].finditer(value)
+            limit = max((match.end() for match in ends), default=0)
             redacted, count = self._sub_pattern_with_rule(pattern, value[:limit], name)
             return redacted + value[limit:], count
         if name == "signed_url_query_param":
@@ -1934,6 +2013,10 @@ class SecretRedactor:
                 if self._is_placeholder(match.group("secret")):
                     continue
                 if _is_next_statement(value, match.start("secret")):
+                    continue
+                if not match.group("value_quote") and _is_next_label(
+                    value, match.start(), *match.span("secret")
+                ):
                     continue
                 replacement = (
                     self._format_tagged(match.group("secret"), rule_name)

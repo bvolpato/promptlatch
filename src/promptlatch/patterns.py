@@ -26,7 +26,8 @@ STRICT_SENSITIVE_FIELD_RE = re.compile(
 # part of the token, so a key right after one of them would not match. Accented Latin
 # letters still count as part of a word.
 TOKEN_START = (
-    r"(?:(?<![A-Za-z0-9_\u00C0-\u024F])|(?<=[\\\[;0-9A-Fa-f].)(?:(?<=\\[nrtbfv])|"
+    r"(?:(?<![A-Za-z0-9_\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u024F])|"
+    r"(?<=[\\\[;0-9A-Fa-f].)(?:(?<=\\[nrtbfv])|"
     r"(?<=%[0-9A-Fa-f]{2})|(?<=\\x[0-9A-Fa-f]{2})|(?<=\\u[0-9A-Fa-f]{4})|"
     r"(?<=[\[;0-9][mK])))"
 )
@@ -39,6 +40,9 @@ def _token(
     # Look for the head first. The boundary check is too slow to run at every position.
     return re.compile(rf"(?={head}){start}{head}{tail}{end}")
 
+
+# JSON can escape `/` and base64 characters. An escaped delimiter still ends the value.
+SIGNED_VALUE_CHAR = r"(?:[^&#\s\"'<>`\\)]|\\/|\\u(?!00(?:2[0-9]|3[CcEe]))[0-9A-Fa-f]{4})"
 
 BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("anthropic_key", _token(r"sk-ant-", r"[A-Za-z0-9_-]{20,}")),
@@ -149,18 +153,22 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(
             r"(?i)((?:[?&](?:amp;)?|\\u0026)(?:x-amz-signature|x-amz-credential|"
             r"x-amz-security-token|x-goog-signature|x-goog-credential|googleaccessid|"
-            r"signature|sig)=)([^&#\s\"'<>`\\)]+)"
+            rf"signature|sig)=)({SIGNED_VALUE_CHAR}+)"
         ),
     ),
     (
         "assigned_secret",
         re.compile(
             r"(?i)(?P<prefix>(?<![A-Za-z0-9_.-])(?P<key_quote>[\"']?)"
-            r"(?P<field>[A-Za-z0-9_.-]*(?:api[_-]?keys?|client[_-]?secrets?|"
+            r"(?P<field>[A-Za-z0-9_.-]{0,128}(?:api[_-]?keys?|client[_-]?secrets?|"
             r"secrets?|passwords?|passwd|pwd|tokens?|access[_-]?tokens?|"
             r"refresh[_-]?tokens?|id[_-]?tokens?|auth[_-]?tokens?|session[_-]?tokens?|"
             r"private[_-]?keys?|credentials?|webhook[_-]?urls?|"
-            r"(?:account|access)[_-]?keys?(?![_-]?(?:id|name)))[A-Za-z0-9_.-]*)"
+            # Code uses these names for other things, so the value must look like a key.
+            r"(?:account|access)[_-]?keys?(?![_-]?(?:id|name))"
+            r"(?=[A-Za-z0-9_.-]{0,128}\\*[\"']?[ \t]*[:=][ \t]*\\*[\"']?"
+            r"(?=[A-Za-z+/_=-]{0,64}[0-9])[A-Za-z0-9+/_=-]{16,}(?![A-Za-z0-9.(\[])))"
+            r"[A-Za-z0-9_.-]{0,128})"
             r"\\*(?P=key_quote)\s*[:=]\s*(?P<value_quote>(?:\\*[\"'])?))"
             r"(?P<secret>[^\"'\s;\[\]]{8,})(?P=value_quote)"
         ),
@@ -187,7 +195,8 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"mariadb(?:\+[a-z0-9_]+)?|mongodb(?:\+srv)?|rediss?|amqps?|"
             r"clickhouse(?:s|db)?(?:\+[a-z0-9_]+)?)://"
             r"[^:\s/@]*:)(?![0-9]+/)"
-            r"([^@\s/\"]+(?:/[^@\s/?#\"'<>`,\\]+)*(?:@[^@\s/?#\"'<>`,\\]+)*)(@)"
+            # A quote can be part of the password. Before JSON punctuation it ends the string.
+            r"((?:[^@\s/\"]|\"(?!\s*[,:}\]]))+(?:/[^@\s/?#\"'<>`,\\]+)*(?:@[^@\s/?#\"'<>`,\\]+)*)(@)"
         ),
     ),
 ]

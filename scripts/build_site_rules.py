@@ -19,16 +19,44 @@ OUTPUT = ROOT / "site" / "rules.js"
 UNSUPPORTED = re.compile(r"\(\?>|[*+?}]\+|\\[AZz]|\(\?[aiLmsux-]+[:)]")
 
 
+def expand_scoped_case(source: str) -> str:
+    """Spell out `(?i:...)` groups, because scoped flags are not portable in JavaScript."""
+    result: list[str] = []
+    depth = 0
+    position = 0
+    while position < len(source):
+        char = source[position]
+        if not depth and source.startswith("(?i:", position):
+            result.append("(?:")
+            depth = 1
+            position += 4
+            continue
+        if char == "\\":
+            result.append(source[position : position + 2])
+            position += 2
+            continue
+        if char == "[":
+            end = source.index("]", position + 2) + 1
+            members = source[position + 1 : end - 1]
+            if depth and ("\\" in members or members.startswith("^")):
+                raise ValueError(f"character class needs a translation: {members}")
+            result.append(f"[{members}{members.upper()}]" if depth else source[position:end])
+            position = end
+            continue
+        if depth:
+            depth += (char == "(") - (char == ")")
+        result.append(f"[{char}{char.upper()}]" if depth and char.isalpha() else char)
+        position += 1
+    return "".join(result)
+
+
 def to_javascript(pattern: re.Pattern[str]) -> tuple[str, str]:
     source = pattern.pattern
     flags = "g"
     if pattern.flags & re.IGNORECASE:
         source = source.removeprefix("(?i)")
         flags += "i"
-    elif "(?i:" in source:
-        # Scoped flags are not portable. The affected pattern has no case-sensitive part.
-        source = source.replace("(?i:", "(?:")
-        flags += "i"
+    source = expand_scoped_case(source)
     source = source.replace("(?P<", "(?<")
     source = re.sub(r"\(\?P=(\w+)\)", r"\\k<\1>", source)
     if UNSUPPORTED.search(source):

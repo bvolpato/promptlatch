@@ -13,7 +13,9 @@
       content="A local proxy and Python library that redacts credentials from LLM requests before they leave your machine. Works with Claude Code, Codex, Gemini CLI, OpenCode, and any OpenAI-compatible client."
     />
     <meta name="theme-color" content="#1b3fb5" />
+    <link rel="canonical" href="https://bvolpato.github.io/promptlatch/" />
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="PromptLatch" />
     <meta property="og:url" content="https://bvolpato.github.io/promptlatch/" />
     <meta property="og:title" content="PromptLatch: send the prompt, keep the keys" />
     <meta
@@ -21,6 +23,10 @@
       content="A local proxy that redacts credentials from LLM requests before they leave your machine."
     />
     <meta property="og:image" content="https://bvolpato.github.io/promptlatch/hero.png" />
+    <meta
+      property="og:image:alt"
+      content="A prompt with credentials on your machine, and the same prompt with the credentials redacted at the provider"
+    />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:image" content="https://bvolpato.github.io/promptlatch/hero.png" />
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
@@ -90,7 +96,7 @@
             <label class="sheet-title" for="demo-input">On your machine <em>edit me</em></label>
             <div class="editor">
               <pre id="demo-backdrop" aria-hidden="true"></pre>
-              <textarea id="demo-input" spellcheck="false" autocomplete="off" autocapitalize="off">
+              <textarea id="demo-input" maxlength="50000" spellcheck="false" autocomplete="off" autocapitalize="off">
 Turn on JavaScript to run the demo.</textarea
               >
             </div>
@@ -108,7 +114,7 @@ Turn on JavaScript to run the demo.</textarea
         <p class="letter-note">
           This demo runs the project's built-in patterns in your browser, and this page's content
           policy blocks requests to other sites. The installed engine adds bc-detect-secrets and
-          your own rules.
+          your own rules, so it redacts more and can name a rule differently.
         </p>
       </section>
 
@@ -199,16 +205,16 @@ gemini-latch -p "Summarize recent changes"</code></pre>
           <div class="panel" role="tabpanel" id="panel-opencode" aria-labelledby="tab-opencode" tabindex="0">
             <article>
               <h3>Start the proxy for OpenRouter</h3>
-              <pre><code data-lang="bash">git clone https://github.com/bvolpato/promptlatch.git
-cd promptlatch
-promptlatch serve \
-  --config examples/promptlatch-openrouter.config.yaml</code></pre>
+              <pre><code data-lang="bash">uv tool install promptlatch
+curl -fsSL -o openrouter.yaml \
+  https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/promptlatch-openrouter.config.yaml
+promptlatch serve --config openrouter.yaml</code></pre>
+              <p>This config allows OpenRouter only and keeps the key in OpenCode's environment.</p>
             </article>
             <article>
               <h3>Add the provider to your project</h3>
-              <pre><code data-lang="bash">cp examples/opencode-openrouter-promptlatch.json \
-  ~/my-project/opencode.json
-cd ~/my-project
+              <pre><code data-lang="bash">curl -fsSL -o opencode.json \
+  https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/opencode-openrouter-promptlatch.json
 export OPENROUTER_API_KEY="&lt;openrouter-upstream-key&gt;"
 opencode run "Say ok" \
   -m promptlatch-openrouter/openai/gpt-oss-120b</code></pre>
@@ -220,39 +226,37 @@ opencode run "Say ok" \
               <h3>Use one default provider</h3>
               <pre><code data-lang="bash">promptlatch init --target-base-url https://api.openai.com/v1
 export OPENAI_API_KEY="&lt;openai-upstream-key&gt;"
-promptlatch serve
-
-# Point any OpenAI-compatible client here
-export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"</code></pre>
+promptlatch serve</code></pre>
               <p>
-                Chat Completions, Responses, Anthropic Messages, and Gemini routes pass through in
+                Then set <code>OPENAI_BASE_URL=http://127.0.0.1:8000/v1</code> for any
+                OpenAI-compatible client. Chat Completions, Responses, Anthropic Messages, and Gemini routes pass through in
                 their own format, with streaming and tool calls.
               </p>
             </article>
             <article>
               <h3>OpenRouter request</h3>
-              <pre><code data-lang="bash"># config.yaml
-# target:
-#   allowed_base_urls:
-#     - https://openrouter.ai/api/v1
-
-curl http://127.0.0.1:8000/v1/responses \
+              <pre><code data-lang="bash">curl http://127.0.0.1:8000/v1/responses \
   -H "X-Target-Base-URL: https://openrouter.ai/api/v1" \
   -H "X-Target-API-Key: $OPENROUTER_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"openai/gpt-oss-120b","input":"Say ok"}'</code></pre>
-              <p>Choose a provider per request. The configured key is never sent to another host.</p>
+              <p>
+                Choose a provider per request. The configured key is never sent to another host. To
+                limit the hosts, list each one in the config:
+              </p>
+              <pre><code data-lang="yaml">target:
+  allowed_base_urls:
+    - https://api.openai.com/v1
+    - https://openrouter.ai/api/v1</code></pre>
             </article>
           </div>
 
           <div class="panel" role="tabpanel" id="panel-python" aria-labelledby="tab-python" tabindex="0">
             <article>
               <h3>Add the library</h3>
-              <pre><code data-lang="bash">uv add promptlatch
-# or
-python -m pip install promptlatch</code></pre>
+              <pre><code data-lang="bash">uv add promptlatch</code></pre>
               <p>
-                No proxy needed. Four helpers cover text, messages, SDK parameters, and raw
+                Or use <code>python -m pip install promptlatch</code>. No proxy needed. Four helpers cover text, messages, SDK parameters, and raw
                 payloads. They return a redacted copy and leave your input unchanged.
               </p>
             </article>
@@ -285,6 +289,10 @@ response = client.responses.create(
 
 curl --retry 10 --retry-all-errors --retry-delay 1 \
   -fsS http://127.0.0.1:8000/healthz</code></pre>
+              <p>
+                <code>provider.env</code> holds <code>PROMPTLATCH_TARGET_BASE_URL</code> and
+                <code>PROMPTLATCH_TARGET_API_KEY</code>.
+              </p>
             </article>
             <article>
               <h3>Helm</h3>
@@ -295,7 +303,11 @@ helm install promptlatch \
   https://github.com/bvolpato/promptlatch/releases/download/v0.2.11/promptlatch-0.2.11.tgz \
   --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
   --set existingSecret=promptlatch-env</code></pre>
-              <p>For network access, set a target allowlist and a proxy API key.</p>
+              <p>
+                <code>kubernetes.env</code> holds <code>PROMPTLATCH_TARGET_API_KEY</code> and
+                <code>PROMPTLATCH_SERVER_API_KEY</code>. See the
+                <a href="https://github.com/bvolpato/promptlatch/blob/main/docs/deployment.md">deployment guide</a>.
+              </p>
             </article>
           </div>
         </div>
@@ -461,7 +473,11 @@ promptlatch stats --days 7</code></pre>
             <h3>Check it yourself</h3>
             <p>
               A model's reply cannot prove what was sent. Send a fake key to an echo server and read
-              what arrived.
+              what arrived: <code>GEMINI_API_KEY=[REDACTED_SECRET]</code>.
+            </p>
+            <p>
+              Use the config from <code>promptlatch init</code>. <code>agents.yaml</code> rejects the
+              echo server, because it allows the official provider endpoints only.
             </p>
           </div>
           <pre><code data-lang="bash">FAKE_KEY="AI""zaSyFixtureToken000000000000000000000"
@@ -469,9 +485,7 @@ curl --compressed -fsS http://127.0.0.1:8000/post \
   -H "X-Target-Base-URL: https://postman-echo.com" \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"content":"GEMINI_API_KEY='"$FAKE_KEY"'"}]}' \
-  | jq -r '.data.messages[0].content'
-
-# GEMINI_API_KEY=[REDACTED_SECRET]</code></pre>
+  | jq -r '.data.messages[0].content'</code></pre>
         </div>
       </section>
     </main>

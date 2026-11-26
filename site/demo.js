@@ -1,6 +1,16 @@
 (() => {
   const MASK = "[REDACTED_SECRET]";
-  const PLACEHOLDER = /^<your[-_](?:api[-_]key|client[-_]secret|password|token|secret)(?:[-_]here)?>$/i;
+  const PLACEHOLDER =
+    /^(?:<your[-_](?:api[-_]key|client[-_]secret|password|token|secret)(?:[-_]here)?>|\$\{[a-z_][a-z0-9_]*\})$/i;
+  const TOKEN_COUNT = /[0-9]+(?=[^A-Za-z0-9_.-]|$)/y;
+  const TOKEN_COUNT_LABEL =
+    /(?:budget|cached?|completion|creation|input|max|new|num|output|prompt|read|reasoning|thinking|total)[_-]?tokens\\*["']?\s*[:=]\s*$/i;
+  const BLOCK_OPENER =
+    /^[ \t}]*(?:async[ \t]+)?(?:case|class|def|elif|except|for|if|match|when|while|with)\b.*:[ \t]*$/;
+  const NEXT_STATEMENT = /(?:continue|raise|return)(?=\s|$)|[A-Za-z_][A-Za-z_.-]*(?:[ \t]+[-+*/|&]?=[ \t]|[([])/y;
+  const OPENER_WORDS = new Set(
+    "and as async await case class def elif except for if in is match not or when while with".split(" "),
+  );
   const CODE_REFERENCE = /[A-Za-z_]\w*(?:[ \t]*\.[ \t]*[A-Za-z_]\w*|[ \t]*\([ \t]*\))*[ \t]*[[(]?/y;
   const ASSIGNMENTS = new Set(["assigned_secret", "auth_header"]);
   const SECOND_GROUP = new Set(["signed_url_query_param", "url_credentials"]);
@@ -20,6 +30,40 @@
     CODE_REFERENCE.lastIndex = start;
     const match = CODE_REFERENCE.exec(text);
     return match !== null && match.index + match[0].length >= end;
+  };
+
+  const startsAt = (pattern, text, start) => {
+    pattern.lastIndex = start;
+    return pattern.test(text);
+  };
+
+  // Mirrors _is_token_count: `max_tokens: 4096` is not a secret.
+  const isTokenCount = (text, start) =>
+    startsAt(TOKEN_COUNT, text, start) && TOKEN_COUNT_LABEL.test(text.slice(Math.max(0, start - 32), start));
+
+  // Mirrors _is_next_statement: the indented line after `if token:` is not its value.
+  const isNextStatement = (text, start) => {
+    let position = start;
+    while (position && " \t".includes(text[position - 1])) position -= 1;
+    if (position <= 0 || position >= start || text[position - 1] !== "\n") return false;
+    if (!startsAt(NEXT_STATEMENT, text, start)) return false;
+    const above = text.slice(Math.max(0, position - 513), position - 1);
+    const line = above.slice(above.lastIndexOf("\n") + 1);
+    if ((line.length === above.length && position > 513) || !BLOCK_OPENER.test(line)) return false;
+    // Two plain words in a row are prose, such as `for staging use this password:`.
+    const words = line.match(/[A-Za-z_]\w*|[^\w\s]/g) || [];
+    const plain = (word) => /^[A-Za-z0-9]/.test(word) && !OPENER_WORDS.has(word);
+    return !words.some((word, index) => index > 0 && plain(words[index - 1]) && plain(word));
+  };
+
+  // Mirrors _is_next_label: an empty `access_key:` does not take the next line's label.
+  const isNextLabel = (text, separator, start, end) => {
+    if (!text.slice(separator, start).includes("\n")) return false;
+    const secret = text.slice(start, end);
+    const name = /^[A-Za-z_][A-Za-z_.-]*/.exec(secret);
+    if (name === null) return false;
+    const rest = secret.slice(name[0].length);
+    return rest === ":" || (rest === "" && /^[ \t]*[:=]/.test(text.slice(end, end + 512)));
   };
 
   const secretRange = (name, match) => {
@@ -83,7 +127,11 @@
         const skip =
           secret === MASK ||
           (ASSIGNMENTS.has(name) &&
-            (PLACEHOLDER.test(secret) || isCodeReference(current, start, end)));
+            (PLACEHOLDER.test(secret) ||
+              isCodeReference(current, start, end) ||
+              isTokenCount(current, start) ||
+              isNextStatement(current, start) ||
+              (!match.groups.value_quote && isNextLabel(current, match.index, start, end))));
         if (skip) {
           pattern.lastIndex = Math.max(start, match.index + 1);
           continue;
@@ -253,4 +301,5 @@
 
   input.value = samples.env.join("\n");
   render({ sweep: true });
+  root.classList.add("live");
 })();

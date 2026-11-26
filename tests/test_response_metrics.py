@@ -324,6 +324,107 @@ def test_anthropic_cached_input_and_partial_cumulative_usage() -> None:
     assert result["outcome_override"] is None
 
 
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            {
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 5,
+                        "cache_read_input_tokens": 10,
+                        "cache_creation_input_tokens": 2,
+                        "output_tokens": 1,
+                        "server_tool_use": None,
+                    }
+                },
+            },
+            {
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": None,
+                    "cache_read_input_tokens": None,
+                    "cache_creation_input_tokens": None,
+                    "output_tokens": 7,
+                },
+            },
+            {"type": "message_stop"},
+        ],
+        [
+            {
+                "choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 7,
+                    "total_tokens": None,
+                    "prompt_tokens_details": {"cached_tokens": None, "audio_tokens": None},
+                    "completion_tokens_details": {"reasoning_tokens": None, "audio_tokens": None},
+                },
+            }
+        ],
+    ],
+)
+def test_null_counters_are_unsupplied_rather_than_invalid(events) -> None:
+    metrics = ResponseMetrics(1)
+    for payload in events:
+        metrics.feed(event(payload))
+    metrics.finish_stream()
+    result = metrics.snapshot()
+    assert result["input_tokens"] == 17
+    assert result["output_tokens"] == 7
+    assert result["total_tokens"] == 24
+    assert result["reasoning_tokens"] is None
+    assert result["metrics_incomplete"] is False
+    assert result["unsupported_costs"] is False
+
+
+@pytest.mark.parametrize("details", ["input_tokens_details", "prompt_tokens_details"])
+def test_cache_writes_are_read_from_both_openai_usage_shapes(details: str) -> None:
+    metrics = ResponseMetrics(1)
+    metrics.observe_body(
+        json.dumps(
+            {
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 5,
+                    details: {"cached_tokens": 20, "cache_write_tokens": 60},
+                }
+            }
+        ).encode()
+    )
+    assert metrics.snapshot()["cached_input_tokens"] == 20
+    assert metrics.snapshot()["cache_write_tokens"] == 60
+
+
+@pytest.mark.parametrize("chunk_size", [1, 4096])
+def test_json_body_labelled_as_sse_is_parsed(chunk_size: int) -> None:
+    def observe(payload: dict[str, Any], status: int) -> ResponseMetrics:
+        metrics = ResponseMetrics(1)
+        metrics.response_headers({"content-type": "text/event-stream"}, status)
+        body = b"\n" + json.dumps(payload).encode()
+        for start in range(0, len(body), chunk_size):
+            metrics.feed_response(body[start : start + chunk_size])
+        metrics.finish_response()
+        return metrics
+
+    result = observe(
+        {
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        },
+        200,
+    ).snapshot()
+    assert result["response_format"] == "json"
+    assert result["total_tokens"] == 4
+    assert result["outcome_override"] is None
+    assert result["metrics_incomplete"] is False
+    assert observe({"error": {"message": "bad key", "code": "auth"}}, 401).take_error_details() == {
+        "code": "auth",
+        "message": "bad key",
+    }
+
+
 @pytest.mark.parametrize("newline", [b"\n", b"\r", b"\r\n"])
 @pytest.mark.parametrize("chunk_size", [1, 7, 4096])
 def test_sse_boundaries_utf8_and_multiline_data(newline: bytes, chunk_size: int) -> None:
@@ -892,6 +993,18 @@ def test_oversized_event_is_dropped_and_following_usage_still_parses() -> None:
     assert metrics.snapshot()["metrics_incomplete"] is True
 
 
+@pytest.mark.parametrize("name,outcome", [("completed", None), ("in_progress", "incomplete")])
+def test_oversized_event_name_still_reports_completion(name: str, outcome: str | None) -> None:
+    metrics = ResponseMetrics(1)
+    metrics.response_headers({"content-type": "text/event-stream"}, 200)
+    metrics.feed_response(f"event: response.{name}\n".encode())
+    metrics.feed_response(b'data: {"type": "' + b"x" * (1024 * 1024 + 1) + b'"}\n\n')
+    metrics.finish_response()
+    assert metrics.snapshot()["outcome_override"] == outcome
+    assert metrics.snapshot()["metrics_unavailable_reason"] == "observation_limit"
+    assert metrics.snapshot()["metrics_incomplete"] is True
+
+
 @pytest.mark.parametrize("encoding", ["gzip", "br", "zstd"])
 def test_oversized_compressed_body_is_bounded(encoding: str) -> None:
     metrics = ResponseMetrics(1)
@@ -950,6 +1063,37 @@ def test_actual_service_tier_is_preserved_from_completed_response() -> None:
     metrics.feed(event({"type": "response.completed", "response": {"service_tier": "flex"}}))
     metrics.finish_stream()
     assert metrics.snapshot()["service_tier"] == "flex"
+
+
+def test_anthropic_usage_reports_actual_service_tier() -> None:
+    metrics = ResponseMetrics(1)
+    metrics.observe_body(
+        b'{"type":"message","usage":{"input_tokens":3,"output_tokens":1,"service_tier":"priority"}}'
+    )
+    assert metrics.snapshot()["service_tier"] == "priority"
+
+
+@pytest.mark.parametrize(
+    "stop,code",
+    [
+        ("max_tokens", "upstream_incomplete_max_output_tokens"),
+        ("model_context_window_exceeded", "upstream_incomplete_model_context_window_exceeded"),
+        ("end_turn", None),
+    ],
+)
+def test_nonstream_anthropic_stop_reason_matches_streaming(stop: str, code: str | None) -> None:
+    metrics = ResponseMetrics(1)
+    metrics.observe_body(
+        json.dumps(
+            {
+                "type": "message",
+                "stop_reason": stop,
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            }
+        ).encode()
+    )
+    assert metrics.snapshot()["outcome_override"] == ("incomplete" if code else None)
+    assert metrics.take_error_details().get("code") == code
 
 
 def test_sse_byte_order_mark_and_unterminated_final_event() -> None:

@@ -3,500 +3,519 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PromptLatch</title>
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'"
+    />
+    <title>PromptLatch: send the prompt, keep the keys</title>
     <meta
       name="description"
-      content="Open-source local proxy and Python library for redacting secrets before LLM requests leave your machine."
+      content="A local proxy and Python library that redacts credentials from LLM requests before they leave your machine. Works with Claude Code, Codex, Gemini CLI, OpenCode, and any OpenAI-compatible client."
     />
-    <meta property="og:title" content="PromptLatch" />
+    <meta name="theme-color" content="#1b3fb5" />
+    <link rel="canonical" href="https://bvolpato.github.io/promptlatch/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="PromptLatch" />
+    <meta property="og:url" content="https://bvolpato.github.io/promptlatch/" />
+    <meta property="og:title" content="PromptLatch: send the prompt, keep the keys" />
     <meta
       property="og:description"
-      content="Redact keys, tokens, private keys, signed URLs, and custom rules before requests reach LLM providers."
+      content="A local proxy that redacts credentials from LLM requests before they leave your machine."
     />
     <meta property="og:image" content="https://bvolpato.github.io/promptlatch/hero.png" />
+    <meta
+      property="og:image:alt"
+      content="A prompt with credentials on your machine, and the same prompt with the credentials redacted at the provider"
+    />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:image" content="https://bvolpato.github.io/promptlatch/hero.png" />
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="preload" href="./fonts/archivo.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="./styles.css" />
     <script src="./highlight.js" defer></script>
+    <script src="./rules.js" defer></script>
+    <script src="./demo.js" defer></script>
+    <script src="./site.js" defer></script>
     <script src="./prompt.js" defer></script>
   </head>
   <body>
-    <header class="site-header">
-      <a class="brand" href="#top" aria-label="PromptLatch home">
-        <img class="brand-mark" src="./favicon.svg" alt="" />
-        <span>PromptLatch</span>
-      </a>
-      <nav aria-label="Primary">
-        <a href="#install">Install</a>
-        <a href="#proxy">Proxy</a>
-        <a href="#library">Library</a>
-        <a href="#agents">Agents</a>
-        <a href="#limits">Limits</a>
-        <a href="#security">Security</a>
-        <a href="https://github.com/bvolpato/promptlatch">GitHub</a>
-      </nav>
-    </header>
+    <a class="skip" href="#demo">Skip to the demo</a>
 
-    <main id="top">
-      <section class="hero">
-        <div class="hero-copy">
-          <p class="eyebrow">Local secret redaction</p>
-          <h1>PromptLatch</h1>
-          <p class="lede">
-            PromptLatch runs locally and redacts credentials from LLM request content
-            before sending it to a provider.
+    <div class="envelope envelope-start">
+      <header class="bar-top wrap">
+        <a class="brand" href="#top" aria-label="PromptLatch home">
+          <img src="./favicon.svg" alt="" width="30" height="30" />
+          <span>PromptLatch</span>
+        </a>
+        <nav aria-label="Primary">
+          <a href="#setup">Setup</a>
+          <a href="#coverage">Coverage</a>
+          <a href="#limits">Limits</a>
+          <a href="https://github.com/bvolpato/promptlatch#readme">Docs</a>
+          <a href="https://github.com/bvolpato/promptlatch">GitHub</a>
+        </nav>
+      </header>
+
+      <div id="top" class="hero wrap">
+        <h1><span>Send the prompt.</span> <span>Keep the keys.</span></h1>
+        <div class="hero-side">
+          <p>
+            Coding agents read your .env, your logs, and your configs, then send them to a model.
+            PromptLatch runs on your machine and blacks out the credentials before the request
+            leaves.
           </p>
-          <div class="actions">
-            <a class="button primary" href="#install">Start</a>
-            <a class="button secondary" href="#verify">Verify</a>
-            <button
-              id="copy-prompt"
-              class="button secondary copy-button"
-              type="button"
-              data-prompt-url="./PROMPT.md"
-              aria-describedby="copy-prompt-status"
-            >
-              <img class="button-icon" src="./icons/copy.svg" alt="" />
-              <span id="copy-prompt-label">Copy prompt</span>
+          <div class="command">
+            <code id="install-command">uv tool install promptlatch</code>
+            <button type="button" class="copy" data-copy="#install-command">Copy</button>
+          </div>
+          <p class="hero-links">
+            <a href="#setup">Set up your agent</a>
+            <a href="https://github.com/bvolpato/promptlatch">Read the source</a>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <main>
+      <section id="demo" class="letter wrap" aria-labelledby="demo-title">
+        <h2 id="demo-title" class="sr-only">Try it: edit the prompt and watch what is sent</h2>
+        <div class="letter-tools">
+          <div class="chips" role="group" aria-label="Sample prompt">
+            <button type="button" data-sample="env" aria-pressed="true">.env file</button>
+            <button type="button" data-sample="tool" aria-pressed="false">Tool output</button>
+            <button type="button" data-sample="curl" aria-pressed="false">curl command</button>
+            <button type="button" data-sample="trace" aria-pressed="false">Stack trace</button>
+          </div>
+          <div class="chips" role="group" aria-label="Placeholder style">
+            <button type="button" data-mode="full" aria-pressed="true">Full mask</button>
+            <button type="button" data-mode="tagged" aria-pressed="false">Tagged</button>
+          </div>
+        </div>
+        <div class="sheets">
+          <div class="sheet">
+            <label class="sheet-title" for="demo-input">On your machine <em>edit me</em></label>
+            <div class="editor">
+              <pre id="demo-backdrop" aria-hidden="true"></pre>
+              <textarea id="demo-input" maxlength="50000" spellcheck="false" autocomplete="off" autocapitalize="off">
+Turn on JavaScript to run the demo.</textarea
+              >
+            </div>
+          </div>
+          <div class="perforation" aria-hidden="true"><img src="./favicon.svg" alt="" width="34" height="34" /></div>
+          <div class="sheet">
+            <p class="sheet-title" id="demo-output-title">What the provider receives</p>
+            <pre id="demo-output" role="region" tabindex="0" aria-labelledby="demo-output-title">DATABASE_URL=postgres://app:<span class="bar">[REDACTED_SECRET]</span>@db:5432/prod</pre>
+          </div>
+        </div>
+        <div class="letter-foot">
+          <p aria-live="polite"><strong id="demo-count">1 redaction</strong></p>
+          <ul id="demo-hits" aria-label="Rules that matched"></ul>
+        </div>
+        <p class="letter-note">
+          This demo runs the project's built-in patterns in your browser, and this page's content
+          policy blocks requests to other sites. The installed engine adds bc-detect-secrets and
+          your own rules, so it redacts more and can name a rule differently.
+        </p>
+      </section>
+
+      <section id="setup" class="section wrap" aria-labelledby="setup-title">
+        <div class="section-head">
+          <h2 id="setup-title">Works with the agent you already run</h2>
+          <p>
+            Start one local proxy, then launch your agent through it. The wrappers keep your login
+            and do not edit your agent's config files.
+          </p>
+        </div>
+        <div class="tabs">
+          <div class="tablist" role="tablist" aria-label="Setup guides">
+            <button type="button" role="tab" id="tab-claude" aria-controls="panel-claude">
+              <img src="./icons/anthropic.svg" alt="" width="18" height="18" />Claude Code
             </button>
-            <a class="button secondary" href="https://github.com/bvolpato/promptlatch">GitHub</a>
-            <span id="copy-prompt-status" class="sr-only" aria-live="polite"></span>
+            <button type="button" role="tab" id="tab-codex" aria-controls="panel-codex">
+              <img src="./icons/codex.svg" alt="" width="18" height="18" />Codex
+            </button>
+            <button type="button" role="tab" id="tab-gemini" aria-controls="panel-gemini">
+              <img src="./icons/gemini.svg" alt="" width="18" height="18" />Gemini CLI
+            </button>
+            <button type="button" role="tab" id="tab-opencode" aria-controls="panel-opencode">OpenCode</button>
+            <button type="button" role="tab" id="tab-client" aria-controls="panel-client">
+              <img src="./icons/openai.svg" alt="" width="18" height="18" />Any API client
+            </button>
+            <button type="button" role="tab" id="tab-python" aria-controls="panel-python">Python</button>
+            <button type="button" role="tab" id="tab-deploy" aria-controls="panel-deploy">Docker and Helm</button>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-claude" aria-labelledby="tab-claude" tabindex="0">
+            <article>
+              <h3>Start the proxy once</h3>
+              <pre><code data-lang="bash">uv tool install promptlatch
+curl -fsSO https://bvolpato.github.io/promptlatch/agents.yaml
+promptlatch serve --config agents.yaml</code></pre>
+              <p>It listens on <code>127.0.0.1:8000</code> and allows the official provider endpoints only.</p>
+            </article>
+            <article>
+              <h3>Run Claude Code through it</h3>
+              <pre><code data-lang="bash">claude-latch
+claude-latch -p "Review this repository"</code></pre>
+              <p>
+                Works with a Claude login or <code>ANTHROPIC_API_KEY</code>. If the proxy is down or
+                redaction is off, the wrapper stops instead of sending unredacted prompts.
+              </p>
+            </article>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-codex" aria-labelledby="tab-codex" tabindex="0">
+            <article>
+              <h3>Start the proxy once</h3>
+              <pre><code data-lang="bash">uv tool install promptlatch
+curl -fsSO https://bvolpato.github.io/promptlatch/agents.yaml
+promptlatch serve --config agents.yaml</code></pre>
+              <p>It listens on <code>127.0.0.1:8000</code> and allows the official provider endpoints only.</p>
+            </article>
+            <article>
+              <h3>Run Codex through it</h3>
+              <pre><code data-lang="bash">codex-latch
+codex-latch exec "Review this repository"</code></pre>
+              <p>
+                Uses your ChatGPT login or <code>OPENAI_API_KEY</code>. If the proxy is down or
+                redaction is off, the wrapper stops instead of sending unredacted prompts.
+              </p>
+            </article>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-gemini" aria-labelledby="tab-gemini" tabindex="0">
+            <article>
+              <h3>Start the proxy once</h3>
+              <pre><code data-lang="bash">uv tool install promptlatch
+curl -fsSO https://bvolpato.github.io/promptlatch/agents.yaml
+promptlatch serve --config agents.yaml</code></pre>
+              <p>It listens on <code>127.0.0.1:8000</code> and allows the official provider endpoints only.</p>
+            </article>
+            <article>
+              <h3>Run Gemini CLI through it</h3>
+              <pre><code data-lang="bash">gemini-latch
+gemini-latch -p "Summarize recent changes"</code></pre>
+              <p>
+                Works with Google sign-in or <code>GEMINI_API_KEY</code>. Vertex AI and other modes
+                that would bypass the proxy stop with an error.
+              </p>
+            </article>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-opencode" aria-labelledby="tab-opencode" tabindex="0">
+            <article>
+              <h3>Start the proxy for OpenRouter</h3>
+              <pre><code data-lang="bash">uv tool install promptlatch
+curl -fsSL -o openrouter.yaml \
+  https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/promptlatch-openrouter.config.yaml
+promptlatch serve --config openrouter.yaml</code></pre>
+              <p>This config allows OpenRouter only and keeps the key in OpenCode's environment.</p>
+            </article>
+            <article>
+              <h3>Add the provider to your project</h3>
+              <pre><code data-lang="bash">curl -fsSL -o opencode.json \
+  https://raw.githubusercontent.com/bvolpato/promptlatch/main/examples/opencode-openrouter-promptlatch.json
+export OPENROUTER_API_KEY="&lt;openrouter-upstream-key&gt;"
+opencode run "Say ok" \
+  -m promptlatch-openrouter/openai/gpt-oss-120b</code></pre>
+            </article>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-client" aria-labelledby="tab-client" tabindex="0">
+            <article>
+              <h3>Use one default provider</h3>
+              <pre><code data-lang="bash">promptlatch init --target-base-url https://api.openai.com/v1
+export OPENAI_API_KEY="&lt;openai-upstream-key&gt;"
+promptlatch serve</code></pre>
+              <p>
+                Then set <code>OPENAI_BASE_URL=http://127.0.0.1:8000/v1</code> for any
+                OpenAI-compatible client. Chat Completions, Responses, Anthropic Messages, and Gemini routes pass through in
+                their own format, with streaming and tool calls.
+              </p>
+            </article>
+            <article>
+              <h3>OpenRouter request</h3>
+              <pre><code data-lang="bash">curl http://127.0.0.1:8000/v1/responses \
+  -H "X-Target-Base-URL: https://openrouter.ai/api/v1" \
+  -H "X-Target-API-Key: $OPENROUTER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openai/gpt-oss-120b","input":"Say ok"}'</code></pre>
+              <p>
+                Choose a provider per request. The configured key is never sent to another host. To
+                limit the hosts, list each one in the config:
+              </p>
+              <pre><code data-lang="yaml">target:
+  allowed_base_urls:
+    - https://api.openai.com/v1
+    - https://openrouter.ai/api/v1</code></pre>
+            </article>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-python" aria-labelledby="tab-python" tabindex="0">
+            <article>
+              <h3>Add the library</h3>
+              <pre><code data-lang="bash">uv add promptlatch</code></pre>
+              <p>
+                Or use <code>python -m pip install promptlatch</code>. No proxy needed. Four helpers cover text, messages, SDK parameters, and raw
+                payloads. They return a redacted copy and leave your input unchanged.
+              </p>
+            </article>
+            <article>
+              <h3>Redact at the SDK call</h3>
+              <pre><code data-lang="python">from openai import OpenAI
+from promptlatch import redact_params
+
+client = OpenAI()
+response = client.responses.create(
+    **redact_params(
+        model="gpt-6-sol",
+        input="Read this: GITHUB_TOKEN=example-value-123456",
+    )
+)</code></pre>
+              <p>
+                The same call works with LiteLLM. Use <code>redact_messages</code> for Anthropic and
+                LangChain.
+              </p>
+            </article>
+          </div>
+
+          <div class="panel" role="tabpanel" id="panel-deploy" aria-labelledby="tab-deploy" tabindex="0">
+            <article>
+              <h3>Docker</h3>
+              <pre><code data-lang="bash">docker run -d --name promptlatch --rm \
+  -p 127.0.0.1:8000:8000 \
+  --env-file "$HOME/.config/promptlatch/provider.env" \
+  ghcr.io/bvolpato/promptlatch:0.3.0
+
+curl --retry 10 --retry-all-errors --retry-delay 1 \
+  -fsS http://127.0.0.1:8000/healthz</code></pre>
+              <p>
+                <code>provider.env</code> holds <code>PROMPTLATCH_TARGET_BASE_URL</code> and
+                <code>PROMPTLATCH_TARGET_API_KEY</code>.
+              </p>
+            </article>
+            <article>
+              <h3>Helm</h3>
+              <pre><code data-lang="bash">kubectl create secret generic promptlatch-env \
+  --from-env-file="$HOME/.config/promptlatch/kubernetes.env"
+
+helm install promptlatch \
+  https://github.com/bvolpato/promptlatch/releases/download/v0.3.0/promptlatch-0.3.0.tgz \
+  --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
+  --set existingSecret=promptlatch-env</code></pre>
+              <p>
+                <code>kubernetes.env</code> holds <code>PROMPTLATCH_TARGET_API_KEY</code> and
+                <code>PROMPTLATCH_SERVER_API_KEY</code>. See the
+                <a href="https://github.com/bvolpato/promptlatch/blob/main/docs/deployment.md">deployment guide</a>.
+              </p>
+            </article>
           </div>
         </div>
       </section>
 
-      <section class="proof" aria-label="Open source project facts">
-        <div>
-          <span>Artifacts</span>
-          <strong>Open source, MIT</strong>
-          <p>Releases include Docker, Helm, and Homebrew packages. Release tags are signed.</p>
+      <section class="section wrap" aria-labelledby="request-title">
+        <div class="section-head">
+          <h2 id="request-title">What happens to one request</h2>
+          <p>A request from a coding agent, line by line, on its way to the provider.</p>
         </div>
-        <div>
-          <span>Detection</span>
-          <strong>Deterministic local rules</strong>
-          <p>Provider patterns, bc-detect-secrets, and custom tail or regex rules.</p>
-        </div>
-        <div>
-          <span>Logging</span>
-          <strong>Redacted audit logs</strong>
-          <p>Logs omit matched values and include counts and rule names.</p>
-        </div>
-        <div>
-          <span>API</span>
-          <strong>OpenAI-compatible</strong>
-          <p>Chat Completions, Responses API, legacy completions, models, and pass-through routes.</p>
+        <div class="request" role="table" aria-label="Annotated request">
+          <div class="row" role="row">
+            <code role="cell">POST /v1/responses?token=<b class="bar">[REDACTED_SECRET]</b></code>
+            <p role="cell"><strong class="scan">Scanned</strong> Query parameters, including signed URLs.</p>
+          </div>
+          <div class="row" role="row">
+            <code role="cell"><s>Authorization: Bearer local-client-key</s></code>
+            <p role="cell"><strong class="drop">Dropped</strong> Client credentials, unless you enable forwarding.</p>
+          </div>
+          <div class="row" role="row">
+            <code role="cell"><s>Cookie: session=abc</s></code>
+            <p role="cell"><strong class="drop">Dropped</strong> Cookies and secret-named headers.</p>
+          </div>
+          <div class="row" role="row">
+            <code role="cell"><ins>Authorization: Bearer $OPENAI_API_KEY</ins></code>
+            <p role="cell"><strong class="add">Added</strong> Your provider key, and only for that provider.</p>
+          </div>
+          <div class="row" role="row">
+            <code role="cell">{ "model": "gpt-6-sol", "stream": true,</code>
+            <p role="cell"><strong class="keep">Kept</strong> The JSON shape and provider-specific fields.</p>
+          </div>
+          <div class="row" role="row">
+            <code role="cell">  "input": [{ "role": "user", "content": "GITHUB_TOKEN=<b class="bar">[REDACTED_SECRET]</b>" },</code>
+            <p role="cell"><strong class="scan">Scanned</strong> Prompts and the full conversation history.</p>
+          </div>
+          <div class="row" role="row">
+            <code role="cell">  { "type": "function_call_output", "output": "password=<b class="bar">[REDACTED_SECRET]</b>" }] }</code>
+            <p role="cell"><strong class="scan">Scanned</strong> Tool arguments and tool output, at any depth.</p>
+          </div>
+          <div class="row" role="row">
+            <code role="cell">← data: {"type":"response.output_text.delta"}</code>
+            <p role="cell"><strong class="keep">Kept</strong> Responses stream back unscanned.</p>
+          </div>
         </div>
       </section>
 
-      <section id="verify" class="quickstart" aria-label="Redaction verification">
-        <div>
-          <p class="eyebrow">Verify</p>
-          <h2>Check what leaves your machine.</h2>
+      <section id="coverage" class="section wrap" aria-labelledby="coverage-title">
+        <div class="section-head">
+          <h2 id="coverage-title">What it recognizes</h2>
           <p>
-            Send a fixture token to a public echo endpoint and inspect the forwarded
-            body. A model reply cannot verify the forwarded request.
+            Deterministic rules, so the same input always gives the same result. No model calls and
+            no entropy guessing.
           </p>
         </div>
-        <pre><code>brew tap bvolpato/tap
-brew install promptlatch
-promptlatch init
-promptlatch serve</code></pre>
-        <pre><code>FAKE_KEY="AI""zaSyFixtureToken000000000000000000000"
+        <ul class="coverage">
+          <li><code>sk-proj-<b></b></code><span>OpenAI</span></li>
+          <li><code>sk-ant-<b></b></code><span>Anthropic</span></li>
+          <li><code>AIza<b></b></code><span>Google Gemini</span></li>
+          <li><code>sk-or-v1-<b></b></code><span>OpenRouter</span></li>
+          <li><code>xai-<b></b></code><span>xAI</span></li>
+          <li><code>gsk_<b></b></code><span>Groq</span></li>
+          <li><code>pplx-<b></b></code><span>Perplexity</span></li>
+          <li><code>hf_<b></b></code><span>Hugging Face</span></li>
+          <li><code>r8_<b></b></code><span>Replicate</span></li>
+          <li><code>ghp_<b></b></code><span>GitHub</span></li>
+          <li><code>glpat-<b></b></code><span>GitLab</span></li>
+          <li><code>ATATT<b></b></code><span>Atlassian</span></li>
+          <li><code>lin_api_<b></b></code><span>Linear</span></li>
+          <li><code>AKIA<b></b></code><span>AWS</span></li>
+          <li><code>ya29.<b></b></code><span>Google Cloud</span></li>
+          <li><code>dapi<b></b></code><span>Databricks</span></li>
+          <li><code>dop_v1_<b></b></code><span>DigitalOcean</span></li>
+          <li><code>hvs.<b></b></code><span>Vault</span></li>
+          <li><code>tskey-<b></b></code><span>Tailscale</span></li>
+          <li><code>sk_live_<b></b></code><span>Stripe</span></li>
+          <li><code>shpat_<b></b></code><span>Shopify</span></li>
+          <li><code>xoxb-<b></b></code><span>Slack</span></li>
+          <li><code>SG.<b></b></code><span>SendGrid</span></li>
+          <li><code>npm_<b></b></code><span>npm</span></li>
+          <li><code>pypi-<b></b></code><span>PyPI</span></li>
+          <li><code>sbp_<b></b></code><span>Supabase</span></li>
+          <li><code>vcp_<b></b></code><span>Vercel</span></li>
+          <li><code>napi_<b></b></code><span>Neon</span></li>
+          <li><code>glsa_<b></b></code><span>Grafana</span></li>
+          <li><code>sntrys_<b></b></code><span>Sentry</span></li>
+          <li><code>eyJ<b></b></code><span>JWTs</span></li>
+          <li><code>://user:<b></b>@</code><span>Database URLs</span></li>
+          <li><code>sig=<b></b></code><span>Signed URLs</span></li>
+          <li><code>-----BEGIN<b></b></code><span>PEM and PGP</span></li>
+          <li><code>password=<b></b></code><span>Labeled values</span></li>
+          <li><code>…<b></b>abcd1234</code><span>Your own rules</span></li>
+        </ul>
+        <p class="after">
+          Not a complete list. Add an exact-tail or regex rule for internal formats, and store only
+          the last few characters of a secret instead of the secret itself.
+          <a href="https://github.com/bvolpato/promptlatch/blob/main/src/promptlatch/patterns.py">See every pattern</a>.
+        </p>
+      </section>
+
+      <section class="section wrap" aria-labelledby="inspector-title">
+        <div class="section-head">
+          <h2 id="inspector-title">See what was sent</h2>
+          <p>
+            A local inspector shows each redacted request, what matched, and what it cost. Nothing
+            in it leaves your machine.
+          </p>
+        </div>
+        <div class="inspector">
+          <div>
+            <ul>
+              <li>Conversations grouped by session, with the redacted payload for each request.</li>
+              <li>Tokens, latency, and cost estimates for OpenAI, Anthropic, and Gemini traffic.</li>
+              <li>Redaction counts by rule, without storing secret values.</li>
+              <li>A size cap on disk, or metadata only if you prefer.</li>
+            </ul>
+            <pre><code data-lang="bash">promptlatch serve --dashboard
+promptlatch tail --follow
+promptlatch stats --days 7</code></pre>
+          </div>
+          <figure>
+            <img
+              class="shot"
+              src="./dashboard.png"
+              width="1900"
+              height="1094"
+              loading="lazy"
+              alt="PromptLatch dashboard showing a captured conversation in which credentials appear as REDACTED_SECRET, next to a list of sessions"
+            />
+            <figcaption>Sample data. Secrets in the captured conversation appear as placeholders.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section id="limits" class="section wrap" aria-labelledby="limits-title">
+        <div class="section-head">
+          <h2 id="limits-title">Where the protection stops</h2>
+          <p>PromptLatch protects what goes into a request. Know what sits outside it.</p>
+        </div>
+        <div class="limits">
+          <div>
+            <h3>Covered</h3>
+            <ul>
+              <li>JSON, form, and text request bodies, plus query parameters.</li>
+              <li><code>gzip</code> and <code>zstd</code> bodies, with limits on expansion.</li>
+              <li>Private and loopback targets are blocked by default.</li>
+              <li>Audit logs hold counts and rule names, never values.</li>
+              <li>No telemetry and no analytics.</li>
+            </ul>
+          </div>
+          <div>
+            <h3>Not covered</h3>
+            <ul>
+              <li>Private token formats that no rule describes.</li>
+              <li>Provider responses, MCP servers, and tool subprocesses.</li>
+              <li>Multipart uploads. The proxy rejects them instead of guessing.</li>
+              <li>Names, source code, and other private text. Redaction is not anonymization.</li>
+              <li><code>--debug-requests</code> prints raw bodies. Use it with fake data only.</li>
+            </ul>
+          </div>
+        </div>
+        <div class="verify">
+          <div>
+            <h3>Check it yourself</h3>
+            <p>
+              A model's reply cannot prove what was sent. Send a fake key to an echo server and read
+              what arrived: <code>GEMINI_API_KEY=[REDACTED_SECRET]</code>.
+            </p>
+            <p>
+              Use the config from <code>promptlatch init</code>. <code>agents.yaml</code> rejects the
+              echo server, because it allows the official provider endpoints only.
+            </p>
+          </div>
+          <pre><code data-lang="bash">FAKE_KEY="AI""zaSyFixtureToken000000000000000000000"
 curl --compressed -fsS http://127.0.0.1:8000/post \
   -H "X-Target-Base-URL: https://postman-echo.com" \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"content":"GEMINI_API_KEY='"$FAKE_KEY"'"}]}' \
-  | jq -r '.data.messages[0].content'
-
-# GEMINI_API_KEY=[REDACTED_SECRET]</code></pre>
-      </section>
-
-      <section id="install" class="section">
-        <div class="section-copy">
-          <p class="eyebrow">Install</p>
-          <h2>Install proxy or library.</h2>
-          <p>
-            Run the proxy for existing clients, or add the Python library to redact
-            prompts and request data inside your application.
-          </p>
+  | jq -r '.data.messages[0].content'</code></pre>
         </div>
-        <div class="code-grid">
-          <pre><code>brew tap bvolpato/tap
-brew install promptlatch
-promptlatch init --target-base-url https://api.openai.com/v1
-export OPENAI_API_KEY="&lt;openai-upstream-key&gt;"
-promptlatch serve</code></pre>
-          <pre><code>uv tool install promptlatch
-promptlatch doctor</code></pre>
-          <pre><code>uv add promptlatch
-# or
-python -m pip install promptlatch</code></pre>
-        </div>
-      </section>
-
-      <section id="proxy" class="section">
-        <div class="section-copy">
-          <p class="eyebrow">Proxy mode</p>
-          <h2>Choose upstream in config or per request.</h2>
-          <p>
-            PromptLatch redacts JSON and text bodies, forwards the original route, and
-            leaves provider-specific fields intact. Set one default target, or send
-            per-request target headers.
-          </p>
-        </div>
-        <div class="agent-grid">
-          <article>
-            <h3>OpenAI default</h3>
-            <pre><code>curl http://127.0.0.1:8000/v1/responses \
-  -H "X-Target-Base-URL: https://api.openai.com/v1" \
-  -H "X-Target-API-Key: $OPENAI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-6-sol","input":"Reply exactly: ok"}' \
-  | jq -r '.output[0].content[0].text'</code></pre>
-          </article>
-          <article>
-            <h3>Config default</h3>
-            <pre><code>target:
-  default_base_url: https://api.openai.com/v1
-  api_key: ${OPENAI_API_KEY}
-  api_key_header: authorization
-redaction:
-  engine: detect-secrets
-  redact_mode: full</code></pre>
-          </article>
-          <article>
-            <h3>OpenRouter request</h3>
-            <pre><code># config.yaml
-target:
-  allowed_base_urls:
-    - https://openrouter.ai/api/v1
-
-curl http://127.0.0.1:8000/v1/responses \
-  -H "X-Target-Base-URL: https://openrouter.ai/api/v1" \
-  -H "X-Target-API-Key: $OPENROUTER_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"openai/gpt-oss-120b","input":"Reply exactly: ok"}'</code></pre>
-          </article>
-          <article>
-            <h3>Anthropic-compatible</h3>
-            <pre><code>curl http://127.0.0.1:8000/v1/messages \
-  -H "X-Target-Base-URL: https://api.anthropic.com" \
-  -H "X-Target-API-Key: $ANTHROPIC_API_KEY" \
-  -H "X-Target-API-Key-Header: x-api-key" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-opus-4-8","max_tokens":64,"messages":[{"role":"user","content":"Reply exactly: ok"}]}'</code></pre>
-          </article>
-          <article>
-            <h3>Local Ollama/vLLM</h3>
-            <pre><code>target:
-  default_base_url: http://127.0.0.1:11434/v1
-  allowed_base_urls:
-    - http://127.0.0.1:11434/v1
-  block_private_targets: false</code></pre>
-          </article>
-          <article>
-            <h3>Routes</h3>
-            <pre><code>/v1/chat/completions
-/v1/responses
-/v1/completions
-/v1/models
-/v1/messages
-/v1beta/models/:generateContent</code></pre>
-          </article>
-        </div>
-      </section>
-
-      <section id="library" class="section">
-        <div class="section-copy">
-          <p class="eyebrow">Library</p>
-          <h2>Redact values before SDK calls.</h2>
-          <p>
-            No proxy required. PromptLatch returns a redacted value; pass that returned
-            value to the SDK or HTTP client. It does not intercept or modify SDK calls.
-            If redaction raises an error, do not send the original input.
-          </p>
-        </div>
-        <div class="agent-grid">
-          <article>
-            <h3>Prompt text</h3>
-            <pre><code>from openai import OpenAI
-from promptlatch import redact_text
-
-client = OpenAI()
-prompt = "Inspect config: OPENAI_API_KEY=example-secret-value-123456"
-client.responses.create(
-  model="gpt-6-sol",
-  input=redact_text(prompt),
-)</code></pre>
-          </article>
-          <article>
-            <h3>Message arrays</h3>
-            <pre><code>from openai import OpenAI
-from promptlatch import redact_messages
-
-client = OpenAI()
-messages = [{"role": "user", "content": "GITHUB_TOKEN=example-token-value-123456"}]
-safe_messages = redact_messages(messages)
-
-client.chat.completions.create(
-  model="gpt-6-sol",
-  messages=safe_messages,
-)</code></pre>
-          </article>
-          <article>
-            <h3>SDK parameters</h3>
-            <pre><code>from openai import OpenAI
-from promptlatch import redact_params
-
-client = OpenAI()
-
-safe_params = redact_params(
-  model="gpt-6-sol",
-  input="Authorization: Bearer FixtureToken000000000000000000000",
-)
-client.responses.create(**safe_params)</code></pre>
-          </article>
-          <article>
-            <h3>Structured payloads</h3>
-            <pre><code>import os
-import httpx
-from promptlatch import redact_payload
-
-payload = {
-  "model": "gpt-6-sol",
-  "input": [{"role": "user", "content": [
-    {"type": "input_text", "text": "OPENAI_API_KEY=example-secret-value-123456"}
-  ]}],
-}
-httpx.post(
-  "https://api.openai.com/v1/responses",
-  headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-  json=redact_payload(payload),
-)</code></pre>
-          </article>
-          <article>
-            <h3>LiteLLM</h3>
-            <pre><code>from litellm import completion
-from promptlatch import redact_params
-
-completion(**redact_params(
-  model="openai/gpt-6-sol",
-  messages=[{"role": "user", "content": "GEMINI_API_KEY=example-key-value-123456"}],
-))</code></pre>
-          </article>
-          <article>
-            <h3>LangChain</h3>
-            <pre><code>from langchain_openai import ChatOpenAI
-from promptlatch import redact_messages
-
-llm = ChatOpenAI(model="gpt-6-sol")
-llm.invoke(redact_messages([
-  ("human", "token=example-token-value-123456"),
-]))</code></pre>
-          </article>
-        </div>
-        <p class="section-copy">
-          Helpers return new redacted values and leave input data unchanged. Use
-          <code>scan_text</code>, <code>scan_messages</code>, <code>scan_params</code>,
-          or <code>scan_payload</code> to inspect redaction counts. Keep provider
-          authentication in SDK configuration; these helpers redact application
-          request content.
-        </p>
-      </section>
-
-      <section id="agents" class="section">
-        <div class="section-copy">
-          <p class="eyebrow">Agent configs</p>
-          <h2>Point coding agents at local proxy.</h2>
-        </div>
-        <div class="agent-grid">
-          <article>
-            <h3>Codex</h3>
-            <pre><code>model = "openai/gpt-oss-120b"
-model_provider = "promptlatch-openrouter"
-
-[model_providers.promptlatch-openrouter]
-name = "PromptLatch OpenRouter"
-base_url = "http://127.0.0.1:8000/v1"
-wire_api = "responses"
-env_http_headers = { "X-Target-API-Key" = "OPENROUTER_API_KEY" }
-http_headers = { "X-Target-Base-URL" = "https://openrouter.ai/api/v1" }
-
-# ~/.codex/openrouter-promptlatch.config.toml
-# codex -p openrouter-promptlatch</code></pre>
-            <pre><code>cp examples/promptlatch-openrouter.config.yaml \
-  ~/.config/promptlatch/config.yaml
-cp examples/codex-openrouter-promptlatch.config.toml \
-  ~/.codex/openrouter-promptlatch.config.toml
-export OPENROUTER_API_KEY="&lt;openrouter-upstream-key&gt;"
-promptlatch serve
-codex -p openrouter-promptlatch</code></pre>
-            <p>Use a Responses-capable backend. Current Codex custom tools do not fit the Chat Completions bridge.</p>
-          </article>
-          <article>
-            <h3>OpenCode</h3>
-            <pre><code>{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "promptlatch-openrouter": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "PromptLatch OpenRouter",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "headers": {
-          "X-Target-Base-URL": "https://openrouter.ai/api/v1",
-          "X-Target-API-Key": "{env:OPENROUTER_API_KEY}"
-        }
-      },
-      "models": {
-        "openai/gpt-oss-120b": {
-          "name": "gpt-oss via PromptLatch"
-        }
-      }
-    }
-  },
-  "model": "promptlatch-openrouter/openai/gpt-oss-120b"
-}</code></pre>
-            <pre><code>export OPENROUTER_API_KEY="&lt;openrouter-upstream-key&gt;"
-opencode run \
-  -m promptlatch-openrouter/openai/gpt-oss-120b \
-  "Reply with exactly: promptlatch-opencode-ok"</code></pre>
-          </article>
-          <article>
-            <h3>Claude Code</h3>
-            <pre><code>export PROMPTLATCH_TARGET_BASE_URL="https://api.anthropic.com"
-export PROMPTLATCH_TARGET_API_KEY="$ANTHROPIC_UPSTREAM_API_KEY"
-export PROMPTLATCH_TARGET_API_KEY_HEADER="x-api-key"
-export PROMPTLATCH_SERVER_API_KEY="&lt;local-proxy-key&gt;"
-promptlatch serve
-
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
-export ANTHROPIC_AUTH_TOKEN="$PROMPTLATCH_SERVER_API_KEY"
-export DISABLE_TELEMETRY=1
-claude</code></pre>
-          </article>
-          <article>
-            <h3>Gemini CLI</h3>
-            <pre><code>promptlatch serve \
-  --config examples/promptlatch-agents.config.yaml
-
-# Uses saved Google OAuth or GEMINI_API_KEY
-gemini-latch</code></pre>
-          </article>
-        </div>
-      </section>
-
-      <section id="limits" class="section limits">
-        <div class="section-copy">
-          <p class="eyebrow">Limits</p>
-          <h2>Request redaction has a clear boundary.</h2>
-          <p>
-            PromptLatch scans request bodies and query parameters before forwarding.
-            Some credential flows are outside that boundary.
-          </p>
-        </div>
-        <ul>
-          <li>Provider auth is added from config or dedicated target headers after client header filtering.</li>
-          <li>Unknown private token formats need a custom exact-tail or regex rule.</li>
-          <li>Single <code>gzip</code> and <code>zstd</code> request bodies are decompressed with bounded expansion limits; multipart uploads and unsupported or stacked encodings are rejected while redaction is enabled.</li>
-          <li>Provider responses pass through without scanning or redaction.</li>
-          <li><code>--debug-requests</code> can print raw local request bodies. Use fixture data only.</li>
-        </ul>
-      </section>
-
-      <section id="deploy" class="section">
-        <div class="section-copy">
-          <p class="eyebrow">Deploy</p>
-          <h2>Keep personal proxy on localhost.</h2>
-          <p>
-            For network access, set a target allowlist and a local proxy API key.
-          </p>
-        </div>
-        <div class="agent-grid">
-          <article>
-            <h3>Docker</h3>
-            <pre><code>docker run -d --name promptlatch --rm \
-  -p 127.0.0.1:8000:8000 \
-  --env-file "$HOME/.config/promptlatch/provider.env" \
-  ghcr.io/bvolpato/promptlatch:0.2.11
-
-curl --retry 10 --retry-connrefused --retry-delay 1 \
-  -fsS http://127.0.0.1:8000/healthz</code></pre>
-          </article>
-          <article>
-            <h3>Helm</h3>
-            <pre><code>kubectl create secret generic promptlatch-env \
-  --from-env-file="$HOME/.config/promptlatch/kubernetes.env"
-
-helm install promptlatch \
-  https://github.com/bvolpato/promptlatch/releases/download/v0.2.11/promptlatch-0.2.11.tgz \
-  --set env.PROMPTLATCH_TARGET_DEFAULT_BASE_URL=https://api.openai.com/v1 \
-  --set existingSecret=promptlatch-env
-
-kubectl wait deployment/promptlatch --for=condition=Available --timeout=90s
-export PROMPTLATCH_SERVER_API_KEY="$(kubectl get secret promptlatch-env \
-  -o jsonpath='{.data.PROMPTLATCH_SERVER_API_KEY}' | base64 --decode)"
-kubectl port-forward svc/promptlatch 8000:8000
-curl -fsS http://127.0.0.1:8000/healthz</code></pre>
-          </article>
-        </div>
-      </section>
-
-      <section class="coverage section">
-        <div>
-          <p class="eyebrow">Coverage</p>
-          <h2>Tested credential formats.</h2>
-          <p>
-            Deterministic patterns cover provider keys, personal access tokens, JWTs,
-            signed URLs, private key blocks, URL credentials, and assignment-style secrets.
-          </p>
-        </div>
-        <div class="token-grid" aria-label="Covered secret families">
-          <span><img class="coverage-icon mono" src="./icons/github.svg" alt="" loading="lazy" />GitHub PATs</span>
-          <span><img class="coverage-icon mono" src="./icons/atlassian.svg" alt="" loading="lazy" />Atlassian</span>
-          <span><img class="coverage-icon mono" src="./icons/openai.svg" alt="" loading="lazy" />OpenAI</span>
-          <span><img class="coverage-icon" src="./icons/gemini.svg" alt="" loading="lazy" />Gemini</span>
-          <span><img class="coverage-icon mono" src="./icons/anthropic.svg" alt="" loading="lazy" />Anthropic</span>
-          <span><img class="coverage-icon mono" src="./icons/openrouter.svg" alt="" loading="lazy" />OpenRouter</span>
-          <span><img class="coverage-icon mono" src="./icons/zai.svg" alt="" loading="lazy" />Z.AI</span>
-          <span><img class="coverage-icon mono" src="./icons/minimax.svg" alt="" loading="lazy" />MiniMax</span>
-          <span><img class="coverage-icon" src="./icons/deepseek.svg" alt="" loading="lazy" />DeepSeek</span>
-          <span><img class="coverage-icon mono" src="./icons/codex.svg" alt="" loading="lazy" />Codex</span>
-          <span><img class="coverage-icon mono" src="./icons/xai.svg" alt="" loading="lazy" />Grok/xAI</span>
-          <span><img class="coverage-icon" src="./icons/fireworks.svg" alt="" loading="lazy" />Fireworks</span>
-          <span><img class="coverage-icon mono" src="./icons/cloudflare.svg" alt="" loading="lazy" />Cloudflare</span>
-          <span><img class="coverage-icon mono" src="./icons/aws.svg" alt="" loading="lazy" />AWS</span>
-          <span><img class="coverage-icon mono generic" src="./icons/link-2.svg" alt="" loading="lazy" />Signed URLs</span>
-          <span><img class="coverage-icon mono generic" src="./icons/key-round.svg" alt="" loading="lazy" />PGP keys</span>
-          <span><img class="coverage-icon mono generic" src="./icons/hash.svg" alt="" loading="lazy" />Slack</span>
-          <span><img class="coverage-icon mono" src="./icons/stripe.svg" alt="" loading="lazy" />Stripe</span>
-          <span><img class="coverage-icon mono" src="./icons/jwt.svg" alt="" loading="lazy" />JWTs</span>
-          <span><img class="coverage-icon mono generic" src="./icons/file-key-2.svg" alt="" loading="lazy" />PEM keys</span>
-          <span><img class="coverage-icon mono generic" src="./icons/regex.svg" alt="" loading="lazy" />Custom rules</span>
-        </div>
-      </section>
-
-      <section id="security" class="section security">
-        <div>
-          <p class="eyebrow">Security</p>
-          <h2>Security properties.</h2>
-        </div>
-        <ul>
-          <li>No telemetry or analytics.</li>
-          <li>Entropy-only matching is disabled to avoid unpredictable false positives.</li>
-          <li>Tail-only rules cover internal formats without storing full secrets.</li>
-          <li>Optional AES-GCM encryption for rules at rest.</li>
-          <li>Audit logs store counts and rule names without secret values.</li>
-        </ul>
       </section>
     </main>
 
-    <footer>
-      <span>MIT licensed.</span>
-      <a href="https://github.com/bvolpato/promptlatch">GitHub</a>
-      <a href="https://github.com/bvolpato/promptlatch/blob/main/SECURITY.md">Security</a>
+    <footer class="envelope envelope-end">
+      <div class="wrap">
+        <h2>Let your agent install it</h2>
+        <p>
+          Copy the integration prompt into your coding agent. It picks proxy or library mode,
+          installs PromptLatch, and runs the echo check.
+        </p>
+        <button
+          id="copy-prompt"
+          class="button"
+          type="button"
+          data-prompt-url="./PROMPT.md"
+          aria-describedby="copy-prompt-status"
+        >
+          <img class="button-icon" src="./icons/copy.svg" alt="" width="18" height="18" />
+          <span id="copy-prompt-label">Copy prompt</span>
+        </button>
+        <span id="copy-prompt-status" class="sr-only" aria-live="polite"></span>
+        <div class="foot-links">
+          <span>MIT licensed</span>
+          <a href="https://github.com/bvolpato/promptlatch">GitHub</a>
+          <a href="https://pypi.org/project/promptlatch/">PyPI</a>
+          <a href="https://github.com/bvolpato/promptlatch/blob/main/SECURITY.md">Security policy</a>
+          <a href="https://github.com/bvolpato/promptlatch/releases">Releases</a>
+        </div>
+      </div>
     </footer>
   </body>
 </html>

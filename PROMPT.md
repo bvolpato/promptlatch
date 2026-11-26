@@ -20,8 +20,7 @@ Choose one proxy installation method.
 Homebrew:
 
 ```bash
-brew tap bvolpato/tap
-brew install promptlatch
+brew install bvolpato/tap/promptlatch
 promptlatch version
 ```
 
@@ -35,9 +34,9 @@ promptlatch version
 Docker:
 
 ```bash
-docker pull ghcr.io/bvolpato/promptlatch:0.2.11
+docker pull ghcr.io/bvolpato/promptlatch:0.3.0
 docker run --rm --entrypoint promptlatch \
-  ghcr.io/bvolpato/promptlatch:0.2.11 version
+  ghcr.io/bvolpato/promptlatch:0.3.0 version
 ```
 
 Source checkout:

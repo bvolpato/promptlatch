@@ -10,7 +10,7 @@
     <title>PromptLatch: send the prompt, keep the keys</title>
     <meta
       name="description"
-      content="A local proxy and Python library that redacts credentials from LLM requests before they leave your machine. Works with Claude Code, Codex, Gemini CLI, OpenCode, and any OpenAI-compatible client."
+      content="A local proxy and Python library that redacts credentials from LLM requests before they leave your machine. Works with Claude Code, Codex, Antigravity CLI, OpenCode, and any OpenAI-compatible client."
     />
     <meta name="theme-color" content="#1b3fb5" />
     <link rel="canonical" href="https://bvolpato.github.io/promptlatch/" />
@@ -134,9 +134,7 @@ Turn on JavaScript to run the demo.</textarea
             <button type="button" role="tab" id="tab-codex" aria-controls="panel-codex">
               <img src="./icons/codex.svg" alt="" width="18" height="18" />Codex
             </button>
-            <button type="button" role="tab" id="tab-gemini" aria-controls="panel-gemini">
-              <img src="./icons/gemini.svg" alt="" width="18" height="18" />Gemini CLI
-            </button>
+            <button type="button" role="tab" id="tab-antigravity" aria-controls="panel-antigravity">Antigravity</button>
             <button type="button" role="tab" id="tab-opencode" aria-controls="panel-opencode">OpenCode</button>
             <button type="button" role="tab" id="tab-client" aria-controls="panel-client">
               <img src="./icons/openai.svg" alt="" width="18" height="18" />Any API client
@@ -183,21 +181,26 @@ codex-latch exec "Review this repository"</code></pre>
             </article>
           </div>
 
-          <div class="panel" role="tabpanel" id="panel-gemini" aria-labelledby="tab-gemini" tabindex="0">
+          <div class="panel" role="tabpanel" id="panel-antigravity" aria-labelledby="tab-antigravity" tabindex="0">
             <article>
-              <h3>Start the proxy once</h3>
+              <h3>Start the proxy for the Gemini API</h3>
               <pre><code data-lang="bash">uv tool install promptlatch
 curl -fsSO https://bvolpato.github.io/promptlatch/agents.yaml
-promptlatch serve --config agents.yaml</code></pre>
-              <p>It listens on <code>127.0.0.1:8000</code> and allows the official provider endpoints only.</p>
+PROMPTLATCH_TARGET_BASE_URL=https://generativelanguage.googleapis.com \
+  promptlatch serve --config agents.yaml</code></pre>
+              <p>
+                <code>claude-latch</code> and <code>codex-latch</code> can use the same proxy. Still on
+                Gemini CLI? Run <code>gemini-latch</code>.
+              </p>
             </article>
             <article>
-              <h3>Run Gemini CLI through it</h3>
-              <pre><code data-lang="bash">gemini-latch
-gemini-latch -p "Summarize recent changes"</code></pre>
+              <h3>Run Antigravity CLI through it</h3>
+              <pre><code data-lang="bash">export GEMINI_API_KEY="&lt;gemini-api-key&gt;"
+export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:8000"
+agy --settings '{"modelProvider":"gemini"}'</code></pre>
               <p>
-                Works with Google sign-in or <code>GEMINI_API_KEY</code>. Vertex AI and other modes
-                that would bypass the proxy stop with an error.
+                Needs a Gemini API key. Account sign-in ignores the proxy, and no wrapper checks this.
+                Run <code>promptlatch tail --follow</code> and confirm that your first request appears.
               </p>
             </article>
           </div>

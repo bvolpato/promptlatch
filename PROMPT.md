@@ -101,9 +101,13 @@ the allowlist and send matching `X-Target-Base-URL` and `X-Target-API-Key` heade
 Never forward the configured target key to a different host.
 
 Point OpenAI-compatible clients at `http://127.0.0.1:8000/v1`, Claude Code
-`ANTHROPIC_BASE_URL` at `http://127.0.0.1:8000`, and Gemini CLI / Google GenAI
-`GOOGLE_GEMINI_BASE_URL` at `http://127.0.0.1:8000` (or run `codex-latch`,
-`claude-latch`, and `gemini-latch` against `examples/promptlatch-agents.config.yaml`).
+`ANTHROPIC_BASE_URL` at `http://127.0.0.1:8000`, and Google GenAI
+`GOOGLE_GEMINI_BASE_URL` at `http://127.0.0.1:8000` (or run `codex-latch` and
+`claude-latch` against `examples/promptlatch-agents.config.yaml`).
+Antigravity CLI (`agy`) replaces Gemini CLI. It uses `GOOGLE_GEMINI_BASE_URL` only in
+API-key mode: set `GEMINI_API_KEY`, run `agy --settings '{"modelProvider":"gemini"}'`,
+and make `https://generativelanguage.googleapis.com` the default target. Its account
+sign-in does not use the proxy. Use `gemini-latch` only for Gemini CLI, never for `agy`.
 Some SDKs require a local API-key value even when PromptLatch has no
 `server.api_key`; use a non-secret placeholder. Do not invent a PromptLatch key
 unless local proxy auth is enabled.

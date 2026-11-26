@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/bvolpato/promptlatch
-  tag: "0.2.11"
+  tag: "0.3.0"
   pullPolicy: IfNotPresent
 
 service:
@@ -20,7 +20,7 @@ migration:
   preserveSelector: false
 
 # Existing Secret keys are loaded as environment variables. Include
-# PROMPTLATCH_SERVER_API_KEY when serverAuth.enabled is true. The 0.2 chart also
+# PROMPTLATCH_SERVER_API_KEY when serverAuth.enabled is true. The chart also
 # accepts the previous variable name during upgrades.
 existingSecret: ""
 

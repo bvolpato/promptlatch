@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import posixpath
+import re
 import secrets
 import socket
 from collections.abc import AsyncIterator, Iterable, Mapping, MutableMapping
@@ -63,6 +64,7 @@ from promptlatch.request_compression import (
 from promptlatch.version import __version__
 
 logger = logging.getLogger("promptlatch")
+_JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 DROP_REQUEST_HEADERS = {
     "content-length",
@@ -619,18 +621,27 @@ def _redact_request_body(
     parsed = _undeclared_json(content)
     if parsed is not None:
         payload, repeated_keys = parsed
+        if repeated_keys and not undeclared[1]:
+            raise _key_collision()
         result = _redact_json(payload, redactor, protocol)
         stats.merge(result.stats)
         if result.stats.redactions or repeated_keys:
             content = _json_bytes(result.value)
         return body, content, stats, result.value
 
-    # The text scan broke the JSON, so scan the original values and then the new text.
-    payload, repeated_keys = undeclared
-    result = _redact_json(payload, redactor, protocol)
-    if result.stats.redactions or repeated_keys:
-        content, stats = _redact_bytes(_json_bytes(result.value), redactor)
-        stats.merge(result.stats)
+    # The text scan broke the JSON. Redact each string of the valid original in place, so that
+    # the text rules still see its whitespace, numbers, and escapes.
+    string_stats = RedactionStats()
+
+    def redact_string(match: re.Match[str]) -> str:
+        result = redactor.redact_text(json.loads(match[0]))
+        string_stats.merge(result.stats)
+        return json.dumps(result.value) if result.stats.redactions else match[0]
+
+    text = body.decode(json.detect_encoding(body), "surrogatepass")
+    text = _JSON_STRING.sub(redact_string, text)
+    content, stats = _redact_bytes(text.encode("utf-8", "surrogatepass"), redactor)
+    stats.merge(string_stats)
     return body, content, stats, None
 
 
@@ -644,10 +655,7 @@ def _redact_json(
             return redactor.redact_payload(payload)
         return redactor.redact_payload(payload, protocol=protocol)
     except RedactionKeyCollisionError:
-        raise HTTPException(
-            status_code=400,
-            detail="request contains colliding keys after redaction",
-        ) from None
+        raise _key_collision() from None
     except RecursionError:
         raise _too_deep() from None
 
@@ -659,6 +667,10 @@ def _redact_bytes(body: bytes, redactor: SecretRedactor) -> tuple[bytes, Redacti
 
 def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _key_collision() -> HTTPException:
+    return HTTPException(status_code=400, detail="request contains colliding keys after redaction")
 
 
 def _too_deep() -> HTTPException:

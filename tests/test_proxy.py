@@ -2074,6 +2074,11 @@ async def test_undeclared_json_is_scanned_after_decoding_escapes(content_type: s
             '{"card": 4111111111111111, "prompt": "\\u0041\\u000a' + OPENAI_FAKE + '"}',
             ["4111111111111111", OPENAI_FAKE],
         ),
+        # A rule can depend on the original spacing or number format.
+        (
+            '{"acct": "A-99", "amount": 123.450, "prompt": "\\u0041\\u000a' + OPENAI_FAKE + '"}',
+            ["A-99", "123.450", OPENAI_FAKE],
+        ),
         # Parsing drops the first value.
         (
             '{"p":"\\u0041\\u000a\\u0073' + OPENAI_FAKE[1:] + '","p":"clean"}',
@@ -2090,7 +2095,11 @@ def test_undeclared_json_secrets_reach_neither_upstream_nor_history(
     redactor = SecretRedactor(
         RedactionConfig(
             engine="basic",
-            rules=[RuleConfig(type="regex", value=r"\b4\d{15}\b")],
+            rules=[
+                RuleConfig(type="regex", value=r"\b4\d{15}\b"),
+                RuleConfig(type="regex", value=r'"acct": "[^"]+"'),
+                RuleConfig(type="regex", value=r"\b\d{3}\.\d{2}0\b"),
+            ],
         )
     )
 
@@ -2099,6 +2108,19 @@ def test_undeclared_json_secrets_reach_neither_upstream_nor_history(
     for secret in secrets:
         assert secret not in content.decode()
         assert secret not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_undeclared_json_keys_that_collide_after_redaction_return_client_error() -> None:
+    transport = httpx.ASGITransport(app=create_app(_unmonitored_settings()))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Content-Type": "text/plain"},
+            content=json.dumps({OPENAI_FAKE + "a": "one", OPENAI_FAKE + "b": "two"}),
+        )
+
+    assert response.status_code == 400
 
 
 @pytest.mark.asyncio

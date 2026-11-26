@@ -36,7 +36,8 @@ requires authentication must receive its key through `X-Target-API-Key` or
 `X-Target-Authorization`; PromptLatch never reuses configured key for another host.
 
 An empty `target.allowed_base_urls` permits any public target. Add URLs to restrict
-dynamic routing. Set `block_private_targets: false` only for trusted local targets.
+dynamic routing. If a listed URL has a path, the proxy rejects `..` segments. Set
+`block_private_targets: false` only for trusted local targets.
 
 For custom rules per request, see [custom rules](configuration.md#custom-rules).
 

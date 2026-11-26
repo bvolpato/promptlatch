@@ -85,6 +85,7 @@ and any loopback proxy `/healthz` endpoint (including running-version drift);
   are not stored.
 - PromptLatch strips cookies and secret-named client headers. Provider credentials are
   added from config or dedicated `X-Target-*` headers after that filtering step.
+- A plain word or a very short password, such as `hunter`, is masked where it is a value. The same word elsewhere in the text stays.
 - Unknown private token formats need a custom exact-tail or regex rule.
 
 See [SECURITY.md](../SECURITY.md) for deployment defaults and remaining limits.
